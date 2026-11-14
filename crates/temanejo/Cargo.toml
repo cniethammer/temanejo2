@@ -1,0 +1,9 @@
+[package]
+name = "temanejo"
+description = "Task graph analysis server with browser GUI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tmj-trace = { path = "../tmj-trace" }

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Temanejo – task graph</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Temanejo</h1>
+  <label>MPI rank
+    <select id="rank"></select>
+  </label>
+  <div class="seg" role="tablist" aria-label="View">
+    <button id="view-graph" role="tab" aria-selected="true">Graph</button>
+    <button id="view-timeline" role="tab" aria-selected="false">Timeline</button>
+  </div>
+  <label>Colour by
+    <select id="color">
+      <option value="thread">Thread</option>
+      <option value="cpu">CPU (hardware thread)</option>
+      <option value="numa">NUMA node</option>
+      <option value="loc">Source location</option>
+      <option value="region">Parallel region</option>
+      <option value="kind">Task kind</option>
+      <option value="work">Work time</option>
+    </select>
+  </label>
+  <label class="chk"><input type="checkbox" id="show-crit" checked> Critical path</label>
+  <label class="chk"><input type="checkbox" id="show-create" checked> Creation edges</label>
+  <label class="chk"><input type="checkbox" id="show-dep" checked> Dependence edges</label>
+  <span class="grow"></span>
+  <input id="find" type="search" placeholder="Task id…" size="9" aria-label="Find task by id">
+  <button id="fit" title="Fit to window (F)">Fit</button>
+</header>
+
+<main>
+  <section id="stage">
+    <canvas id="canvas"></canvas>
+    <div id="legend"></div>
+    <div id="hint">Drag to pan · wheel to zoom · click a task · <kbd>Shift</kbd>+drag to select a region</div>
+    <div id="tip" hidden></div>
+  </section>
+
+  <aside>
+    <section>
+      <h2>Process</h2>
+      <div id="summary" class="tiles"></div>
+    </section>
+    <section>
+      <h2>Task</h2>
+      <div id="task"><p class="muted">Click a task to see its details.</p></div>
+    </section>
+    <section>
+      <h2>Selected region</h2>
+      <div id="region"><p class="muted">Shift+drag over the graph (or a time range in the timeline) to analyse the degree of parallelism of a region.</p></div>
+    </section>
+  </aside>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

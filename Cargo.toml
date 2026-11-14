@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/tmj-trace", "crates/tmj-ompt", "crates/temanejo"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+
+[profile.release]
+opt-level = 3
+debug = 1
+# The OMPT tool is called from foreign (libomp) frames; never unwind into them.
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

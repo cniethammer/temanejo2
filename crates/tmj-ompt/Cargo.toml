@@ -1,0 +1,12 @@
+[package]
+name = "tmj-ompt"
+description = "OMPT tool library recording task graph events (the Ayudame role)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tmj-trace = { path = "../tmj-trace" }

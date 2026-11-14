@@ -1,0 +1,20 @@
+#!/bin/sh
+# Runs a command with the temanejo OMPT tool attached.
+#
+#   tmj-run [-o trace-dir] <command> [args...]
+#   tmj-run -o traces mpirun -np 4 ./app        # one trace file per rank
+#
+# The variables are exported, so Open MPI's mpirun forwards them to local
+# ranks; for multi-node runs pass them on explicitly, e.g.
+#   mpirun -x OMP_TOOL_LIBRARIES -x TEMANEJO_TRACE_DIR ...
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+lib=${TEMANEJO_LIB:-$root/target/release/libtmj_ompt.so}
+dir=${TEMANEJO_TRACE_DIR:-tmj-trace}
+if [ "${1:-}" = "-o" ]; then dir=$2; shift 2; fi
+[ $# -gt 0 ] || { echo "usage: tmj-run [-o trace-dir] <command> [args...]" >&2; exit 2; }
+[ -f "$lib" ] || { echo "tmj-run: $lib not found - run 'cargo build --release' first" >&2; exit 1; }
+mkdir -p "$dir"
+export OMP_TOOL_LIBRARIES="$lib"
+export TEMANEJO_TRACE_DIR="$(CDPATH= cd -- "$dir" && pwd)"
+exec "$@"

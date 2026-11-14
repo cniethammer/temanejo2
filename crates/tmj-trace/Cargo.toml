@@ -1,0 +1,6 @@
+[package]
+name = "tmj-trace"
+description = "Trace file format shared by the OMPT tool and the analysis server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
