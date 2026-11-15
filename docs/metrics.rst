@@ -79,6 +79,38 @@ Badges
       migrated the executing thread, which happens when threads are not
       pinned (``OMP_PROC_BIND``, ``OMP_PLACES``).
 
+Per-origin metrics
+------------------
+
+Shown in the *Task origins* table. Tasks are grouped by their origin: the
+code address of the construct that created them, i.e. the ``codeptr_ra`` of
+``task_create`` for explicit tasks and of ``parallel_begin`` for the implicit
+tasks of a region. The initial task forms a group of its own. For a group
+*G*:
+
+Tasks
+   \|\ *G*\ \|, the number of tasks in the group.
+
+Work
+   Σ\ :sub:`t∈G` *w(t)*, and its share of T\ :sub:`1` in percent.
+
+Crit.
+   Σ\ :sub:`t∈G` of each task's work on the critical path. The column sums
+   to T\ :sub:`∞`.
+
+Average per task (tooltip)
+   Work / number of tasks.
+
+Every task belongs to exactly one group, so the rows add up to the totals of
+the process.
+
+The location shown is only as good as the address the runtime reports. LLVM
+``libomp`` 23 reports an address inside the runtime for tasks created by
+``taskloop`` (shown as ``__kmpc_taskloop (libomp.so)``) and for the implicit
+tasks of nested parallel regions (``__kmp_invoke_microtask (libomp.so)``).
+All tasks with such an address are grouped into one row, even if they come
+from different constructs.
+
 Per-process metrics
 -------------------
 

@@ -25,6 +25,7 @@ const S = {
   cam: { x: 0, y: 0, k: 1 },           // graph camera: screen = world * k + (x, y)
   tl: { t0: 0, t1: 1 },                // visible time window of the timeline
   drag: null, hover: -1, css: {}, children: [], succ: [], pred: [],
+  originSort: { key: 'w', dir: -1 },   // task origins table: column and direction
 };
 
 // ------------------------------------------------------------------ helpers
@@ -96,7 +97,8 @@ function assignSlots() {
 function locShort(l) {
   if (!l) return 'unknown';
   if (l.file) return l.file.split('/').pop() + ':' + l.line;
-  return l.func || l.addr;
+  const mod = l.module ? ' (' + l.module.split('/').pop() + ')' : '';
+  return (l.func || l.addr) + mod;
 }
 
 // ------------------------------------------------------------------ data
@@ -124,6 +126,7 @@ async function loadRank(rank) {
   assignSlots();
   setRegion(new Set());
   renderSummary();
+  renderOrigins();
   renderTask();
   renderLegend();
   fit();
@@ -139,6 +142,63 @@ function renderSummary() {
     tile(fmt(g.work), 'total work T₁') + tile(fmt(g.critical), 'critical path T∞') +
     tile(fmt(g.wall), 'wall time') + tile((g.work / Math.max(g.wall, 1)).toFixed(2), 'measured avg. concurrency');
 }
+
+// ------------------------------------------------------------------ task origins
+
+// Groups tasks by the source location of the construct that created them:
+// the task construct for explicit tasks, the parallel construct for implicit
+// tasks. The initial task (serial code) gets a row of its own.
+function origins() {
+  const m = new Map();
+  S.g.tasks.forEach((t, i) => {
+    const key = t.k === 0 ? 'initial' : t.loc;
+    let o = m.get(key);
+    if (!o) m.set(key, o = { key, loc: t.k === 0 ? -1 : t.loc, kinds: new Set(), n: 0, w: 0, cr: 0, tasks: [] });
+    o.kinds.add(t.k); o.n++; o.w += t.w; o.cr += t.cr; o.tasks.push(i);
+  });
+  for (const o of m.values()) {
+    const l = S.g.locs[o.loc];
+    o.name = o.key === 'initial' ? 'initial task' : l ? locShort(l) : 'unknown location';
+    o.func = o.key === 'initial' ? 'serial code outside parallel regions' : l ? (l.func || l.module) : '';
+    o.kind = o.key === 'initial' ? 'initial' : [...o.kinds].sort().map(k => k === 1 ? 'parallel region' : 'task').join(' + ');
+  }
+  return [...m.values()];
+}
+
+function renderOrigins() {
+  const g = S.g, { key, dir } = S.originSort;
+  const rows = origins().sort((a, b) => key === 'name' ? dir * a.name.localeCompare(b.name) : dir * (a[key] - b[key]));
+  const total = Math.max(g.work, 1), showDot = S.colorBy === 'loc';
+  const head = (k, label, title) =>
+    `<th data-k="${k}" title="${title}" class="sortable">${label}${k === key ? (dir < 0 ? ' ▾' : ' ▴') : ''}</th>`;
+  $('origins').innerHTML = `<div class="scroll"><table class="origins">
+    <thead><tr>${head('name', 'Location', 'Source location of the task or parallel construct')}${head('n', 'Tasks', 'Number of tasks created there')}${head('w', 'Work', 'Total exclusive work time of these tasks')}${head('cr', 'Crit.', 'Part of that work on the critical path')}</tr></thead>
+    ${rows.map(o => {
+      const dot = showDot ? `<span class="dot" style="background:${S.css.cat[(S.catSlots.get(o.loc) ?? 0) % 8]}"></span>` : '';
+      const pct = 100 * o.w / total;
+      // One tbody per origin: the location on its own line, the numbers below it.
+      return `<tbody data-o="${esc(String(o.key))}" title="${esc(o.func)} · avg. ${fmt(o.w / o.n)} per task · click to select these tasks">
+        <tr class="name"><td colspan="4">${dot}<span class="mono">${esc(o.name)}</span></td></tr>
+        <tr><td><span class="muted">${esc(o.kind)}</span><div class="bar" style="width:${pct.toFixed(1)}%"></div></td>
+        <td>${o.n}</td><td>${fmt(o.w)}<br><span class="muted">${pct < 0.1 && pct > 0 ? '<0.1' : pct.toFixed(1)} %</span></td>
+        <td>${o.cr ? fmt(o.cr) : '–'}</td></tr></tbody>`;
+    }).join('')}
+    <tbody><tr class="total"><td>all tasks</td><td>${g.tasks.length}</td><td>${fmt(g.work)}</td><td>${fmt(g.critical)}</td></tr></tbody>
+  </table></div><p class="muted">Work is exclusive task time (T₁ share below it). Click a row to analyse its tasks as a region.</p>`;
+}
+
+$('origins').addEventListener('click', e => {
+  const th = e.target.closest('th[data-k]');
+  if (th) {
+    const k = th.dataset.k, s = S.originSort;
+    S.originSort = { key: k, dir: s.key === k ? -s.dir : (k === 'name' ? 1 : -1) };
+    return renderOrigins();
+  }
+  const tr = e.target.closest('tbody[data-o]');
+  if (!tr) return;
+  const o = origins().find(o => String(o.key) === tr.dataset.o);
+  if (o) setRegion(new Set(o.tasks));
+});
 
 // ------------------------------------------------------------------ canvas
 
@@ -404,7 +464,7 @@ canvas.addEventListener('wheel', e => {
 function select(i) { S.sel = i; renderTask(); draw(); }
 
 $('rank').onchange = e => loadRank(e.target.value);
-$('color').onchange = e => { S.colorBy = e.target.value; assignSlots(); renderLegend(); renderTask(); draw(); };
+$('color').onchange = e => { S.colorBy = e.target.value; assignSlots(); renderLegend(); renderOrigins(); renderTask(); draw(); };
 for (const [id, key] of [['show-crit', 'showCrit'], ['show-create', 'showCreate'], ['show-dep', 'showDep']])
   $(id).onchange = e => { S[key] = e.target.checked; renderLegend(); draw(); };
 for (const v of ['graph', 'timeline']) $('view-' + v).onclick = () => {

@@ -45,6 +45,24 @@ One row per OpenMP thread, with the execution segments of all tasks over
 time. A red strip below a segment marks a critical-path task. Drag to pan,
 the wheel zooms the time axis.
 
+Task origins
+------------
+
+A table of all source locations that create tasks, with, for each:
+
+* the location (file and line, or function and library without debug
+  information) and whether it is a ``task`` construct or a parallel region
+  (whose implicit tasks are counted);
+* the number of tasks created there;
+* their total work time and its share of T\ :sub:`1`, also drawn as a bar;
+* the part of that work on the critical path.
+
+The initial task, which holds the serial code outside parallel regions, has
+its own row. The last row sums up all tasks. Click a column header to sort,
+hover a row for the function name and the average work per task, and click a
+row to select all its tasks for the region analysis. With *Colour by: Source
+location*, each row shows the colour its tasks have in the graph.
+
 Task details
 ------------
 
