@@ -183,6 +183,18 @@ One row per OpenMP thread, with the execution segments of all tasks over
 time. A red strip below a segment marks a critical-path task. Drag to pan,
 the wheel zooms the time axis.
 
+Run information
+---------------
+
+*Run information* below the process summary unfolds what the trace header
+says about the run of the selected rank: OpenMP runtime, its version and
+library, executable, command line, working directory, the CPUs the process
+was allowed to use, the number of MPI processes, and the OpenMP-related
+environment variables. Entries the recording tool could not determine are
+absent, and traces of older versions have none; then the section is hidden.
+*CPUs the process may use* shows the binding of the MPI launcher, see
+:ref:`binding`.
+
 Task origins
 ------------
 

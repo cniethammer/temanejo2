@@ -142,6 +142,8 @@ pub struct Model {
     pub rank: u32,
     pub pid: u32,
     pub host: String,
+    /// Optional information about the run from the trace header.
+    pub info: Vec<(String, String)>,
     /// Duration covered by the trace in ns; all timestamps are relative to its start.
     pub wall: u64,
     pub tasks: Vec<Task>,
@@ -558,6 +560,15 @@ impl Model {
             rank: trace.rank,
             pid: trace.pid,
             host: trace.host.clone(),
+            info: {
+                // The runtime library is a header field of its own; show it with the rest.
+                let mut info = trace.info.clone();
+                if !trace.runtime_module.is_empty() {
+                    let at = info.iter().position(|(k, _)| !k.starts_with("omp.") && !k.starts_with("tool.")).unwrap_or(info.len());
+                    info.insert(at, ("omp.runtime_library".to_string(), trace.runtime_module.clone()));
+                }
+                info
+            },
             wall,
             tasks: b.tasks,
             parallels: b.parallels,

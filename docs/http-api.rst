@@ -42,6 +42,11 @@ The server has no authentication and binds to ``127.0.0.1`` by default.
    number of tasks executing at the same time), ``threads``, ``locs``,
    ``parallels`` and ``origins`` as in the full graph below, and:
 
+   ``info``
+      Optional information about the run: ``[key, value]`` pairs from the
+      trace header (see :doc:`trace-format`, "Run information"), plus
+      ``omp.runtime_library``, the path of the OpenMP runtime library. May
+      be empty; also part of ``/full``.
    ``n``
       Number of tasks. Task indices run from 0 to ``n`` − 1.
    ``ids``, ``par``

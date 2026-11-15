@@ -84,10 +84,10 @@ with ``backtrace(3)`` and uses the first return address that lies neither in
 the runtime nor in the tool: the call of ``__kmpc_taskloop`` in the program.
 This happens once per execution of a ``taskloop`` construct, not per task.
 
-When the trace is written, every task whose reported address lies in the
+When the trace is read, every task whose reported address lies in the
 runtime gets the address of the latest ``taskloop`` its encountering task
-started before the task was created. The reported address is kept in the
-event as well. The GUI then shows these tasks with the source line of the
+started before the task was created (see :doc:`trace-format`, "Taskloop
+tasks"). The reported address is kept in the event as well. The GUI then shows these tasks with the source line of the
 ``taskloop`` (line 76 in the example), the kind *taskloop* in the task
 origins table and a *taskloop* badge in the task details.
 

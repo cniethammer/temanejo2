@@ -94,7 +94,7 @@ impl TraceBuilder {
 
     fn build(&mut self) -> Trace {
         let events = self.threads.values().flatten().copied().collect();
-        Trace { rank: 0, pid: 1, epoch_ns: 0, host: "test".into(), events, syms: vec![] }
+        Trace { rank: 0, pid: 1, epoch_ns: 0, host: "test".into(), events, complete: true, ..Default::default() }
     }
 }
 

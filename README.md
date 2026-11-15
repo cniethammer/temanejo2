@@ -15,7 +15,7 @@ The structure follows the original Temanejo/Ayudame pair:
 
 Unlike the original, which streamed events over a socket and could steer the
 program, this draft works **post mortem**: each process writes a trace file
-when the OpenMP runtime shuts down, and the server analyses the files.
+while it runs, and the server analyses the files afterwards.
 
 ```
  app (rank 0..N-1)                               temanejo <trace-dir>
@@ -61,6 +61,9 @@ mpirun -np 2 -x OMP_TOOL_LIBRARIES -x TEMANEJO_TRACE_DIR ./app
 ```
 
 `TEMANEJO_VERBOSE=1` makes the tool report what it attached to and wrote.
+`TEMANEJO_BUFFER_SIZE` (e.g. `256K`, `16M`, `unlimited`) and
+`TEMANEJO_FLUSH_INTERVAL` (seconds) control how often events are written to
+the trace file during the run.
 The trace directory must be on a file system all ranks can write to.
 On a cluster, run the server where the traces are and forward the port:
 `ssh -L 8700:localhost:8700 login-node`.
@@ -100,9 +103,10 @@ Server options: `temanejo <trace-dir> [--port 8700] [--bind 127.0.0.1] [--summar
 `work`. Each
 callback appends one 56-byte record (timestamp from `CLOCK_MONOTONIC`, CPU
 and NUMA node from `getcpu`, ids stored in the `ompt_data_t` slots) to a
-per-thread buffer – no locks, no I/O while the program runs. Code addresses
-(`codeptr_ra`) are resolved to module + load bias at shutdown; file and line
-are looked up by the server.
+per-thread buffer, without locks. A thread appends its buffer to the trace
+file when it is full (1 MiB by default) and at the end. Code addresses
+(`codeptr_ra`) are resolved to module + load bias when they are first
+written; file and line are looked up by the server.
 
 **Work time.** A task's work time is exclusive: the sum of the intervals in
 which it was the running task of a thread, without the time it was suspended
@@ -165,9 +169,11 @@ synthetic traces (see Tests); the OMPT tool itself is only tested manually.
 
 - Post mortem only; no live view and no execution control (breakpoints,
   stepping) as in the original Temanejo.
-- Events stay in memory until the runtime shuts down (56 bytes per event,
-  roughly 5 events per task). A program that aborts or calls `_exit` leaves
-  no trace.
+- Events are written in blocks while the program runs (56 bytes per event,
+  roughly 5 events per task; per-thread buffer of 1 MiB by default, see
+  `TEMANEJO_BUFFER_SIZE` and `TEMANEJO_FLUSH_INTERVAL` in the documentation).
+  A program that crashes or calls `_exit` leaves an incomplete trace with
+  the events written up to then, which the viewer still loads.
 - The MPI rank is read from `PMIX_RANK`, `OMPI_COMM_WORLD_RANK` or
   `PMI_RANK`. Without any of them every process writes `rank-0.tmj`.
 - Clocks of different ranks are not aligned; each rank's time starts at its

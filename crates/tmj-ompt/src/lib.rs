@@ -1,21 +1,26 @@
 //! OMPT tool recording the task graph of an OpenMP (+MPI) program.
 //!
 //! Activate with `OMP_TOOL_LIBRARIES=/path/to/libtmj_ompt.so`. Each process
-//! writes `<TEMANEJO_TRACE_DIR>/rank-<N>.tmj` when the OpenMP runtime shuts
-//! down. The MPI rank is taken from the launcher environment (PMIx / Open MPI),
+//! writes `<TEMANEJO_TRACE_DIR>/rank-<N>.tmj`: a thread appends its events
+//! as a block whenever its buffer is full (`TEMANEJO_BUFFER_SIZE`) or older
+//! than `TEMANEJO_FLUSH_INTERVAL`, and everything left when the OpenMP
+//! runtime shuts down. The MPI rank is taken from the launcher environment (PMIx / Open MPI),
 //! so the tool has no link-time dependency on any MPI library.
 //!
-//! Callbacks only append fixed-size records to a per-thread buffer; all graph
-//! reconstruction happens post mortem in the `temanejo` server.
+//! Callbacks only append fixed-size records to a per-thread buffer, which is
+//! written out in one piece; all graph reconstruction happens post mortem in
+//! the `temanejo` server.
 
 #![allow(clippy::missing_safety_doc)]
 
 use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::collections::HashSet;
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
 
-use tmj_trace::{kind, Event, Sym, Trace};
+use tmj_trace::{kind, Event, Sym};
 
 // ---------------------------------------------------------------- OMPT FFI
 
@@ -99,6 +104,77 @@ fn now(clk: c_int) -> u64 {
 struct ThreadBuf {
     id: u32,
     events: Vec<Event>,
+    /// Timestamp of the oldest buffered event (for `TEMANEJO_FLUSH_INTERVAL`).
+    oldest: u64,
+    /// Code addresses this thread has already passed on for symbol resolution.
+    seen: HashSet<u64>,
+}
+
+/// The trace file and what has been written to it; shared by all threads.
+struct Output {
+    file: std::fs::File,
+    path: String,
+    rank: u32,
+    events: u64,
+    blocks: u64,
+    /// Code addresses whose symbol record is in the file.
+    symbols: HashSet<u64>,
+    failed: bool,
+}
+
+static OUTPUT: Mutex<Option<Output>> = Mutex::new(None);
+/// What the runtime passed to `ompt_start_tool`: its `_OPENMP` version and version string.
+static STARTED_BY: Mutex<(c_uint, String)> = Mutex::new((0, String::new()));
+/// Events a thread buffers before it writes them (`usize::MAX`: until the end).
+static BUFFER_EVENTS: AtomicUsize = AtomicUsize::new(DEFAULT_BUFFER_BYTES / tmj_trace::EVENT_SIZE);
+/// Maximum age of a buffered event in ns before the buffer is written (0: no limit).
+static FLUSH_INTERVAL_NS: AtomicU64 = AtomicU64::new(0);
+static SYNC: AtomicBool = AtomicBool::new(false);
+
+const DEFAULT_BUFFER_BYTES: usize = 1 << 20;
+const MIN_BUFFER_EVENTS: usize = 64;
+
+/// Writes the events of `tb` as one block, preceded by the symbols of code
+/// addresses that are new in it, and empties the buffer. Called by the
+/// owning thread, and by `finalize` for the buffers of other threads.
+fn flush(tb: &mut ThreadBuf) {
+    if tb.events.is_empty() {
+        return;
+    }
+    let mut new_addrs = Vec::new();
+    for e in &tb.events {
+        let code = matches!(e.kind, kind::PARALLEL_BEGIN | kind::TASK_CREATE | kind::SYNC_REGION | kind::SYNC_WAIT | kind::WORK);
+        if code && e.d != 0 && tb.seen.insert(e.d) {
+            new_addrs.push(e.d);
+        }
+    }
+    let mut guard = OUTPUT.lock().unwrap();
+    if let Some(out) = guard.as_mut() {
+        let mut bytes = Vec::new();
+        new_addrs.retain(|a| out.symbols.insert(*a));
+        if !new_addrs.is_empty() {
+            let syms: Vec<Sym> = new_addrs.iter().map(|&a| unsafe { resolve(a) }).collect();
+            tmj_trace::encode_symbols_block(&mut bytes, &syms);
+        }
+        tmj_trace::encode_events_block(&mut bytes, &tb.events);
+        let mut result = out.file.write_all(&bytes);
+        if result.is_ok() && SYNC.load(Relaxed) {
+            result = out.file.sync_data();
+        }
+        match result {
+            Ok(()) => {
+                out.events += tb.events.len() as u64;
+                out.blocks += 1;
+            }
+            Err(e) if !out.failed => {
+                out.failed = true;
+                eprintln!("[temanejo] rank {}: cannot write {}: {e}; events are lost", out.rank, out.path);
+            }
+            Err(_) => {}
+        }
+    }
+    drop(guard);
+    tb.events.clear();
 }
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -153,7 +229,9 @@ fn thread_buf() -> &'static mut ThreadBuf {
         if p.is_null() {
             p = Box::into_raw(Box::new(ThreadBuf {
                 id: NEXT_THREAD.fetch_add(1, Relaxed),
-                events: Vec::with_capacity(1 << 14),
+                events: Vec::with_capacity(BUFFER_EVENTS.load(Relaxed).min(1 << 14)),
+                oldest: 0,
+                seen: HashSet::new(),
             }));
             REGISTRY.lock().unwrap().push(p as usize);
             c.set(p);
@@ -171,19 +249,15 @@ fn rec(kind: u8, endpoint: u8, flags: u32, a: u64, b: u64, c: u64, d: u64) {
     let (mut cpu, mut node) = (0 as c_uint, 0 as c_uint);
     unsafe { getcpu(&mut cpu, &mut node) };
     let tb = thread_buf();
-    tb.events.push(Event {
-        kind,
-        endpoint,
-        cpu: cpu as u16,
-        numa: node as u16,
-        thread: tb.id,
-        flags,
-        ts: now(CLOCK_MONOTONIC),
-        a,
-        b,
-        c,
-        d,
-    });
+    let ts = now(CLOCK_MONOTONIC);
+    if tb.events.is_empty() {
+        tb.oldest = ts;
+    }
+    tb.events.push(Event { kind, endpoint, cpu: cpu as u16, numa: node as u16, thread: tb.id, flags, ts, a, b, c, d });
+    let interval = FLUSH_INTERVAL_NS.load(Relaxed);
+    if tb.events.len() >= BUFFER_EVENTS.load(Relaxed) || (interval != 0 && ts - tb.oldest >= interval) {
+        flush(tb);
+    }
 }
 
 #[inline]
@@ -211,6 +285,9 @@ unsafe extern "C" fn on_thread_begin(thread_type: c_int, _thread_data: *mut Ompt
 
 unsafe extern "C" fn on_thread_end(_thread_data: *mut OmptData) {
     rec(kind::THREAD_END, 0, 0, 0, 0, 0, 0);
+    if ACTIVE.load(Relaxed) {
+        flush(thread_buf());
+    }
 }
 
 unsafe extern "C" fn on_parallel_begin(
@@ -362,8 +439,134 @@ unsafe extern "C" fn initialize(lookup: Lookup, _initial_device_num: c_int, _too
     let mut warm = [std::ptr::null_mut::<c_void>(); 2];
     backtrace(warm.as_mut_ptr(), 2);
     EPOCH_NS.store(now(CLOCK_REALTIME), Relaxed);
+    configure();
+    if let Err(msg) = open_output(lookup) {
+        eprintln!("[temanejo] {msg}; recording is disabled");
+        return 0; // zero deactivates the tool
+    }
     ACTIVE.store(true, Relaxed);
     1 // non-zero keeps the tool active
+}
+
+/// Parses a size like `4096`, `256K`, `4M` or `1G` (bytes, powers of 1024).
+fn parse_size(v: &str) -> Option<usize> {
+    let v = v.trim();
+    let (num, mult) = match v.chars().last()?.to_ascii_uppercase() {
+        'K' => (&v[..v.len() - 1], 1 << 10),
+        'M' => (&v[..v.len() - 1], 1 << 20),
+        'G' => (&v[..v.len() - 1], 1 << 30),
+        _ => (v, 1),
+    };
+    num.trim().parse::<usize>().ok()?.checked_mul(mult)
+}
+
+/// Reads the buffering parameters from the environment.
+fn configure() {
+    if let Ok(v) = std::env::var("TEMANEJO_BUFFER_SIZE") {
+        let events = match v.trim().to_ascii_lowercase().as_str() {
+            "unlimited" | "0" => Some(usize::MAX),
+            _ => parse_size(&v).map(|bytes| (bytes / tmj_trace::EVENT_SIZE).max(MIN_BUFFER_EVENTS)),
+        };
+        match events {
+            Some(n) => BUFFER_EVENTS.store(n, Relaxed),
+            None => eprintln!("[temanejo] ignoring TEMANEJO_BUFFER_SIZE={v}: expected a size like 256K, 4M or 'unlimited'"),
+        }
+    }
+    if let Ok(v) = std::env::var("TEMANEJO_FLUSH_INTERVAL") {
+        match v.trim().parse::<f64>() {
+            Ok(s) if s >= 0.0 && s.is_finite() => FLUSH_INTERVAL_NS.store((s * 1e9) as u64, Relaxed),
+            _ => eprintln!("[temanejo] ignoring TEMANEJO_FLUSH_INTERVAL={v}: expected seconds, e.g. 0.5"),
+        }
+    }
+    SYNC.store(std::env::var("TEMANEJO_SYNC").is_ok_and(|v| !matches!(v.trim(), "" | "0")), Relaxed);
+}
+
+/// Information about the run for the trace header. Every entry is optional:
+/// what cannot be determined is left out.
+unsafe fn run_info(lookup: Lookup) -> Vec<(String, String)> {
+    let mut info: Vec<(String, String)> = Vec::new();
+    let mut add = |key: &str, value: String| {
+        if !value.is_empty() {
+            info.push((key.to_string(), value));
+        }
+    };
+    add("tool.version", env!("CARGO_PKG_VERSION").to_string());
+
+    // The OpenMP runtime, as it introduced itself.
+    let (omp_version, runtime_version) = STARTED_BY.lock().unwrap().clone();
+    add("omp.runtime_version", runtime_version);
+    if omp_version != 0 {
+        add("omp.version", omp_version.to_string()); // the runtime's _OPENMP value, yyyymm
+    }
+    // OMPT entry point; safe to call during tool initialisation.
+    if let Some(f) = lookup(c"ompt_get_num_procs".as_ptr()) {
+        let num_procs: unsafe extern "C" fn() -> c_int = std::mem::transmute(f);
+        let n = num_procs();
+        if n > 0 {
+            add("omp.num_procs", n.to_string());
+        }
+    }
+
+    // The process.
+    if let Ok(exe) = std::fs::read_link("/proc/self/exe") {
+        add("process.exe", exe.to_string_lossy().into_owned());
+    }
+    let args: Vec<String> = std::env::args().collect();
+    add("process.args", args.join(" "));
+    if let Ok(cwd) = std::env::current_dir() {
+        add("process.cwd", cwd.to_string_lossy().into_owned());
+    }
+    // CPUs the process may run on, e.g. "0-3,8": shows how the launcher bound it.
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        if let Some(line) = status.lines().find_map(|l| l.strip_prefix("Cpus_allowed_list:")) {
+            add("process.cpus_allowed", line.trim().to_string());
+        }
+    }
+    for (key, vars) in [("mpi.world_size", ["OMPI_COMM_WORLD_SIZE", "PMI_SIZE"])] {
+        if let Some(v) = vars.iter().find_map(|v| std::env::var(v).ok()) {
+            add(key, v);
+        }
+    }
+
+    // Environment variables that configure OpenMP runtimes and this tool.
+    let mut env: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.to_string_lossy().into_owned())))
+        .filter(|(k, _)| ["OMP_", "KMP_", "GOMP_", "LIBOMP_", "TEMANEJO_"].iter().any(|p| k.starts_with(p)))
+        .collect();
+    env.sort();
+    for (k, v) in env {
+        info.push((format!("env.{k}"), v)); // an empty value is information too
+    }
+    info
+}
+
+/// Creates the trace file and writes its header.
+unsafe fn open_output(lookup: Lookup) -> Result<(), String> {
+    let runtime_addr = lookup as usize as u64;
+    let rank = mpi_rank();
+    let dir = std::env::var("TEMANEJO_TRACE_DIR").unwrap_or_else(|_| "tmj-trace".into());
+    let path = format!("{dir}/rank-{rank}.tmj");
+    let mut host = [0 as c_char; 256];
+    gethostname(host.as_mut_ptr(), host.len() - 1);
+    let mut header = Vec::new();
+    tmj_trace::encode_header(&mut header, rank, std::process::id(), EPOCH_NS.load(Relaxed), &cstr(host.as_ptr()), &resolve(runtime_addr).module, &run_info(lookup));
+    let mut file = std::fs::create_dir_all(&dir)
+        .and_then(|_| std::fs::File::create(&path))
+        .map_err(|e| format!("rank {rank}: cannot create {path}: {e}"))?;
+    file.write_all(&header).map_err(|e| format!("rank {rank}: cannot write {path}: {e}"))?;
+    if verbose() {
+        let buffer = match BUFFER_EVENTS.load(Relaxed) {
+            usize::MAX => "unlimited (written at the end)".to_string(),
+            n => format!("{n} events ({} KiB) per thread", n * tmj_trace::EVENT_SIZE / 1024),
+        };
+        let interval = match FLUSH_INTERVAL_NS.load(Relaxed) {
+            0 => "off".to_string(),
+            ns => format!("{} s", ns as f64 / 1e9),
+        };
+        eprintln!("[temanejo] rank {rank}: writing {path}; buffer {buffer}, flush interval {interval}, sync {}", if SYNC.load(Relaxed) { "on" } else { "off" });
+    }
+    *OUTPUT.lock().unwrap() = Some(Output { file, path, rank, events: 0, blocks: 0, symbols: HashSet::new(), failed: false });
+    Ok(())
 }
 
 fn mpi_rank() -> u32 {
@@ -407,96 +610,32 @@ unsafe fn resolve(addr: u64) -> Sym {
     sym
 }
 
-/// libomp creates the tasks of a `taskloop` inside the runtime and reports a
-/// code address in the runtime (`__kmpc_taskloop`) for them, also for its
-/// internal helper tasks, which create tasks on other threads later on. The
-/// WORK event of the construct carries the program's address (found by
-/// `on_work`). This gives every task whose reported address lies in the
-/// runtime the address of the latest taskloop its encountering task started
-/// before the task was created, keeping the reported address in `c`.
-unsafe fn attribute_taskloop_tasks(events: &mut [Event]) {
-    use std::collections::HashMap;
-    let mut taskloops: HashMap<u64, Vec<(u64, u64)>> = HashMap::new(); // task -> (ts, codeptr)
-    for e in events.iter() {
-        if e.kind == kind::WORK && e.endpoint == tmj_trace::ENDPOINT_BEGIN && e.a == tmj_trace::WORK_TASKLOOP && e.d != 0 {
-            taskloops.entry(e.b).or_default().push((e.ts, e.d));
-        }
-    }
-    if taskloops.is_empty() {
-        return;
-    }
-    for v in taskloops.values_mut() {
-        v.sort_unstable();
-    }
-    let mut inside_runtime: HashMap<u64, bool> = HashMap::new();
-    for e in events.iter_mut().filter(|e| e.kind == kind::TASK_CREATE && e.d != 0) {
-        let Some(v) = taskloops.get(&e.b) else { continue };
-        let inside = *inside_runtime.entry(e.d).or_insert_with(|| in_runtime(e.d));
-        if !inside {
-            continue;
-        }
-        // Latest taskloop of the encountering task that began before the creation.
-        let i = v.partition_point(|&(ts, _)| ts <= e.ts);
-        if i > 0 {
-            e.c = e.d;
-            e.d = v[i - 1].1;
-        }
-    }
-}
-
+/// Writes what is still buffered and the end block that marks the trace as
+/// complete. Events recorded by other threads after this point are dropped.
 unsafe extern "C" fn finalize(_tool_data: *mut OmptData) {
     if !ACTIVE.swap(false, Relaxed) {
         return;
     }
     let bufs: Vec<usize> = REGISTRY.lock().unwrap().clone();
-    let mut events = Vec::new();
     for p in bufs {
-        events.extend_from_slice(&(*(p as *const ThreadBuf)).events);
+        flush(&mut *(p as *mut ThreadBuf));
     }
-
-    attribute_taskloop_tasks(&mut events);
-
-    let mut addrs: Vec<u64> = events
-        .iter()
-        .filter(|e| matches!(e.kind, kind::PARALLEL_BEGIN | kind::TASK_CREATE | kind::SYNC_REGION | kind::WORK))
-        .flat_map(|e| [e.d, if e.kind == kind::TASK_CREATE { e.c } else { 0 }])
-        .filter(|&a| a != 0)
-        .collect();
-    addrs.sort_unstable();
-    addrs.dedup();
-    let syms = addrs.into_iter().map(|a| resolve(a)).collect();
-
-    let mut host = [0 as c_char; 256];
-    gethostname(host.as_mut_ptr(), host.len() - 1);
-
-    let trace = Trace {
-        rank: mpi_rank(),
-        pid: std::process::id(),
-        epoch_ns: EPOCH_NS.load(Relaxed),
-        host: cstr(host.as_ptr()),
-        events,
-        syms,
-    };
-
-    let dir = std::env::var("TEMANEJO_TRACE_DIR").unwrap_or_else(|_| "tmj-trace".into());
-    let path = format!("{dir}/rank-{}.tmj", trace.rank);
-    let result = std::fs::create_dir_all(&dir)
-        .and_then(|_| std::fs::File::create(&path))
-        .and_then(|f| {
-            let mut w = std::io::BufWriter::new(f);
-            trace.write(&mut w)?;
-            std::io::Write::flush(&mut w)
-        });
+    let Some(mut out) = OUTPUT.lock().unwrap().take() else { return };
+    let mut end = Vec::new();
+    tmj_trace::encode_end_block(&mut end, out.events);
+    let result = out.file.write_all(&end).and_then(|_| out.file.sync_all());
     match result {
-        Ok(()) if verbose() => eprintln!("[temanejo] rank {}: {} events -> {path}", trace.rank, trace.events.len()),
+        Ok(()) if out.failed => {}
+        Ok(()) if verbose() => eprintln!("[temanejo] rank {}: {} events in {} blocks -> {}", out.rank, out.events, out.blocks, out.path),
         Ok(()) => {}
-        Err(e) => eprintln!("[temanejo] rank {}: cannot write {path}: {e}", trace.rank),
+        Err(e) => eprintln!("[temanejo] rank {}: cannot finish {}: {e}", out.rank, out.path),
     }
 }
 
 /// Entry point looked up by the OpenMP runtime (OpenMP 5.x, section "OMPT tool initialization").
 #[no_mangle]
-pub unsafe extern "C" fn ompt_start_tool(_omp_version: c_uint, runtime_version: *const c_char) -> *mut StartToolResult {
+pub unsafe extern "C" fn ompt_start_tool(omp_version: c_uint, runtime_version: *const c_char) -> *mut StartToolResult {
+    *STARTED_BY.lock().unwrap() = (omp_version, cstr(runtime_version));
     if verbose() {
         eprintln!("[temanejo] OMPT tool attached to runtime: {}", cstr(runtime_version));
     }

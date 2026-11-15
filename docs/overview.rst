@@ -14,8 +14,9 @@ Components
    * - OMPT tool
      - ``libtmj_ompt.so``
      - Loaded by the OpenMP runtime through ``OMP_TOOL_LIBRARIES``. Records
-       OMPT events into per-thread memory buffers and writes one trace file
-       per process when the runtime shuts down. Corresponds to Ayudame.
+       OMPT events into per-thread memory buffers and appends them to one
+       trace file per process, whenever a buffer is full and at the end.
+       Corresponds to Ayudame.
    * - Server
      - ``temanejo``
      - Reads the trace files of one run, reconstructs and analyses the task
@@ -41,8 +42,8 @@ Data flow::
 Differences from the original Temanejo
 --------------------------------------
 
-* **Post mortem.** Events are written when the OpenMP runtime finalizes, not
-  streamed while the program runs. There is no execution control
+* **Post mortem.** Events are written to trace files and analysed after
+  the run, not streamed to the GUI while the program runs. There is no execution control
   (breakpoints, stepping).
 * **Standard interface.** Events come from OMPT, so any OpenMP runtime that
   implements OMPT works without modifications to the runtime.

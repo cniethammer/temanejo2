@@ -3,8 +3,13 @@ Trace file format
 
 Every process traced by ``libtmj_ompt.so`` writes one binary file,
 ``rank-<rank>.tmj``, into the trace directory (see :doc:`usage`). This page
-specifies the format, version ``01``. Reader and writer are implemented in
+specifies the format, version ``03``. Reader and writer are implemented in
 ``crates/tmj-trace/src/lib.rs``.
+
+A trace is written in blocks while the program runs, so its size is not
+limited by memory and a run that crashes still leaves the events written up
+to then. The previous versions are described in `Versions 01 and 02`_ and
+are still read.
 
 Conventions
 -----------
@@ -19,16 +24,18 @@ Conventions
 File layout
 -----------
 
-.. list-table::
+A file consists of a header followed by any number of blocks.
+
+.. list-table:: Header
    :header-rows: 1
-   :widths: 18 14 68
+   :widths: 22 12 66
 
    * - Field
      - Type
      - Content
    * - ``magic``
      - 8 bytes
-     - ASCII ``TMJTRC01``. The last two characters are the format version;
+     - ASCII ``TMJTRC03``. The last two characters are the format version;
        an incompatible change increments it.
    * - ``rank``
      - ``u32``
@@ -44,20 +51,97 @@ File layout
    * - ``host``
      - ``str``
      - Host name of the node.
-   * - ``n_events``
-     - ``u64``
-     - Number of event records that follow.
-   * - ``events``
-     - ``n_events`` × 56 bytes
-     - Event records, see below.
-   * - ``n_syms``
+   * - ``runtime_module``
+     - ``str``
+     - Absolute path of the OpenMP runtime library. Code addresses whose
+       symbol record names this module lie inside the runtime (see
+       `Taskloop tasks`_).
+   * - ``n_info``
      - ``u32``
-     - Number of symbol records that follow.
-   * - ``syms``
-     - ``n_syms`` × variable
-     - Symbol records, see below.
+     - Number of information entries that follow; may be 0.
+   * - ``info``
+     - ``n_info`` × (``str``, ``str``)
+     - Key and value of each entry, see `Run information`_.
 
-The file ends after the last symbol record.
+Run information
+~~~~~~~~~~~~~~~
+
+The information entries describe the run. **All of them are optional**: the
+tool writes an entry only if it could determine the value, and other writers
+may add entries or write none. Readers must ignore unknown keys and must not
+depend on any key being present. Values are text, at most 64 KiB; an entry
+appears at most once.
+
+Keys written by ``libtmj_ompt.so``:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Key
+     - Value
+   * - ``tool.version``
+     - Version of the recording tool.
+   * - ``omp.runtime_version``
+     - The version string the OpenMP runtime passed to the tool
+       (``ompt_start_tool``), e.g. ``LLVM OMP version: 5.0.20140926``.
+   * - ``omp.version``
+     - The runtime's ``_OPENMP`` value, ``yyyymm``, e.g. ``201611``.
+   * - ``omp.num_procs``
+     - Number of processors available to the runtime
+       (``ompt_get_num_procs``), if the runtime knows it when the tool
+       starts. LLVM ``libomp`` 23 does not, so the entry is missing there.
+   * - ``process.exe``
+     - Absolute path of the executable.
+   * - ``process.args``
+     - The command line, arguments separated by spaces.
+   * - ``process.cwd``
+     - Working directory when the tool started.
+   * - ``process.cpus_allowed``
+     - CPUs the process may run on when the tool starts, as a list such as
+       ``0-3,8`` (``Cpus_allowed_list`` of ``/proc/self/status``). Shows the
+       binding applied by the MPI launcher or batch system.
+   * - ``mpi.world_size``
+     - Number of MPI processes, from ``OMPI_COMM_WORLD_SIZE`` or
+       ``PMI_SIZE``.
+   * - ``env.<NAME>``
+     - Value of the environment variable ``<NAME>``, for every variable
+       whose name starts with ``OMP_``, ``KMP_``, ``GOMP_``, ``LIBOMP_`` or
+       ``TEMANEJO_``, sorted by name. A variable set to the empty string is
+       written with an empty value; an unset variable has no entry.
+
+The environment shows what was requested, not what the runtime did with it:
+team sizes actually used are in the ``IMPLICIT_TASK`` events, and the CPUs
+tasks ran on in every event.
+
+Every block starts with a ``u8`` type:
+
+.. list-table:: Blocks
+   :header-rows: 1
+   :widths: 8 16 76
+
+   * - Type
+     - Name
+     - Content after the type byte
+   * - 1
+     - events
+     - ``u32 n``, then ``n`` event records of 56 bytes, see `Event
+       records`_. Written by one thread when its buffer is full or old (see
+       :doc:`usage`), and for all threads at the end.
+   * - 2
+     - symbols
+     - ``u32 n``, then ``n`` `symbol records`_. A symbols block precedes the
+       events block in which a code address occurs for the first time.
+   * - 3
+     - end
+     - ``u64``: the total number of events in the file. It is the last block
+       and marks the trace as complete.
+
+**Incomplete traces.** If the process was killed, crashed or left through
+``_exit``, the file has no end block, and its last block may be cut off.
+Readers should use all blocks that are complete, drop a cut-off one, and
+report the trace as incomplete: events of every thread are missing from its
+last written block on. ``temanejo`` does this and prints a warning.
 
 Event records
 -------------
@@ -130,11 +214,13 @@ Unused payload fields are 0. ``endpoint`` is 0 where the table says –.
 Event order
 ~~~~~~~~~~~
 
-Events are grouped by thread: the records of one thread follow each other in
-the order they were recorded, and the threads' groups are concatenated. The
-file is therefore *not* globally sorted by time. A reader that needs a single
-timeline sorts by ``ts`` with a stable sort, which keeps the per-thread order
-of events with equal timestamps.
+Within an events block all records come from one thread, in the order they
+were recorded, and the blocks of one thread appear in the order they were
+written. Blocks of different threads are interleaved. The file is therefore
+*not* globally sorted by time, but reading the blocks in file order yields
+every thread's events in order. A reader that needs a single timeline
+concatenates the blocks and sorts by ``ts`` with a stable sort, which keeps
+the per-thread order of events with equal timestamps.
 
 Identifiers
 ~~~~~~~~~~~
@@ -266,12 +352,9 @@ Notes:
     construct, 9 implicit barrier at the end of a parallel region,
     10 barrier of a teams region.
 
-(6) 0, unless the runtime reported an address inside the OpenMP runtime for
-    a task created by a ``taskloop``. Then ``c`` holds that reported address
-    and ``d`` the address of the ``taskloop`` construct, taken from the
-    latest ``WORK`` begin event of type ``taskloop`` of the creating task
-    before the creation. Readers can use ``c != 0`` to recognise tasks
-    created by a ``taskloop``. See :doc:`runtime-notes`.
+(6) 0 in the file. After `Taskloop tasks`_ have been attributed by the
+    reader, ``c`` holds the address the runtime reported for a task created
+    by a ``taskloop`` and ``d`` the address of the construct.
 
 (7) ``ompt_work_t``: 1 loop, 2 sections, 3 single (executing thread),
     4 single (other threads), 5 workshare, 6 distribute, 7 taskloop, 8 scope,
@@ -293,8 +376,8 @@ traces (see also :doc:`runtime-notes`):
   flag and again through ``implicit_task``; both carry the same id.
 * The end event of an implicit task carries no region id (``b`` is 0).
 * Tasks created by ``taskloop``, and the construct itself in the ``work``
-  callback, are reported with an address inside ``__kmpc_taskloop``; the
-  tool corrects this as described in (6) and (8).
+  callback, are reported with an address inside ``__kmpc_taskloop``; see (8)
+  and `Taskloop tasks`_.
 * Worker threads report the end of the barrier at the end of a parallel
   region only when they are reused for the next region, if at all. Nothing
   is executed in the implicit task after that barrier has begun.
@@ -303,11 +386,11 @@ Symbol records
 --------------
 
 One record exists for every distinct non-zero code address in the
-``d`` field of ``PARALLEL_BEGIN``, ``TASK_CREATE``, ``SYNC_REGION`` and
-``WORK`` events and in the ``c`` field of ``TASK_CREATE`` events, sorted by
-address. The records are produced with ``dladdr1(3)`` while
-the process still runs, so the server can resolve addresses after the process
-has exited:
+``d`` field of ``PARALLEL_BEGIN``, ``TASK_CREATE``, ``SYNC_REGION``,
+``SYNC_WAIT`` and ``WORK`` events. The records are produced with
+``dladdr1(3)`` while the process runs, when an address first occurs in a
+buffer being written, so the server can resolve addresses after the process
+has exited or crashed:
 
 .. list-table::
    :header-rows: 1
@@ -338,11 +421,31 @@ Because ``addr`` is a return address, it points just after the call
 instruction. The server looks up ``addr - load_bias - 1`` to get the line of
 the call itself.
 
+Taskloop tasks
+--------------
+
+LLVM ``libomp`` reports a code address inside the runtime for the tasks of a
+``taskloop`` (see :doc:`runtime-notes`). The tool stores what it is given;
+the correction is the reader's job, because it needs events of other
+threads. After reading all blocks:
+
+1. For every ``WORK`` begin event of work type 7 (``taskloop``) note task
+   ``b``, time ``ts`` and address ``d``.
+2. For every ``TASK_CREATE`` whose address ``d`` has a symbol record with
+   ``module`` equal to the header's ``runtime_module``: take the latest
+   taskloop of its creating task ``b`` that began at or before the event's
+   ``ts``. If there is one, move ``d`` to ``c`` and set ``d`` to the
+   taskloop's address.
+
+A task with ``c != 0`` was created by a ``taskloop``. ``tmj_trace::Trace::read``
+does this (``attribute_taskloop_tasks``).
+
 Example: reading a trace in Python
 ----------------------------------
 
 The following script prints the header and counts events per kind. It needs
-only the Python standard library:
+only the Python standard library, reads complete and incomplete version 03
+files, and does not attribute taskloop tasks:
 
 .. code-block:: python
 
@@ -354,24 +457,55 @@ only the Python standard library:
             10: "SYNC_REGION", 11: "SYNC_WAIT", 12: "WORK"}
    EVENT = struct.Struct("<BBHH2xIIQQQQQ")   # 56 bytes
 
+   class Truncated(Exception):
+       pass
+
+   def read(f, n):
+       data = f.read(n)
+       if len(data) < n:
+           raise Truncated
+       return data
+
    def read_str(f):
-       (n,) = struct.unpack("<I", f.read(4))
-       return f.read(n).decode("utf-8", "replace")
+       (n,) = struct.unpack("<I", read(f, 4))
+       return read(f, n).decode("utf-8", "replace")
 
+   events, syms, complete = [], [], False
    with open(sys.argv[1], "rb") as f:
-       if f.read(8) != b"TMJTRC01":
-           sys.exit("not a version 01 temanejo trace")
-       rank, pid, epoch_ns = struct.unpack("<IIQ", f.read(16))
-       host = read_str(f)
-       (n_events,) = struct.unpack("<Q", f.read(8))
-       events = [EVENT.unpack(f.read(EVENT.size)) for _ in range(n_events)]
-       (n_syms,) = struct.unpack("<I", f.read(4))
-       syms = []
-       for _ in range(n_syms):
-           addr, load_bias = struct.unpack("<QQ", f.read(16))
-           syms.append((addr, load_bias, read_str(f), read_str(f)))
+       if f.read(8) != b"TMJTRC03":
+           sys.exit("not a version 03 temanejo trace")
+       rank, pid, epoch_ns = struct.unpack("<IIQ", read(f, 16))
+       host, runtime_module = read_str(f), read_str(f)
+       (n_info,) = struct.unpack("<I", read(f, 4))
+       info = dict((read_str(f), read_str(f)) for _ in range(n_info))
+       try:
+           while not complete:
+               kind = f.read(1)
+               if not kind:
+                   break                          # no end block
+               if kind[0] == 1:                   # events
+                   (n,) = struct.unpack("<I", read(f, 4))
+                   block = read(f, n * EVENT.size)
+                   events += EVENT.iter_unpack(block)
+               elif kind[0] == 2:                 # symbols
+                   (n,) = struct.unpack("<I", read(f, 4))
+                   block = []
+                   for _ in range(n):
+                       addr, load_bias = struct.unpack("<QQ", read(f, 16))
+                       block.append((addr, load_bias, read_str(f), read_str(f)))
+                   syms += block
+               elif kind[0] == 3:                 # end
+                   read(f, 8)
+                   complete = True
+               else:
+                   sys.exit(f"unknown block type {kind[0]}")
+       except Truncated:
+           pass                                   # drop the cut-off block
 
-   print(f"rank {rank} pid {pid} host {host}: {n_events} events, {n_syms} symbols")
+   print(f"rank {rank} pid {pid} host {host}: {len(events)} events, "
+         f"{len(syms)} symbols, {'complete' if complete else 'INCOMPLETE'}")
+   print("runtime:", info.get("omp.runtime_version", "unknown"),
+         "| threads requested:", info.get("env.OMP_NUM_THREADS", "not set"))
    counts = collections.Counter(NAMES.get(e[0], e[0]) for e in events)
    for name, n in counts.most_common():
        print(f"  {name:16} {n}")
@@ -390,3 +524,27 @@ Reading in Rust
            println!("task {} created by {} at {} ns", e.a, e.b, e.ts);
        }
    }
+
+``trace.complete`` is false for a trace without end block.
+
+Versions 01 and 02
+------------------
+
+**Version 02** (``TMJTRC02``) is version 03 without the information entries:
+its header ends after ``runtime_module``, and the first block follows
+directly.
+
+**Version 01** (``TMJTRC01``) files were written in one piece when the
+program ended:
+
+.. code-block:: text
+
+   magic "TMJTRC01"
+   u32 rank, u32 pid, u64 epoch_ns, str host
+   u64 n_events, n_events event records
+   u32 n_syms,   n_syms symbol records
+
+Event and symbol records are as in version 03. There are no
+``runtime_module`` and no information entries; the tool had already
+attributed taskloop tasks, so ``TASK_CREATE`` events carry ``c`` as described
+in `Taskloop tasks`_.

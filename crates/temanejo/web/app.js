@@ -177,7 +177,7 @@ async function loadInfo() {
 async function loadRanks() {
   loadInfo().catch(() => {});
   const ranks = await (await fetch('api/ranks')).json();
-  $('rank').innerHTML = ranks.map(r => `<option value="${r.rank}">${r.rank} – ${esc(r.host)} (${r.tasks} tasks)</option>`).join('');
+  $('rank').innerHTML = ranks.map(r => `<option value="${r.rank}">${r.rank} – ${esc(r.host)} (${r.tasks} tasks${r.complete ? '' : ', incomplete'})</option>`).join('');
   if (ranks.length) await loadRank(ranks[0].rank);
 }
 
@@ -283,6 +283,26 @@ function renderSummary() {
     `<button id="sel-crit" title="Select all tasks with work on the critical path for the region analysis">Select critical path</button>` +
     `<span class="muted">${n} task${n === 1 ? '' : 's'} on the path</span>`;
   $('sel-crit').onclick = () => setRegion(criticalTasks());
+  renderRunInfo();
+}
+
+// Optional information about the run from the trace header (S.g.info:
+// [key, value] pairs). Known keys get a label; "env.NAME" entries are
+// environment variables; anything else is shown under its key.
+const INFO_LABEL = {
+  'omp.runtime_version': 'OpenMP runtime', 'omp.runtime_library': 'OpenMP runtime library', 'omp.version': 'OpenMP version (_OPENMP)', 'omp.num_procs': 'Processors seen by the runtime',
+  'process.exe': 'Executable', 'process.args': 'Command line', 'process.cwd': 'Working directory', 'process.cpus_allowed': 'CPUs the process may use',
+  'mpi.world_size': 'MPI processes', 'tool.version': 'Recording tool version',
+};
+function renderRunInfo() {
+  const el = $('runinfo'), info = S.g.info || [];
+  el.hidden = !info.length;
+  if (!info.length) return;
+  const row = (k, v) => `<tr><td>${esc(k)}</td><td class="mono">${v === '' ? '<span class="muted">(empty)</span>' : esc(v)}</td></tr>`;
+  const env = info.filter(([k]) => k.startsWith('env.')), other = info.filter(([k]) => !k.startsWith('env.'));
+  el.innerHTML = `<summary>Run information</summary><table class="kv">` +
+    other.map(([k, v]) => row(INFO_LABEL[k] || k, v)).join('') +
+    (env.length ? `<tr><th colspan="2">Environment variables</th></tr>` + env.map(([k, v]) => row(k.slice(4), v)).join('') : '') + `</table>`;
 }
 
 // Indices of all tasks with work on the critical path of the whole graph.

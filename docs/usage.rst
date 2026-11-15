@@ -209,9 +209,27 @@ Environment variables of the tool
    ``tmj-trace`` relative to each process's working directory. It must be on
    a file system that every node can write to.
 
+``TEMANEJO_BUFFER_SIZE``
+   Size of the event buffer of each thread, in bytes, with an optional
+   suffix ``K``, ``M`` or ``G`` (powers of 1024), e.g. ``256K``. A thread
+   writes its buffer to the trace file when it is full. Default: ``1M``
+   (18 724 events); minimum 64 events. ``unlimited`` (or ``0``) keeps all
+   events in memory and writes them when the program ends, which avoids any
+   file access during the run. See `Buffering and flushing`_.
+
+``TEMANEJO_FLUSH_INTERVAL``
+   Seconds, may be fractional, e.g. ``0.5``. A thread also writes its
+   buffer when its oldest event is older than this. Default: ``0`` (off).
+
+``TEMANEJO_SYNC``
+   If set to anything but ``0``, the file is synchronised to the storage
+   device (``fdatasync``) after every write, so the data survives a crash
+   of the node, at a considerable cost per write.
+
 ``TEMANEJO_VERBOSE``
    If set (to any value), the tool reports on standard error which runtime it
-   attached to, which callbacks are unavailable, and how many events it wrote.
+   attached to, the trace file and buffering parameters, which callbacks are
+   unavailable, and how many events it wrote in how many blocks.
 
 ``TEMANEJO_LIB``
    Read by ``tmj-run`` only: tool library to use instead of
@@ -224,14 +242,67 @@ Environment variables of the tool
 Output
 ------
 
-Each process writes ``<TEMANEJO_TRACE_DIR>/rank-<rank>.tmj`` when the OpenMP
+Each process writes ``<TEMANEJO_TRACE_DIR>/rank-<rank>.tmj``. The file is
+created when the OpenMP runtime starts the tool and completed when the
 runtime finalizes, normally at program exit. The format is described in
-:doc:`trace-format`. A process that crashes, is killed or leaves through
-``_exit`` writes no file. Existing files of the same name are overwritten, so
-use a fresh directory per run.
+:doc:`trace-format`. Existing files of the same name are overwritten, so use
+a fresh directory per run. If the file cannot be created, the tool reports
+it and records nothing.
 
-Events are kept in memory until then: 56 bytes per event, about five events
-per task (the example program: 60 890 events for 12 037 tasks, 3.4 MB).
+The file header also records what is known about the run: the OpenMP
+runtime and its version, executable, command line and working directory,
+the CPUs the process was allowed to use, the number of MPI processes, and
+all ``OMP_*``, ``KMP_*``, ``GOMP_*``, ``LIBOMP_*`` and ``TEMANEJO_*``
+environment variables. The GUI shows it under *Run information* in the
+*Process* panel; the keys are listed in :doc:`trace-format`.
+
+A trace takes 56 bytes per event and about five events per task: the example
+program produces 60 890 events for 12 037 tasks, 3.4 MB.
+
+Buffering and flushing
+----------------------
+
+Every thread collects its events in a buffer of its own and appends the
+buffer to the trace file in one piece
+
+* when it is full (``TEMANEJO_BUFFER_SIZE``, default 1 MiB per thread),
+* when its oldest event is older than ``TEMANEJO_FLUSH_INTERVAL`` (off by
+  default), checked whenever the thread records an event,
+* when the thread ends, and for all threads when the runtime finalizes.
+
+Memory use is therefore bounded by the buffer size times the number of
+threads, whatever the length of the run.
+
+**Choosing the parameters.** Writing happens inside an OpenMP callback of
+the thread whose buffer is full: that thread, and the task it is about to
+run or has just finished, is delayed for the duration of the write, and
+writes of different threads are serialised. Larger buffers mean fewer but
+longer interruptions; ``unlimited`` means none during the run.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 38 62
+
+   * - Goal
+     - Setting
+   * - Least disturbance of a short run
+     - ``TEMANEJO_BUFFER_SIZE=unlimited``: all events stay in memory (56
+       bytes each) until the end.
+   * - Long run, bounded memory
+     - the default, or a larger buffer such as ``16M`` to write less often.
+   * - Program that crashes or hangs
+     - a small buffer such as ``64K`` together with
+       ``TEMANEJO_FLUSH_INTERVAL=1``; add ``TEMANEJO_SYNC=1`` if the node
+       itself may go down.
+
+**Runs that do not finish.** A process that is killed, crashes or leaves
+through ``_exit`` cannot write its remaining buffers and the end marker.
+The file then holds every thread's events up to that thread's last write;
+``temanejo`` loads it, reports it as incomplete on standard error and marks
+the rank as *incomplete* in the rank selector. Tasks that were running are
+shown as ending with the last recorded event. A thread that records no
+events, e.g. one blocked in a system call, does not write: the flush
+interval is only checked when an event arrives.
 
 Viewing
 -------

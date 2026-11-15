@@ -28,6 +28,8 @@ struct Rank {
     graph_json: String,
     /// Wall-clock time (ns since the Unix epoch) when the tool started in this process.
     epoch_ns: u64,
+    /// False if the trace has no end marker: the run did not finish cleanly.
+    complete: bool,
 }
 
 /// Describes the loaded run: trace directory and recording time.
@@ -65,7 +67,7 @@ fn summary_json(r: &Rank) -> String {
     let m = &r.model;
     let work = m.total_work();
     format!(
-        "{{\"rank\":{},\"host\":{},\"pid\":{},\"tasks\":{},\"threads\":{},\"events\":{},\"wall\":{},\"work\":{},\"critical\":{}}}",
+        "{{\"rank\":{},\"host\":{},\"pid\":{},\"tasks\":{},\"threads\":{},\"events\":{},\"wall\":{},\"work\":{},\"critical\":{},\"complete\":{}}}",
         m.rank,
         esc(&m.host),
         m.pid,
@@ -74,7 +76,8 @@ fn summary_json(r: &Rank) -> String {
         m.n_events,
         m.wall,
         work,
-        r.crit.length
+        r.crit.length,
+        r.complete
     )
 }
 
@@ -131,7 +134,9 @@ fn header_json(m: &Model, crit: &PathResult, locs: &[Loc], loc_of: &HashMap<u64,
         crit.length,
         peak
     );
-    o.push_str("\"threads\":[");
+    o.push_str("\"info\":");
+    list(&mut o, m.info.iter().map(|(k, v)| format!("[{},{}]", esc(k), esc(v))));
+    o.push_str(",\"threads\":[");
     for (i, t) in m.threads.iter().enumerate() {
         let _ = write!(o, "{}{{\"id\":{},\"tid\":{},\"type\":{}}}", if i > 0 { "," } else { "" }, t.id, t.os_tid, t.thread_type);
     }
@@ -544,6 +549,18 @@ fn load(dir: &str) -> Vec<Rank> {
                 continue;
             }
         };
+        if !trace.complete {
+            eprintln!(
+                "temanejo: {} has no end marker: the run of rank {} did not finish cleanly; showing the {} events recorded up to its last flush",
+                path.display(),
+                trace.rank,
+                trace.events.len()
+            );
+        }
+        if trace.events.is_empty() {
+            eprintln!("temanejo: skipping {}: it contains no events", path.display());
+            continue;
+        }
         let model = Model::build(&trace);
         let crit = analysis::critical_path(&model, None);
         let locs = symbolize::symbolize(&trace.syms);
@@ -551,7 +568,7 @@ fn load(dir: &str) -> Vec<Rank> {
         let groups = analysis::groups(&model);
         let top = analysis::top_group(model.tasks.len(), &groups);
         let graph_json = graph_json(&model, &crit, &locs, &loc_of, &groups, &top);
-        ranks.push(Rank { model, crit, locs, loc_of, groups, graph_json, epoch_ns: trace.epoch_ns });
+        ranks.push(Rank { model, crit, locs, loc_of, groups, graph_json, epoch_ns: trace.epoch_ns, complete: trace.complete });
     }
     ranks.sort_by_key(|r| r.model.rank);
     ranks
