@@ -21,7 +21,7 @@ const FLAGS = [[0x08000000, 'undeferred'], [0x10000000, 'untied'], [0x20000000, 
 
 const S = {
   g: null, view: 'graph', colorBy: 'thread',
-  showCrit: true, showCreate: true, showDep: true,
+  showCrit: true, showCreate: true, showDep: true, fadeOthers: true,
   sel: -1, region: new Set(), regionInfo: null, regionCrit: new Map(), regionEdges: new Set(),
   cam: { x: 0, y: 0, k: 1 },           // graph camera: screen = world * k + (x, y)
   tl: { t0: 0, t1: 1 },                // visible time window of the timeline
@@ -278,21 +278,37 @@ function drawGraph() {
   };
   const far = k < 0.25;
   const isCrit = e => S.showCrit && e[3];
-  if (S.showCreate) pass(e => e[2] === 0 && !isCrit(e), css.edgeCreate, 1, far ? 0.5 : 0.9);
-  if (S.showDep) pass(e => e[2] === 1 && !isCrit(e), css.edgeDep, 1, far ? 0.35 : 0.7);
+  // With "grey out unselected", everything outside the selected region is
+  // drawn first in grey; only edges between two selected tasks keep their style.
+  const fade = S.fadeOthers && S.region.size > 0;
+  const inSel = e => !fade || (S.region.has(e[0]) && S.region.has(e[1]));
+  const shown = e => e[2] === 0 ? S.showCreate : S.showDep;
+  if (fade) pass(e => shown(e) && !inSel(e), css.axis, 1, far ? 0.25 : 0.4);
+  if (S.showCreate) pass(e => e[2] === 0 && !isCrit(e) && inSel(e), css.edgeCreate, 1, far ? 0.5 : 0.9);
+  if (S.showDep) pass(e => e[2] === 1 && !isCrit(e) && inSel(e), css.edgeDep, 1, far ? 0.35 : 0.7);
   if (S.regionEdges.size) pass(e => S.regionEdges.has(e[0] + ',' + e[1]) || S.regionEdges.has(e[1] + ',' + e[0]), css.ink, 2.5, 1);
-  if (S.showCrit) pass(e => e[3] && (e[2] === 0 ? S.showCreate : S.showDep), css.critical, Math.max(2, 3 * Math.min(k, 1)), 1);
+  if (S.showCrit) pass(e => e[3] && shown(e) && inSel(e), css.critical, Math.max(2, 3 * Math.min(k, 1)), 1);
 
-  // Nodes.
+  // Nodes. When greying out, unselected nodes are drawn first, in grey and
+  // without marks, so the selected ones lie on top in their true colours.
   const simple = r < 2.5;
-  for (let i = 0; i < T.length; i++) {
+  const order = fade ? [...T.keys()].filter(i => !S.region.has(i)).concat([...S.region]) : T.keys();
+  for (const i of order) {
     const t = T[i], x = sx(t), y = sy(t);
     if (x < -r - 4 || x > S.w + r + 4 || y < -r - 4 || y > S.h + r + 4) continue;
+    if (fade && !S.region.has(i)) {
+      ctx.fillStyle = css.axis;
+      if (simple) ctx.fillRect(x - r, y - r, 2 * r, 2 * r);
+      else { ctx.beginPath(); shape(t, x, y, r); ctx.fill(); }
+      continue;
+    }
     ctx.fillStyle = color(t);
     if (simple) { ctx.fillRect(x - r, y - r, 2 * r, 2 * r); }
     else {
       ctx.beginPath(); shape(t, x, y, r); ctx.fill();
-      if (S.region.has(i)) {
+      // Ink rings mark the selection; with greying out only the region's
+      // critical path keeps its (thick) ring.
+      if (S.region.has(i) && (!fade || S.regionCrit.has(i))) {
         ctx.lineWidth = S.regionCrit.has(i) ? 3.5 : 1.5; ctx.strokeStyle = css.ink;
         ctx.beginPath(); shape(t, x, y, r + 2.5); ctx.stroke();
       }
@@ -303,7 +319,7 @@ function drawGraph() {
     }
     if (simple && S.showCrit && t.cr > 0) { ctx.fillStyle = css.critical; ctx.fillRect(x - r - 1, y - r - 1, 2 * r + 2, 2 * r + 2); }
   }
-  if (simple && S.region.size) {
+  if (simple && S.region.size && !fade) {
     ctx.fillStyle = css.ink; ctx.globalAlpha = 0.55;
     for (const i of S.region) { const t = T[i]; ctx.fillRect(sx(t) - r, sy(t) + r, 2 * r, 1.5); }
     ctx.globalAlpha = 1;
@@ -368,16 +384,17 @@ function drawTimeline() {
 
   ctx.save(); ctx.beginPath(); ctx.rect(TL.left, 0, S.w - TL.left, S.h); ctx.clip();
   g.tasks.forEach((t, i) => {
-    const inRegion = S.region.has(i);
+    const inRegion = S.region.has(i), grey = S.fadeOthers && S.region.size > 0 && !inRegion;
     for (const s of t.segs) {
       if (s[5] < S.tl.t0 || s[4] > S.tl.t1) continue;
       const row = rowOf.get(s[0]); if (row === undefined) continue;
       const x = tlX(s[4]), w = Math.max(tlX(s[5]) - x, 0.6), y = TL.top + row * TL.row + (TL.row - TL.bar) / 2;
-      ctx.fillStyle = color(t);
+      ctx.fillStyle = grey ? css.axis : color(t);
       // A 1px surface gap separates adjacent segments once they are wide enough.
       ctx.fillRect(x, y, w > 3 ? w - 1 : w, TL.bar);
+      if (grey) continue;
       if (S.showCrit && t.cr > 0) { ctx.fillStyle = css.critical; ctx.fillRect(x, y + TL.bar + 1, w > 3 ? w - 1 : w, 3); }
-      if (inRegion) { ctx.fillStyle = css.ink; ctx.fillRect(x, y - 4, w > 3 ? w - 1 : w, 2); }
+      if (inRegion && !S.fadeOthers) { ctx.fillStyle = css.ink; ctx.fillRect(x, y - 4, w > 3 ? w - 1 : w, 2); }
       if (i === S.sel || i === S.hover) { ctx.strokeStyle = css.ink; ctx.lineWidth = i === S.sel ? 2 : 1; ctx.strokeRect(x - 1, y - 1, w + 1, TL.bar + 2); }
     }
   });
@@ -487,7 +504,7 @@ function select(i) { S.sel = i; renderTask(); draw(); }
 
 $('rank').onchange = e => loadRank(e.target.value);
 $('color').onchange = e => { S.colorBy = e.target.value; assignSlots(); renderLegend(); renderOrigins(); renderTask(); draw(); };
-for (const [id, key] of [['show-crit', 'showCrit'], ['show-create', 'showCreate'], ['show-dep', 'showDep']])
+for (const [id, key] of [['show-crit', 'showCrit'], ['show-create', 'showCreate'], ['show-dep', 'showDep'], ['fade-others', 'fadeOthers']])
   $(id).onchange = e => { S[key] = e.target.checked; renderLegend(); draw(); };
 for (const v of ['graph', 'timeline']) $('view-' + v).onclick = () => {
   S.view = v;
@@ -560,6 +577,7 @@ function renderLegend() {
     if (vals.length > 8) html += `<span class="muted">+${vals.length - 8} more reuse these colours – see the task details</span>`;
   }
   if (S.showCrit) html += `<span><span class="sw ring"></span>critical path</span>`;
+  if (S.fadeOthers && S.region.size) html += `<span><span class="sw" style="background:${S.css.axis}"></span>not selected</span>`;
   html += `<span class="muted">○ explicit · □ implicit · ◇ initial</span>`;
   $('legend').innerHTML = html;
 }
@@ -637,6 +655,7 @@ $('task').addEventListener('click', e => {
 
 async function setRegion(sel) {
   S.region = sel; S.regionInfo = null; S.regionCrit = new Map(); S.regionEdges = new Set();
+  renderLegend();
   const el = $('region');
   if (!sel.size) {
     el.innerHTML = '<p class="muted">Shift+drag over the graph (or a time range in the timeline) to analyse the degree of parallelism of a region.</p>';

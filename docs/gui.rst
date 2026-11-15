@@ -45,6 +45,15 @@ Colour by
 Critical path, Creation edges, Dependence edges
    Show or hide these overlays.
 
+Grey out unselected
+   While a region is selected (see `Region analysis`_), draw all tasks
+   outside it in grey, without critical path marks, and all edges that do
+   not connect two selected tasks in light grey. The selected tasks keep
+   their colours, which matters for the sequential colour modes. On by
+   default. When it is off, selected tasks are marked in black instead: a
+   ring, or a bar below the node when zoomed out, and a bar above each
+   segment in the timeline.
+
 Task id, Fit
    Jump to a task by its id; fit the view to the window (key ``F``).
 
@@ -127,8 +136,10 @@ the panel shows:
 * a chart of that number over time (hover for values);
 * the work done by each thread.
 
-Tasks on the selection's own critical path get a thick outline. The
-quantities are defined in :doc:`metrics`.
+Tasks on the selection's own critical path get a thick black outline, and
+the path is drawn as a thick black line. With *Grey out unselected* (the
+default) the rest of the graph is drawn in grey. *Clear selection* in the
+panel ends the selection. The quantities are defined in :doc:`metrics`.
 
 Links
 -----
