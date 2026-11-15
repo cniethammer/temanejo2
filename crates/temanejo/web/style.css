@@ -82,6 +82,8 @@ main { flex: 1; display: flex; min-height: 0; }
 #legend .ramp { display: inline-block; width: 90px; height: 8px; border-radius: 4px; margin: 0 6px; vertical-align: 0;
   background: linear-gradient(90deg, var(--seq-lo), var(--seq-hi)); }
 #hint { position: absolute; right: 12px; bottom: 12px; max-width: 36%; text-align: right; color: var(--muted); font-size: 12px; pointer-events: none; }
+#perf { position: absolute; right: 12px; top: 8px; padding: 3px 8px; border-radius: 6px; font-size: 12px;
+  background: color-mix(in srgb, var(--surface) 90%, transparent); border: 1px solid var(--grid); color: var(--ink2); font-variant-numeric: tabular-nums; }
 kbd { border: 1px solid var(--axis); border-radius: 4px; padding: 0 4px; font: inherit; }
 #tip {
   position: absolute; pointer-events: none; z-index: 5; white-space: nowrap;

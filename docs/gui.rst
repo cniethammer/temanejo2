@@ -19,6 +19,14 @@ Keyboard
 :kbd:`Esc`
    Clear the region selection and the selected task; while drawing a
    selection rectangle, cancel it.
+:kbd:`P`
+   Show or hide the frame time display, to find out which settings make the
+   GUI slow on a given machine. It shows the measured time between frames
+   for *full redraws* (with the JavaScript part of the last one in
+   brackets; the rest is the browser turning the drawing into pixels) and
+   for *move/overlay* frames. The values are meaningful while the view
+   changes continuously, e.g. during panning; for hovering they are an
+   upper bound.
 Arrow keys
    With the divider between graph and side panel focused: change the panel
    width.
@@ -83,10 +91,22 @@ diamond for the initial task. Light edges are task creation (parent to child,
 including a parallel region's encountering task to the implicit tasks), dark
 edges are ``depend`` dependences. Red marks the critical path.
 
+Tasks that create many children (8 or more, e.g. the task running a
+``taskloop`` or a ``single`` that spawns all tasks of a phase) have their
+creation edges drawn as a *bus*: a short trunk below the parent, a
+horizontal line above each row of children, and a stub down to each child.
+This keeps thousands of long crossing lines from covering the graph and
+from slowing down drawing. Creation edges on the critical path are still
+drawn as direct red lines.
+
 The layout is layered: every edge points downwards. Layers with more tasks
 than fit on a line are wrapped over several rows.
 
-Drag to pan, use the wheel to zoom. Task ids are drawn once the zoom is large
+Drag to pan, use the wheel to zoom. While the view moves, the picture
+already drawn is shifted and scaled, so it can look blurry or leave the
+border empty for a moment; it is redrawn sharp when the movement pauses for
+150 ms or the mouse button is released. Hovering and clicking a task only
+redraw the marks on top of the picture. Task ids are drawn once the zoom is large
 enough.
 
 Timeline view
@@ -197,6 +217,11 @@ The state can be preset through the URL fragment, e.g.::
    ``create``, ``start`` or ``wait``
 ``task``
    task id to select and centre
+``perf``
+   show the frame time display (no value needed)
+``gpubase``
+   draw the graph with the browser's GPU canvas instead of the software
+   canvas used by default (no value needed); for performance comparisons
 ``select``
    ``critical``: select all tasks on the critical path; ``subtree`` or
    ``region``: select relative to ``task``
