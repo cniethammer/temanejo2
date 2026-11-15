@@ -770,3 +770,110 @@ pub fn summarize_groups(m: &Model, crit: &PathResult, grouping: &Grouping) -> Ve
     }
     agg.iter().map(Aggregate::summary).collect()
 }
+
+// ------------------------------------------------------------------ critical path gaps
+
+/// What happens at a moment of the run with respect to the critical path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GapKind {
+    /// A task with work on the critical path is executing.
+    OnPath = 0,
+    /// No critical task executes, and every available thread executes some
+    /// other task: the run is limited by the amount of work.
+    Busy = 1,
+    /// No critical task executes, a thread is idle, and a critical task is
+    /// ready (created, all dependence predecessors finished) but not started:
+    /// a scheduling problem.
+    Waiting = 2,
+    /// No critical task executes, a thread is idle, and no critical task is
+    /// ready: e.g. runtime overhead, or time spent in no task at all.
+    Idle = 3,
+}
+
+pub struct CriticalGaps {
+    /// Consecutive intervals `(begin, end, kind)` covering the whole run.
+    pub intervals: Vec<(u64, u64, GapKind)>,
+    /// Total time per kind, indexed by `GapKind as usize`.
+    pub totals: [u64; 4],
+}
+
+/// Classifies every moment of the run (0 to `m.wall`) by `GapKind`.
+///
+/// A thread is available from the start of its first to the end of its last
+/// execution segment. A critical task is waiting from the moment it is
+/// ready, the later of its creation and the completion of its dependence
+/// predecessors, until its first segment starts.
+pub fn critical_gaps(m: &Model, crit: &PathResult) -> CriticalGaps {
+    // Changes of four counters: critical tasks running, tasks running,
+    // threads available, critical tasks waiting.
+    let mut changes: Vec<(u64, usize, i32)> = Vec::new();
+    let mut ready = vec![0u64; m.tasks.len()];
+    for e in m.edges.iter().filter(|e| e.kind == crate::model::EdgeKind::Depend) {
+        let r = &mut ready[e.to as usize];
+        *r = (*r).max(m.tasks[e.from as usize].end);
+    }
+    let mut span: std::collections::HashMap<u32, (u64, u64)> = Default::default();
+    for (i, t) in m.tasks.iter().enumerate() {
+        let critical = crit.task_time[i] > 0;
+        for s in t.segs.iter().filter(|s| s.end > s.start) {
+            changes.push((s.start, 1, 1));
+            changes.push((s.end, 1, -1));
+            if critical {
+                changes.push((s.start, 0, 1));
+                changes.push((s.end, 0, -1));
+            }
+            let sp = span.entry(s.thread).or_insert((s.start, s.end));
+            sp.0 = sp.0.min(s.start);
+            sp.1 = sp.1.max(s.end);
+        }
+        if critical {
+            if let Some(first) = t.segs.first() {
+                let from = ready[i].max(t.create_ts);
+                if from < first.start {
+                    changes.push((from, 3, 1));
+                    changes.push((first.start, 3, -1));
+                }
+            }
+        }
+    }
+    for &(a, b) in span.values() {
+        changes.push((a, 2, 1));
+        changes.push((b, 2, -1));
+    }
+    changes.sort_unstable_by_key(|c| c.0);
+
+    let mut intervals: Vec<(u64, u64, GapKind)> = Vec::new();
+    let mut totals = [0u64; 4];
+    let mut count = [0i32; 4];
+    let mut push = |a: u64, b: u64, kind: GapKind| {
+        if b <= a {
+            return;
+        }
+        totals[kind as usize] += b - a;
+        match intervals.last_mut() {
+            Some(last) if last.2 == kind && last.1 == a => last.1 = b,
+            _ => intervals.push((a, b, kind)),
+        }
+    };
+    let mut t = 0u64;
+    let mut k = 0;
+    while t < m.wall {
+        while k < changes.len() && changes[k].0 <= t {
+            count[changes[k].1] += changes[k].2;
+            k += 1;
+        }
+        let next = changes.get(k).map_or(m.wall, |c| c.0.min(m.wall));
+        let kind = if count[0] > 0 {
+            GapKind::OnPath
+        } else if count[2] > 0 && count[1] >= count[2] {
+            GapKind::Busy
+        } else if count[3] > 0 {
+            GapKind::Waiting
+        } else {
+            GapKind::Idle
+        };
+        push(t, next, kind);
+        t = next;
+    }
+    CriticalGaps { intervals, totals }
+}

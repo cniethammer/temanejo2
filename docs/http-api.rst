@@ -100,6 +100,15 @@ The server has no authentication and binds to ``127.0.0.1`` by default.
    ``peak``, the largest number of them executing at the same time. Computed
    on request with a pass over the graph.
 
+``GET /api/rank/<rank>/gaps``
+   The run's time classified around the critical path (see
+   :doc:`metrics`, "Critical path gaps"): ``start`` and ``kind`` list
+   consecutive intervals by their begin and class (0 on the critical path,
+   1 gap with all threads busy, 2 gap with a critical task waiting, 3 gap
+   with threads idle); an interval ends where the next begins, the last
+   one at ``end``. ``total`` is the time per class. Computed on the first
+   request and kept.
+
 ``POST /api/rank/<rank>/view``
    The dependence edges between the nodes that are visible when certain
    groups are expanded. Request body: the ids of the expanded groups,

@@ -764,3 +764,39 @@ fn nested_groups_are_visible_one_level_at_a_time() {
     inner[gr.groups[top].children[0] as usize] = true;
     assert_eq!(gr.visible(&inner), all);
 }
+
+// ------------------------------------------------------------------ critical path gaps
+
+fn gaps(trace: &Trace) -> Vec<(u64, u64, analysis::GapKind)> {
+    let (m, crit) = analyse(trace);
+    let g = analysis::critical_gaps(&m, &crit);
+    // The intervals cover the run without holes and add up to the totals.
+    assert_eq!(g.intervals.first().map(|i| i.0), Some(0));
+    assert_eq!(g.intervals.last().map(|i| i.1), Some(m.wall));
+    assert!(g.intervals.windows(2).all(|w| w[0].1 == w[1].0 && w[0].2 != w[1].2), "contiguous and merged");
+    for k in 0..4 {
+        let sum: u64 = g.intervals.iter().filter(|i| i.2 as usize == k).map(|i| i.1 - i.0).sum();
+        assert_eq!(sum, g.totals[k]);
+    }
+    g.intervals
+}
+
+#[test]
+fn gap_while_one_thread_runs_other_work() {
+    use analysis::GapKind::*;
+    // Dependence scenario, one thread: critical tasks I (0-8, 44-50),
+    // A (8-18) and B (23-43). From 18 to 23 the only thread runs C, which is
+    // not critical, while B (ready at 18, when A ends) waits: busy, because
+    // no thread is free. From 43 to 44 nothing runs: idle.
+    assert_eq!(gaps(&dependence_trace()), [(0, 18, OnPath), (18, 23, Busy), (23, 43, OnPath), (43, 44, Idle), (44, 50, OnPath)]);
+}
+
+#[test]
+fn gap_while_a_critical_task_waits_for_a_thread() {
+    use analysis::GapKind::*;
+    // Two threads: critical tasks I (0-10, 59-70), implicit task 10 (10-16)
+    // and task 20 (17-57). Task 20 is created at 15 without dependences;
+    // from 16 to 17 both threads are idle in the barrier while it is ready:
+    // waiting. From 57 to 59 no task runs and none is ready: idle.
+    assert_eq!(gaps(&parallel_trace()), [(0, 16, OnPath), (16, 17, Waiting), (17, 57, OnPath), (57, 59, Idle), (59, 70, OnPath)]);
+}

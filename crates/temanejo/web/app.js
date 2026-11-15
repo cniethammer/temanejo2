@@ -73,6 +73,7 @@ function readCss() {
   S.css = {
     surface: v('--surface'), ink: v('--ink'), ink2: v('--ink2'), muted: v('--muted'), grid: v('--grid'), axis: v('--axis'),
     edgeCreate: v('--edge-create'), edgeDep: v('--edge-dep'), critical: v('--critical'),
+    gap: [v('--critical'), v('--gap-busy'), v('--gap-wait'), v('--gap-idle')],
     cat: [1, 2, 3, 4, 5, 6, 7, 8].map(i => v('--s' + i)), seqLo: v('--seq-lo'), seqHi: v('--seq-hi'),
   };
 }
@@ -969,11 +970,93 @@ function drawBand() {
 // ------------------------------------------------------------------ timeline
 
 const TL = { left: 86, top: 30, row: 30, bar: 20 };
+// Critical path strip above the thread rows (with the "Critical path" overlay).
+const STRIP = { top: 24, height: 16 };
+const GAP_LABEL = ['critical path running', 'gap: all threads busy with other work', 'gap: critical task ready, a thread idle', 'gap: threads idle, no critical task ready'];
+const GAP_SHORT = ['on critical path', 'gap, threads busy', 'gap, critical task waiting', 'gap, idle'];
+
+// The classification of the run's time around the critical path, from the
+// server (analysis::critical_gaps), fetched once per rank. Kept as typed
+// arrays: interval j runs from st[j] to st[j + 1] and has class kd[j]. For
+// wide views, the time per class is summed up over GAP_BINS equal bins of
+// the run once; `cum` holds the running totals per class over the bins.
+const GAP_BINS = 1 << 16;
+function loadGaps() {
+  const g = S.g;
+  if (g.gaps || g.gapsLoading) return;
+  g.gapsLoading = fetch(`api/rank/${g.rank}/gaps`).then(r => r.json()).then(raw => {
+    if (S.g !== g) return;
+    const n = raw.kind.length, st = new Float64Array(n + 1), kd = Uint8Array.from(raw.kind);
+    st.set(raw.start); st[n] = raw.end;
+    const span = Math.max(raw.end, 1), width = span / GAP_BINS, bins = new Float64Array(GAP_BINS * 4);
+    for (let j = 0; j < n; j++) {
+      const fa = st[j] / width, fb = st[j + 1] / width;
+      for (let c = Math.floor(fa); c < Math.min(Math.ceil(fb), GAP_BINS); c++) bins[c * 4 + kd[j]] += (Math.min(fb, c + 1) - Math.max(fa, c)) * width;
+    }
+    const cum = new Float64Array((GAP_BINS + 1) * 4);
+    for (let c = 0; c < GAP_BINS; c++) for (let k = 0; k < 4; k++) cum[(c + 1) * 4 + k] = cum[c * 4 + k] + bins[c * 4 + k];
+    g.gaps = { st, kd, n, width, bins, cum, total: raw.total };
+    renderLegend();
+    draw();
+  });
+}
+const stripShown = () => S.showCrit && S.view === 'timeline';
+
+function drawGapStrip() {
+  const gaps = S.g.gaps;
+  ctx.fillStyle = S.css.ink2; ctx.textAlign = 'left';
+  ctx.fillText('critical path', 10, STRIP.top + STRIP.height / 2);
+  if (!gaps) { loadGaps(); return; }
+  // Per pixel column the class that takes most of its time: classes change
+  // far faster than one pixel between fine-grained tasks, and drawing all
+  // intervals would let whichever class is drawn last dominate.
+  const x0 = TL.left, cols = Math.max(1, Math.ceil(S.w - TL.left - 12)), per = (S.tl.t1 - S.tl.t0) / cols;
+  const time = new Float64Array(cols * 4), { st, kd, n, width, bins, cum } = gaps;
+  if (per >= 4 * width) {
+    // Wide view: running totals over the bins, interpolated inside a bin.
+    const at = (x, k) => { const b = Math.min(Math.max(x, 0), GAP_BINS), i = Math.min(Math.floor(b), GAP_BINS - 1); return cum[i * 4 + k] + (b - i) * bins[i * 4 + k]; };
+    for (let c = 0; c < cols; c++) {
+      const a = (S.tl.t0 + c * per) / width, b = (S.tl.t0 + (c + 1) * per) / width;
+      for (let k = 0; k < 4; k++) time[c * 4 + k] = at(b, k) - at(a, k);
+    }
+  } else {
+    // Narrow view: the intervals inside it.
+    let lo = 0, hi = n;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (st[mid + 1] < S.tl.t0) lo = mid + 1; else hi = mid; }
+    for (let j = lo; j < n && st[j] < S.tl.t1; j++) {
+      const fa = (Math.max(st[j], S.tl.t0) - S.tl.t0) / per, fb = (Math.min(st[j + 1], S.tl.t1) - S.tl.t0) / per;
+      for (let c = Math.max(0, Math.floor(fa)); c < Math.min(Math.ceil(fb), cols); c++) time[c * 4 + kd[j]] += Math.min(fb, c + 1) - Math.max(fa, c);
+    }
+  }
+  const paths = [new Path2D(), new Path2D(), new Path2D(), new Path2D()];
+  let runStart = 0, runKind = -1;
+  for (let c = 0; c <= cols; c++) {
+    let kind = -1, best = 0;
+    if (c < cols) for (let k = 0; k < 4; k++) if (time[c * 4 + k] > best) { best = time[c * 4 + k]; kind = k; }
+    if (kind !== runKind) {
+      if (runKind >= 0) paths[runKind].rect(x0 + runStart, STRIP.top, c - runStart, STRIP.height);
+      runStart = c; runKind = kind;
+    }
+  }
+  for (let k = 0; k < 4; k++) { ctx.fillStyle = S.css.gap[k]; ctx.fill(paths[k]); }
+}
+
+// The gap interval under the mouse as [begin, end, class], or null.
+function pickGap(mx, my) {
+  const gaps = S.g.gaps;
+  if (!stripShown() || !gaps || mx < TL.left || my < STRIP.top - 2 || my > STRIP.top + STRIP.height + 2) return null;
+  const t = tlT(mx), { st, kd, n } = gaps;
+  if (t < st[0] || t > st[n]) return null;
+  let lo = 0, hi = n - 1;
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (st[mid] <= t) lo = mid; else hi = mid - 1; }
+  return [st[lo], st[lo + 1], kd[lo]];
+}
 const tlX = t => TL.left + (t - S.tl.t0) / (S.tl.t1 - S.tl.t0) * (S.w - TL.left - 12);
 const tlT = x => S.tl.t0 + (x - TL.left) / (S.w - TL.left - 12) * (S.tl.t1 - S.tl.t0);
 
 function drawTimeline() {
   const { g, css } = S;
+  TL.top = stripShown() ? STRIP.top + STRIP.height + 12 : 30;
   ctx.clearRect(0, 0, S.w, S.h);
   ctx.font = '11px system-ui, sans-serif'; ctx.textBaseline = 'middle';
   // Time axis: about 8 round ticks.
@@ -990,6 +1073,7 @@ function drawTimeline() {
   const rowOf = new Map(g.threads.map((t, i) => [t.id, i]));
   ctx.textAlign = 'left'; ctx.fillStyle = css.ink2;
   g.threads.forEach((t, i) => ctx.fillText(`thread ${t.id}`, 10, TL.top + i * TL.row + TL.row / 2));
+  if (stripShown()) drawGapStrip();
 
   ctx.save(); ctx.beginPath(); ctx.rect(TL.left, 0, S.w - TL.left, S.h); ctx.clip();
   // Batched like the graph: one path per fill colour and per kind of mark.
@@ -1095,6 +1179,17 @@ canvas.addEventListener('pointermove', e => {
   if (!S.g) return;
   const [x, y] = pos(e), d = S.drag;
   if (!d) {
+    const gap = S.view === 'timeline' ? pickGap(x, y) : null;
+    if (gap) {
+      if (S.hover >= 0) { S.hover = -1; draw(true); }
+      const tip = $('tip'), total = Math.max(S.g.wall, 1);
+      tip.innerHTML = `<b>${GAP_LABEL[gap[2]]}</b><br>${fmt(gap[0])} → ${fmt(gap[1])} (${fmt(gap[1] - gap[0])})<br>` +
+        `<span style="opacity:.75">${GAP_SHORT[gap[2]]} in total: ${fmt(S.g.gaps.total[gap[2]])} (${pctText(S.g.gaps.total[gap[2]], total)} % of the run)</span>`;
+      tip.hidden = false;
+      tip.style.left = Math.min(x + 14, S.w - tip.offsetWidth - 6) + 'px';
+      tip.style.top = Math.max(y + 16, 4) + 'px';
+      return;
+    }
     const h = pick(x, y), task = Math.max(h, -1), grp = h < -1 ? -h - 2 : -1;
     if (task !== S.hover || grp !== S.hoverGroup) { S.hover = task; S.hoverGroup = grp; draw(true); }
     return showTip(h, x, y);
@@ -1175,6 +1270,7 @@ for (const v of ['graph', 'timeline']) $('view-' + v).onclick = async () => {
   $('hint').innerHTML = v === 'graph'
     ? 'Drag to pan · wheel to zoom · click a task · <kbd>Shift</kbd>+drag to select a region · <kbd>Esc</kbd> to clear'
     : 'Drag to pan · wheel to zoom time · click a segment · <kbd>Shift</kbd>+drag to select a time range · <kbd>Esc</kbd> to clear';
+  renderLegend();
   draw();
 };
 $('fit').onclick = fit;
@@ -1269,6 +1365,11 @@ function renderLegend() {
     if (vals.length > 8) html += `<span class="muted">+${vals.length - 8} more reuse these colours – see the task details</span>`;
   }
   if (S.showCrit) html += `<span><span class="sw ring"></span>critical path</span>`;
+  if (stripShown() && g.gaps) {
+    const total = Math.max(g.wall, 1);
+    html += `<span class="muted">strip:</span>` + [0, 1, 2, 3].map(k =>
+      `<span title="${GAP_LABEL[k]}"><span class="sw" style="border-radius:2px;background:${S.css.gap[k]}"></span>${GAP_SHORT[k]} ${pctText(g.gaps.total[k], total)} %</span>`).join('');
+  }
   if (S.fadeOthers && S.region.size) html += `<span><span class="sw" style="background:${S.css.axis}"></span>not selected</span>`;
   html += `<span class="muted">○ explicit · □ implicit · ◇ initial${S.groups.some(x => x.drawn) ? ' · ▭ collapsed group (×tasks)' : ''}</span>`;
   $('legend').innerHTML = html;

@@ -223,6 +223,40 @@ Work per thread
    concurrency indicates load imbalance; an even one with low concurrency
    indicates threads that were idle in turns.
 
+Critical path gaps
+------------------
+
+The critical path covers only part of the wall time; in between, the
+threads execute other tasks or wait. The strip in the timeline classifies
+every moment of the run (from the first to the last event):
+
+*on the critical path*
+   A task with work on the critical path executes.
+*gap, threads busy*
+   No critical task executes, and the number of executing tasks is at
+   least the number of available threads. A thread is available from the
+   start of its first to the end of its last execution segment.
+*gap, critical task waiting*
+   No critical task executes, fewer tasks than available threads execute,
+   and at least one critical task is *ready*: it was created, and all its
+   dependence predecessors have completed, but it has not started yet.
+*gap, idle*
+   No critical task executes, fewer tasks than threads execute, and no
+   critical task is ready. This covers runtime overhead between tasks, and
+   time in which the next critical task cannot start yet for a reason the
+   trace does not record as a task, e.g. a thread finishing a ``taskwait``
+   or a barrier.
+
+The legend shows the share of each class in the wall time. In the example
+trace (rank 1, 4 threads) the critical path runs 36.9 % of the time; the
+gaps are 54.0 % busy, 1.4 % waiting and 7.6 % idle, so the run is mainly
+limited by the amount of work, not by scheduling.
+
+Limitations: readiness only considers creation and ``depend`` clauses, not
+locks or other synchronisation inside tasks; threads of nested teams count
+as available over their whole lifetime, even while their team does not
+exist.
+
 Reading the numbers together
 ----------------------------
 

@@ -30,6 +30,8 @@ struct Rank {
     epoch_ns: u64,
     /// False if the trace has no end marker: the run did not finish cleanly.
     complete: bool,
+    /// Classification of the run's time around the critical path, computed on first request.
+    gaps_json: std::sync::OnceLock<String>,
 }
 
 /// The groups of a rank for one maximum group size.
@@ -441,6 +443,23 @@ fn view_json(r: &Rank, grouping: &analysis::Grouping, body: &str) -> String {
     o
 }
 
+/// The run's time classified around the critical path (`analysis::critical_gaps`):
+/// consecutive intervals given by `start` (begin of each) and `kind` (0 on
+/// the path, 1 all threads busy, 2 critical task waiting, 3 idle); an
+/// interval ends where the next begins, the last at `end`. `total` is the
+/// time per kind.
+fn gaps_json(r: &Rank) -> String {
+    let gaps = analysis::critical_gaps(&r.model, &r.crit);
+    let mut o = String::from("{\"start\":");
+    list(&mut o, gaps.intervals.iter().map(|i| i.0));
+    o.push_str(",\"kind\":");
+    list(&mut o, gaps.intervals.iter().map(|i| i.2 as u8));
+    let _ = write!(o, ",\"end\":{},\"total\":", gaps.intervals.last().map_or(0, |i| i.1));
+    list(&mut o, gaps.totals.iter());
+    o.push('}');
+    o
+}
+
 /// Task indices from a comma-separated request body.
 fn parse_indices(body: &str, n: usize) -> Vec<u32> {
     let mut v: Vec<u32> = body.split(',').filter_map(|t| t.trim().parse().ok()).filter(|&i| (i as usize) < n).collect();
@@ -578,6 +597,7 @@ fn handle(mut stream: TcpStream, info: &str, ranks: &[Rank]) {
                     }
                     respond(&mut stream, "200 OK", JSON, rank.view.read().unwrap().graph_json.as_bytes());
                 }
+                ("GET", Some(rank), "gaps") => respond(&mut stream, "200 OK", JSON, rank.gaps_json.get_or_init(|| gaps_json(rank)).as_bytes()),
                 ("POST", Some(rank), "view") => {
                     let json = view_json(rank, &rank.view.read().unwrap().grouping, &String::from_utf8_lossy(&body));
                     respond(&mut stream, "200 OK", JSON, json.as_bytes());
@@ -640,7 +660,7 @@ fn load(dir: &str, max_group: usize) -> Vec<Rank> {
         let locs = symbolize::symbolize(&trace.syms);
         let loc_of: HashMap<u64, usize> = locs.iter().enumerate().map(|(i, l)| (l.addr, i)).collect();
         let empty = Grouped { grouping: analysis::Grouping { max_group: 0, groups: Vec::new(), task_group: Vec::new() }, graph_json: String::new() };
-        let rank = Rank { model, crit, locs, loc_of, view: std::sync::RwLock::new(empty), epoch_ns: trace.epoch_ns, complete: trace.complete };
+        let rank = Rank { model, crit, locs, loc_of, view: std::sync::RwLock::new(empty), epoch_ns: trace.epoch_ns, complete: trace.complete, gaps_json: Default::default() };
         let grouped = rank.regroup(max_group);
         *rank.view.write().unwrap() = grouped;
         ranks.push(rank);

@@ -10,6 +10,10 @@
   --edge-create: #c3c2b7;
   --edge-dep: #52514e;
   --critical: #d03b3b;
+  /* Critical path strip of the timeline: gap classes. */
+  --gap-busy: #898781;
+  --gap-wait: #fab219;
+  --gap-idle: #e1e0d9;
   /* Sequential ramp; the light end keeps 2:1 contrast on the surface. */
   --seq-lo: #86b6ef;
   --seq-hi: #0d366b;
@@ -29,6 +33,9 @@
     --edge-create: #4a4a46;
     --edge-dep: #c3c2b7;
     --critical: #e66767;
+    --gap-busy: #898781;
+    --gap-wait: #fab219;
+    --gap-idle: #383835;
     --seq-lo: #184f95;
     --seq-hi: #cde2fb;
     --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;

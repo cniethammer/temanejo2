@@ -206,6 +206,39 @@ One row per OpenMP thread, with the execution segments of all tasks over
 time. A red strip below a segment marks a critical-path task. Drag to pan,
 the wheel zooms the time axis.
 
+**Critical path strip.** With the *Critical path* overlay on, a strip above
+the threads shows for every moment of the run what happens with respect to
+the critical path:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 14 30 56
+
+   * - Colour
+     - Meaning
+     - What it suggests
+   * - red
+     - a task on the critical path is running
+     - the path is being worked on
+   * - grey
+     - gap: no critical task runs, and every thread runs some other task
+     - throughput-bound: more threads or less work would help, a shorter
+       critical path would not
+   * - amber
+     - gap: a critical task is ready (created, its dependences finished)
+       but not started while a thread is idle
+     - scheduling problem: e.g. ``priority`` clauses for the critical tasks
+   * - light grey
+     - gap: threads are idle and no critical task is ready
+     - runtime overhead between tasks, or time spent outside tasks
+
+Each pixel column shows the class that takes most of its time, so short
+intervals between fine-grained tasks only become visible when zoomed in.
+Hovering the strip shows the interval under the mouse; the legend gives the
+share of each class in the whole run. The definitions are in
+:doc:`metrics`, "Critical path gaps". The classification is computed by
+the server when the strip is first shown.
+
 Run information
 ---------------
 
