@@ -27,6 +27,7 @@ const S = {
   tl: { t0: 0, t1: 1 },                // visible time window of the timeline
   drag: null, hover: -1, css: {}, children: [], succ: [], pred: [],
   originSort: { key: 'w', dir: -1 },   // task origins table: column and direction
+  originFilter: '',                    // task origins table: lower-case filter text
 };
 
 // ------------------------------------------------------------------ helpers
@@ -118,6 +119,16 @@ function assignSlots() {
   }
 }
 
+// Function of a location as written in the program. Code inside OpenMP
+// constructs is compiled into outlined helper functions named
+// "<function>.omp_outlined..." (clang); those are reported by their enclosing
+// function. Returns '' if the location has no function name.
+function funcName(l) {
+  if (!l || !l.func) return '';
+  const i = l.func.indexOf('.omp_outlined');
+  return i > 0 ? l.func.slice(0, i) : l.func;
+}
+
 function locShort(l) {
   if (!l) return 'unknown';
   if (l.file) return l.file.split('/').pop() + ':' + l.line;
@@ -206,14 +217,25 @@ function origins() {
       par: g.own_cr ? g.w / g.own_cr : 0, peak: g.peak,
       name: g.initial ? 'initial task' : l ? locShort(l) : 'unknown location',
       func: g.initial ? 'serial code outside parallel regions' : l ? (l.func || l.module) : '',
+      // Function in the program; omitted where the location is already a function name.
+      fn: !g.initial && l && l.file ? funcName(l) : '',
+      // Text the filter field searches in.
+      search: (g.initial ? 'initial task serial code' :
+        [l && locShort(l), l && l.file, l && l.func, l && l.module, kinds.join(' ')].filter(Boolean).join('\n')).toLowerCase(),
       kind: g.initial ? 'initial' : kinds.join(' + '),
     };
   });
 }
 
+// Origins matching the filter field (all if it is empty).
+function filteredOrigins() {
+  const f = S.originFilter;
+  return origins().filter(o => !f || o.search.includes(f));
+}
+
 function renderOrigins() {
-  const g = S.g, { key, dir } = S.originSort;
-  const rows = origins().sort((a, b) => key === 'name' ? dir * a.name.localeCompare(b.name) : dir * (a[key] - b[key]));
+  const g = S.g, { key, dir } = S.originSort, filtered = !!S.originFilter;
+  const rows = filteredOrigins().sort((a, b) => key === 'name' ? dir * a.name.localeCompare(b.name) : dir * (a[key] - b[key]));
   const total = Math.max(g.work, 1), showDot = S.colorBy === 'loc';
   const head = (k, label, title) =>
     `<th data-k="${k}" title="${title}" class="sortable">${label}${k === key ? (dir < 0 ? ' ▾' : ' ▴') : ''}</th>`;
@@ -225,15 +247,32 @@ function renderOrigins() {
       const pct = 100 * o.w / total;
       // One tbody per origin: the location on its own line, the numbers below it.
       return `<tbody data-o="${esc(String(o.key))}" title="${esc(o.func)} · click to select these tasks">
-        <tr class="name"><td colspan="6">${dot}<span class="mono">${esc(o.name)}</span> <span class="muted">· ${esc(o.kind)}</span>
+        <tr class="name"><td colspan="6">${dot}<span class="mono">${esc(o.name)}</span>${o.fn ? ` <span class="fn">${esc(o.fn)}</span>` : ''} <span class="muted">· ${esc(o.kind)}</span>
           <div class="bar" style="width:${pct.toFixed(1)}%"></div></td></tr>
         <tr><td>${o.n}</td><td>${fmt(o.avg)}</td><td>${fmt(o.w)}<br><span class="muted">${pctText(o.w, total)} %</span></td>
         <td>${o.cr ? `${fmt(o.cr)}<br><span class="muted">${pctText(o.cr, g.critical)} %</span>` : '–'}</td>
         <td>${o.par ? o.par.toFixed(1) : '–'}</td><td>${o.peak}</td></tr></tbody>`;
     }).join('')}
-    <tbody><tr class="name"><td colspan="6"><b>all tasks</b></td></tr><tr class="total"><td>${g.tasks.length}</td><td>${fmt(g.work / Math.max(g.tasks.length, 1))}</td><td>${fmt(g.work)}</td><td>${fmt(g.critical)}</td><td>${(g.work / Math.max(g.critical, 1)).toFixed(1)}</td><td>${g.peak}</td></tr></tbody>
+    ${filtered ? matchesRow(rows, total) : `<tbody><tr class="name"><td colspan="6"><b>all tasks</b></td></tr><tr class="total"><td>${g.tasks.length}</td><td>${fmt(g.work / Math.max(g.tasks.length, 1))}</td><td>${fmt(g.work)}</td><td>${fmt(g.critical)}</td><td>${(g.work / Math.max(g.critical, 1)).toFixed(1)}</td><td>${g.peak}</td></tr></tbody>`}
   </table></div><p class="muted">Work is exclusive task time; Avg. is work per task. Percentages: share of T₁ under Work, share of the critical path T∞ under Crit. Par.: average parallelism of the row's tasks alone (work ÷ their own critical path); Peak: most of them running at once. Click a row to analyse its tasks as a region.</p>`;
 }
+
+// Total row while the filter is active: sums over the matching origins.
+// Their joint parallelism and peak are not simple sums; select them to see.
+function matchesRow(rows, total) {
+  const g = S.g;
+  if (!rows.length) return `<tbody><tr class="name"><td colspan="6" class="muted">No location matches “${esc(S.originFilter)}”.</td></tr></tbody>`;
+  const n = rows.reduce((a, o) => a + o.n, 0), w = rows.reduce((a, o) => a + o.w, 0), cr = rows.reduce((a, o) => a + o.cr, 0);
+  return `<tbody data-o="__matches" title="Click to select the tasks of all matching locations">
+    <tr class="name"><td colspan="6"><b>${rows.length} matching location${rows.length === 1 ? '' : 's'}</b> <span class="muted">· click to select their tasks</span></td></tr>
+    <tr class="total"><td>${n}</td><td>${fmt(w / Math.max(n, 1))}</td><td>${fmt(w)}<br><span class="muted">${pctText(w, total)} %</span></td>
+    <td>${cr ? `${fmt(cr)}<br><span class="muted">${pctText(cr, g.critical)} %</span>` : '–'}</td><td>–</td><td>–</td></tr></tbody>`;
+}
+
+$('origin-filter').addEventListener('input', e => {
+  S.originFilter = e.target.value.trim().toLowerCase();
+  if (S.g) renderOrigins();
+});
 
 $('origins').addEventListener('click', e => {
   const th = e.target.closest('th[data-k]');
@@ -244,6 +283,7 @@ $('origins').addEventListener('click', e => {
   }
   const tr = e.target.closest('tbody[data-o]');
   if (!tr) return;
+  if (tr.dataset.o === '__matches') return setRegion(new Set(filteredOrigins().flatMap(o => o.tasks)));
   const o = origins().find(o => String(o.key) === tr.dataset.o);
   if (o) setRegion(new Set(o.tasks));
 });
@@ -641,18 +681,25 @@ function renderTask() {
   if (cpus.length > 1) badges.push(`<span class="badge">moved between CPUs</span>`);
 
   let src = '<span class="muted">unknown</span>';
-  if (l) src = (l.file ? `<span class="mono">${esc(l.file)}:${l.line}</span><br>` : '') +
-    `<span class="mono">${esc(l.func || '?')}</span> <span class="muted mono">${esc(l.addr)}</span>` +
-    (l.file ? '' : `<br><span class="muted">${esc(l.module)} (no debug info)</span>`);
+  if (l) src = (l.file ? `<span class="mono">${esc(l.file)}:${l.line}</span>` : `<span class="mono">${esc(l.module)}</span> <span class="muted">(no debug info)</span>`) +
+    ` <span class="muted mono">${esc(l.addr)}</span>`;
+  const fn = funcName(l), outlined = fn && l.func !== fn;
+  const func = !l ? '–' : fn
+    ? `<span class="fn">${esc(fn)}</span>` + (outlined ? `<br><span class="muted">inside an OpenMP construct; compiled as <span class="mono">${esc(l.func)}</span></span>` : '')
+    : '<span class="muted">unknown</span>';
+  // Where the task's parallel region starts.
+  const pl = p ? S.g.locs[p.loc] : null;
+  const regionAt = pl ? ` <span class="muted">at</span> <span class="mono">${esc(locShort(pl))}</span>${funcName(pl) && pl.file ? ` <span class="muted">in</span> <span class="fn">${esc(funcName(pl))}</span>` : ''}` : '';
 
   const list = a => a.length ? a.slice(0, 40).map(taskLink).join(', ') + (a.length > 40 ? ` … (${a.length})` : '') : '–';
   let html = `<div><b style="font-size:15px">Task ${t.id}</b></div><div style="margin:4px 0 8px">${badges.join('')}</div><dl>
     <dt>Source</dt><dd>${src}</dd>
+    <dt>Function</dt><dd>${func}</dd>
     <dt>Work time</dt><dd>${fmt(t.w)} <span class="muted">exclusive, in ${t.segs.length} segment${t.segs.length === 1 ? '' : 's'}</span></dd>
     <dt>Lifetime</dt><dd>${fmt(start)} → ${fmt(t.e)} <span class="muted">(${fmt(Math.max(t.e - start, 0))})</span></dd>
     <dt>On critical path</dt><dd>${t.cr > 0 ? fmt(t.cr) + ` <span class="muted">(${(100 * t.cr / g.critical).toFixed(1)} % of T∞)</span>` : 'no'}</dd>
     <dt>Created</dt><dd>at ${fmt(t.ct)} by ${t.par < 0 ? 'the runtime' : 'task ' + taskLink(t.par)} on thread ${t.cth}${first && t.k === 2 ? ` <span class="muted">· waited ${fmt(Math.max(first[4] - t.ct, 0))}</span>` : ''}</dd>
-    <dt>Parallel region</dt><dd>${p ? `${p.id} <span class="muted">team of ${p.actual}${t.k === 1 ? ', thread number ' + t.ix : ''}${p.parent >= 0 ? ', forked by task' : ''}</span> ${p.parent >= 0 ? taskLink(p.parent) : ''}` : '–'}</dd>
+    <dt>Parallel region</dt><dd>${p ? `${p.id}${regionAt}<br><span class="muted">team of ${p.actual}${t.k === 1 ? ', thread number ' + t.ix : ''}${p.parent >= 0 ? ', forked by task' : ''}</span> ${p.parent >= 0 ? taskLink(p.parent) : ''}` : '–'}</dd>
     <dt>Threads</dt><dd>${threads.join(', ') || '–'}</dd>
     <dt>CPUs</dt><dd>${cpus.join(', ') || '–'} <span class="muted">NUMA ${[...new Set(t.segs.map(s => s[3]))].join(', ') || '–'}</span></dd>
     <dt>Children</dt><dd>${S.children[S.sel].length}</dd>

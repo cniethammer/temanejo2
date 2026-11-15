@@ -102,14 +102,23 @@ Task origins
 A table of all source locations that create tasks, with, for each:
 
 * the location (file and line, or function and library without debug
-  information) and whether it is a ``task`` construct, a ``taskloop`` or a
-  parallel region (whose implicit tasks are counted);
+  information), the function containing it, and whether it is a ``task``
+  construct, a ``taskloop`` or a parallel region (whose implicit tasks are
+  counted);
 * the number of tasks created there and their average work per task;
 * their total work time and its share of T\ :sub:`1`, also drawn as a bar;
 * the part of that work on the critical path, and its share of the critical
   path length T\ :sub:`∞`;
 * the average parallelism of these tasks on their own (*Par.*);
 * the measured peak number of them running at the same time (*Peak*).
+
+The field above the table filters the rows: only locations whose source
+file path, file and line, function name (as shown or as compiled, e.g.
+``omp_outlined``), library or kind contain the typed text are listed; case
+is ignored. While a filter is active, the last row sums up tasks, work and
+critical time of the matching locations; clicking it selects all their
+tasks for the region analysis. :kbd:`Esc` in the field clears it. The
+filter is kept when switching ranks.
 
 The initial task, which holds the serial code outside parallel regions, has
 its own row. The last row sums up all tasks. Click a column header to sort,
@@ -125,12 +134,17 @@ Clicking a task shows:
   for tasks created by a ``taskloop``, tasks on the critical path, tasks that started on a different thread
   than the one that created them (stolen), tasks that ran on several threads
   (untied tasks resumed elsewhere) and tasks the OS moved between CPUs;
-* source file, line and function of the construct, with its address;
+* source file and line of the construct, with its address;
+* the function containing the construct. Code inside OpenMP constructs is
+  compiled into outlined helper functions (clang names them
+  ``<function>.omp_outlined...``); the GUI shows the enclosing function of
+  the program and names the helper function below it;
 * exclusive work time, lifetime, and the part of the work on the critical
   path;
 * creating task and thread, creation time and the time until the task first
   ran;
-* parallel region, team size and, for implicit tasks, thread number;
+* parallel region with the source location and function where it starts,
+  team size and, for implicit tasks, thread number;
 * threads, CPUs and NUMA nodes used;
 * number of children, predecessors and successors by dependence (clickable);
 * the items of the ``depend`` clause;
