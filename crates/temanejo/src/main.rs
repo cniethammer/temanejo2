@@ -303,20 +303,32 @@ fn main() {
     let mut port = 8700u16;
     let mut bind = "127.0.0.1".to_string();
     let mut summary_only = false;
+    const USAGE: &str = "usage: temanejo <trace-dir> [-p|--port PORT] [--bind ADDR] [--summary] [-h|--help]";
+    let usage_error = |msg: String| -> ! {
+        eprintln!("temanejo: {msg}\n{USAGE}");
+        std::process::exit(2);
+    };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--port" | "-p" => port = args.next().and_then(|v| v.parse().ok()).unwrap_or(port),
-            "--bind" => bind = args.next().unwrap_or(bind),
+            "--port" | "-p" => {
+                port = match args.next().map(|v| v.parse()) {
+                    Some(Ok(p)) if p > 0 => p,
+                    _ => usage_error(format!("{a} needs a port number (1-65535)")),
+                }
+            }
+            "--bind" => bind = args.next().unwrap_or_else(|| usage_error("--bind needs an address".into())),
             "--summary" => summary_only = true,
-            "--help" | "-h" => dir = None,
+            "--help" | "-h" => {
+                println!("{USAGE}\n\nSee temanejo(1) for details.");
+                return;
+            }
+            _ if a.starts_with('-') => usage_error(format!("unknown option {a}")),
+            _ if dir.is_some() => usage_error("only one trace directory can be given".into()),
             _ => dir = Some(a),
         }
     }
-    let Some(dir) = dir else {
-        eprintln!("usage: temanejo <trace-dir> [--port 8700] [--bind 127.0.0.1] [--summary]");
-        std::process::exit(2);
-    };
+    let Some(dir) = dir else { usage_error("no trace directory given".into()) };
 
     let ranks = load(&dir);
     if ranks.is_empty() {

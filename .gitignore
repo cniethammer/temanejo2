@@ -2,3 +2,5 @@
 /tmj-trace/
 /examples/mpi_omp_tasks
 /examples/omp_tasks
+/docs/_build/
+/docs/.venv/

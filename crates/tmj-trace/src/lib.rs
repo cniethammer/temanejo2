@@ -9,6 +9,8 @@
 //! u32 n_syms,   n_syms * { u64 addr, u64 load_bias, str module, str symbol }
 //! ```
 //! `str` is a u32 length followed by UTF-8 bytes.
+//!
+//! The full specification is in `docs/trace-format.rst`.
 
 use std::io::{self, Read, Write};
 

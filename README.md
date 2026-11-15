@@ -120,6 +120,17 @@ the graph offers independent of the number of threads used. For a selected
 region the same computation runs on the parts of the selected tasks only.
 See `crates/temanejo/src/model.rs` and `analysis.rs`.
 
+## Documentation
+
+Sphinx sources are in `docs/`: user guide, analysis method, the trace file
+format, the HTTP interface and the `temanejo(1)` man page.
+
+```sh
+pip install -r docs/requirements.txt
+make -C docs html man      # docs/_build/html/index.html, docs/_build/man/temanejo.1
+man -l docs/_build/man/temanejo.1
+```
+
 ## Layout
 
 ```
@@ -130,6 +141,7 @@ crates/temanejo    server: model.rs (graph reconstruction), analysis.rs (critica
 examples/          MPI + OpenMP test program (dependences, recursion + taskwait,
                    nested parallel regions with taskgroup/taskloop)
 scripts/tmj-run    launcher wrapper
+docs/              Sphinx documentation and man page
 ```
 
 ## Status and known limitations
