@@ -37,6 +37,10 @@
   <label class="chk" title="While a region is selected, draw all other tasks and edges in grey"><input type="checkbox" id="fade-others" checked> Grey out unselected</label>
   <span class="grow"></span>
   <input id="find" type="search" placeholder="Task id…" size="9" aria-label="Find task by id">
+  <div class="seg" aria-label="Collapse or expand task groups">
+    <button id="collapse-all" title="Collapse all detected groups: taskloops, and 8 or more sibling tasks created at the same source line">Collapse groups</button>
+    <button id="expand-all" title="Expand all collapsed groups">Expand all</button>
+  </div>
   <button id="fit" title="Fit to window (F)">Fit</button>
 </header>
 

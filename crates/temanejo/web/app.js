@@ -36,7 +36,8 @@ const S = {
   sel: -1, region: new Set(), regionInfo: null, regionCrit: new Map(), regionEdges: new Set(),
   cam: { x: 0, y: 0, k: 1 },           // graph camera: screen = world * k + (x, y)
   tl: { t0: 0, t1: 1 },                // visible time window of the timeline
-  drag: null, hover: -1, css: {}, children: [], succ: [], pred: [],
+  drag: null, hover: -1, hoverGroup: -1, css: {}, children: [], succ: [], pred: [],
+  groups: [], hidden: new Int32Array(0), repGroup: new Int32Array(0), groupOf: new Int32Array(0), vEdges: [],
   originSort: { key: 'w', dir: -1 },   // task origins table: column and direction
   originFilter: '',                    // task origins table: lower-case filter text
 };
@@ -188,9 +189,11 @@ async function loadRank(rank) {
     else { S.succ[a].push(b); S.pred[b].push(a); }
   }
   S.byId = new Map(g.tasks.map((t, i) => [t.id, i]));
-  findFans();
   S.tl = { t0: 0, t1: Math.max(g.wall, 1) };
   assignSlots();
+  S.hoverGroup = -1; S.region = new Set(); S.regionEdges = new Set();
+  detectGroups();
+  rebuildVisible();
   setRegion(new Set());
   renderSummary();
   renderOrigins();
@@ -419,7 +422,7 @@ function drawGraph() {
     ctx.strokeStyle = style; ctx.lineWidth = width; ctx.globalAlpha = alpha;
     let count = 0;
     ctx.beginPath();
-    for (const e of g.edges) {
+    for (const e of S.vEdges) {
       if (!pred(e)) continue;
       const a = T[e[0]], b = T[e[1]];
       const ax = sx(a), ay = sy(a), bx = sx(b), by = sy(b);
@@ -434,7 +437,8 @@ function drawGraph() {
   // With "grey out unselected", everything outside the selected region is
   // drawn first in grey; only edges between two selected tasks keep their style.
   const fade = S.fadeOthers && S.region.size > 0;
-  const inSel = e => !fade || (S.region.has(e[0]) && S.region.has(e[1]));
+  const inReg = i => S.repGroup[i] >= 0 ? S.groups[S.repGroup[i]].inRegion : S.region.has(i);
+  const inSel = e => !fade || (inReg(e[0]) && inReg(e[1]));
   const shown = e => e[2] === 0 ? S.showCreate : S.showDep;
   // Creation edges of large fans are drawn as a bus (see drawFans); only
   // their critical path edges are drawn as direct lines.
@@ -444,8 +448,7 @@ function drawGraph() {
   if (S.showCreate) drawFans(sx, sy, r, fade, greyAlpha, createAlpha);
   if (S.showCreate) pass(e => e[2] === 0 && !isCrit(e) && inSel(e) && direct(e), css.edgeCreate, 1, createAlpha);
   if (S.showDep) pass(e => e[2] === 1 && !isCrit(e) && inSel(e), css.edgeDep, 1, far ? 0.35 : 0.7);
-  const n = T.length;
-  if (S.regionEdges.size) pass(e => S.regionEdges.has(e[0] * n + e[1]) || S.regionEdges.has(e[1] * n + e[0]), css.ink, 2.5, 1);
+  if (S.regionEdges.size) pass(e => e[4], css.ink, 2.5, 1);
   if (S.showCrit) pass(e => e[3] && shown(e) && inSel(e), css.critical, Math.max(2, 3 * Math.min(k, 1)), 1);
 
   // Nodes, batched: one path per fill colour and one per kind of mark, so a
@@ -459,6 +462,7 @@ function drawGraph() {
   const regionRing = new Path2D(), regionCritRing = new Path2D(), critRing = new Path2D();
   const critSquare = new Path2D(), regionBar = new Path2D();
   for (let i = 0; i < T.length; i++) {
+    if (S.hidden[i] >= 0) continue;   // inside a collapsed group
     const t = T[i], x = sx(t), y = sy(t);
     if (x < -r - 4 || x > S.w + r + 4 || y < -r - 4 || y > S.h + r + 4) continue;
     const inRegion = S.region.has(i);
@@ -485,10 +489,12 @@ function drawGraph() {
     ctx.lineWidth = 3.5; ctx.stroke(regionCritRing);
     ctx.strokeStyle = css.critical; ctx.lineWidth = 2; ctx.stroke(critRing);
   }
+  drawGroups(sx, sy, r, fade);
   if (k >= 1.1) {
     ctx.fillStyle = css.ink2; ctx.font = `${Math.min(11 * k, 13)}px system-ui, sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
-    for (const t of T) {
-      const x = sx(t), y = sy(t);
+    for (let i = 0; i < T.length; i++) {
+      if (S.hidden[i] >= 0) continue;
+      const t = T[i], x = sx(t), y = sy(t);
       if (x > -30 && x < S.w + 30 && y > -30 && y < S.h + 30) ctx.fillText(t.id, x, y + r + 5);
     }
   }
@@ -497,12 +503,254 @@ function drawGraph() {
 // Rings around the hovered and the selected task.
 function graphOverlay() {
   const { cam } = S, k = cam.k, r = Math.max(R * k, 1.2);
+  if (S.hoverGroup >= 0 && S.groups[S.hoverGroup]?.drawn) {
+    const grp = S.groups[S.hoverGroup], t = S.g.tasks[grp.rep], [hw, hh] = groupSize(grp, r);
+    ctx.lineWidth = 2.5; ctx.strokeStyle = S.css.ink;
+    ctx.beginPath(); ctx.roundRect(t.x * DX * k + cam.x - hw - 3, t.y * DY * k + cam.y - hh - 3, 2 * hw + 6, 2 * hh + 6, hh * 0.5); ctx.stroke();
+  }
   for (const [i, w] of [[S.hover, 1.5], [S.sel, 3]]) {
     if (i < 0) continue;
     const t = S.g.tasks[i];
     ctx.lineWidth = w; ctx.strokeStyle = S.css.ink;
     ctx.beginPath(); ctx.arc(t.x * DX * k + cam.x, t.y * DY * k + cam.y, Math.max(r + 5, 7), 0, 6.2832); ctx.stroke();
   }
+}
+
+// ------------------------------------------------------------------ collapsible groups
+//
+// A group is a set of tasks that can be shown as one node. Collapsing only
+// changes the view: all metrics are computed by the server on the full graph.
+//   taskloop  the tasks one task created for a taskloop construct
+//   fan       FAN or more sibling tasks created at the same source location
+//   subtree   all descendants of a task (created on demand)
+// The first two are detected when a rank is loaded and include the
+// descendants of their tasks. Hidden tasks take the position of their group
+// node, so edges, selection rectangles and "centre" work on them unchanged.
+
+function descendants(roots) {
+  const out = [], stack = [...roots];
+  while (stack.length) { const i = stack.pop(); out.push(i); for (const c of S.children[i]) stack.push(c); }
+  return out;
+}
+
+function makeGroup(kind, anchor, loc, members) {
+  // The representative is the first-created task: its position is the group
+  // node's, and it decides where a dependence cycle between groups is cut.
+  const T = S.g.tasks, g = { id: S.groups.length, kind, anchor, loc, members, rep: members.reduce((a, b) => Math.min(a, b)), collapsed: false, drawn: false,
+    n: members.length, w: 0, cr: 0, min: Infinity, max: 0, t0: Infinity, t1: 0, threads: new Set(), col: null, stats: null, inRegion: false };
+  for (const i of members) {
+    const t = T[i];
+    g.w += t.w; g.cr += t.cr; g.min = Math.min(g.min, t.w); g.max = Math.max(g.max, t.w);
+    for (const s of t.segs) { g.t0 = Math.min(g.t0, s[4]); g.t1 = Math.max(g.t1, s[5]); g.threads.add(s[0]); }
+  }
+  S.groups.push(g);
+  return g;
+}
+
+function detectGroups() {
+  const T = S.g.tasks, n = T.length;
+  S.groups = [];
+  S.groupOf = new Int32Array(n).fill(-1);   // smallest detected group containing a task
+  S.children.forEach((ch, p) => {
+    if (ch.length < FAN) return;
+    const buckets = new Map();
+    for (const c of ch) {
+      if (T[c].k !== 2) continue;
+      const key = T[c].loc * 2 + (T[c].tl ? 1 : 0);
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key).push(c);
+    }
+    for (const sib of buckets.values()) {
+      if (sib.length < FAN) continue;
+      const g = makeGroup(T[sib[0]].tl ? 'taskloop' : 'fan', p, T[sib[0]].loc, descendants(sib));
+      for (const i of g.members) if (S.groupOf[i] < 0 || S.groups[S.groupOf[i]].n > g.n) S.groupOf[i] = g.id;
+    }
+  });
+}
+
+// Recomputes which tasks are hidden, the merged edges and the fans; lays the
+// visible graph out again unless `relayout` is false (selection changes).
+function rebuildVisible(relayout = true) {
+  const g = S.g, T = g.tasks, n = T.length;
+  S.hidden = new Int32Array(n).fill(-1);
+  S.repGroup = new Int32Array(n).fill(-1);
+  // Larger groups first: a group inside a collapsed group is not drawn.
+  for (const grp of S.groups.filter(x => x.collapsed).sort((a, b) => b.n - a.n)) {
+    grp.drawn = false;
+    for (const i of grp.members) if (S.hidden[i] < 0) { S.hidden[i] = grp.id; grp.drawn = true; }
+    if (grp.drawn) S.repGroup[grp.rep] = grp.id;
+  }
+  for (const grp of S.groups) {
+    if (!grp.collapsed) grp.drawn = false;
+    grp.inRegion = grp.drawn && S.region.size > 0 && grp.members.some(i => S.region.has(i));
+  }
+  const rep = i => S.hidden[i] < 0 ? i : S.groups[S.hidden[i]].rep;
+  // Edges between visible nodes: [from, to, kind, critical, region critical].
+  // All edges between the same two nodes are merged into one.
+  const merged = new Map();
+  for (const e of g.edges) {
+    const a = rep(e[0]), b = rep(e[1]);
+    if (a === b) continue;
+    const key = (a * n + b) * 2 + e[2];
+    let v = merged.get(key);
+    if (!v) merged.set(key, v = [a, b, e[2], 0, 0]);
+    if (e[3]) v[3] = 1;
+    if (S.regionEdges.size && (S.regionEdges.has(e[0] * n + e[1]) || S.regionEdges.has(e[1] * n + e[0]))) v[4] = 1;
+  }
+  S.vEdges = [...merged.values()];
+  findFans();
+  if (relayout) layoutVisible();
+}
+
+// Layered layout of the visible graph, like the server's (src/layout.rs):
+// layer = longest path from a root, ordering by the mean position of the
+// predecessors, wide layers wrapped. A collapsed group takes three slots.
+// Merged edges can form cycles (two groups depending on each other); a cycle
+// is broken at its earliest task, so some edges then point upwards.
+function layoutVisible() {
+  const T = S.g.tasks, n = T.length;
+  const nodes = [];
+  for (let i = 0; i < n; i++) if (S.hidden[i] < 0 || S.repGroup[i] >= 0) nodes.push(i);
+  const succ = new Map(), pred = new Map(), indeg = new Int32Array(n), layer = new Int32Array(n), done = new Uint8Array(n);
+  for (const [a, b] of S.vEdges) {
+    if (!succ.has(a)) succ.set(a, []);
+    if (!pred.has(b)) pred.set(b, []);
+    succ.get(a).push(b); pred.get(b).push(a); indeg[b]++;
+  }
+  const queue = nodes.filter(i => indeg[i] === 0);
+  for (const i of queue) done[i] = 1;
+  let head = 0, next = 0;
+  while (head < nodes.length) {
+    if (head === queue.length) {              // only cycles left: release the earliest task
+      while (done[nodes[next]]) next++;
+      done[nodes[next]] = 1; queue.push(nodes[next]);
+    }
+    const u = queue[head++];
+    for (const v of succ.get(u) || []) {
+      if (done[v]) continue;
+      layer[v] = Math.max(layer[v], layer[u] + 1);
+      if (--indeg[v] === 0) { done[v] = 1; queue.push(v); }
+    }
+  }
+  const layers = [];
+  for (const i of nodes) (layers[layer[i]] ||= []).push(i);
+  const maxRow = Math.max(48, Math.ceil(Math.sqrt(nodes.length) * 2));
+  const placed = new Uint8Array(n);
+  let row = 0;
+  for (const list of layers) {
+    if (!list) continue;
+    const keyed = list.map(v => {
+      let sum = 0, cnt = 0;
+      for (const u of pred.get(v) || []) if (placed[u]) { sum += T[u].x; cnt++; }
+      return [cnt ? sum / cnt : 0, v];
+    }).sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    let i = 0, rows = 0;
+    while (i < keyed.length) {
+      let width = 0, j = i;
+      while (j < keyed.length && (j === i || width + slots(keyed[j][1]) <= maxRow)) width += slots(keyed[j++][1]);
+      let x = -width / 2;
+      for (; i < j; i++) {
+        const v = keyed[i][1], s = slots(v);
+        T[v].x = x + s / 2 - 0.5; T[v].y = row; placed[v] = 1;
+        x += s;
+      }
+      row++; rows++;
+    }
+    if (rows > 1) row += 0.5;
+  }
+  for (let i = 0; i < n; i++) if (S.hidden[i] >= 0 && S.repGroup[i] < 0) { const r = T[S.groups[S.hidden[i]].rep]; T[i].x = r.x; T[i].y = r.y; }
+}
+const slots = i => S.repGroup[i] >= 0 ? 3 : 1;
+
+// Collapses or expands groups and lays the graph out again. `keep` is a task
+// whose position on screen is preserved; without it the view is fitted.
+function setCollapsed(groups, collapsed, keep = -1) {
+  const T = S.g.tasks, before = keep >= 0 ? { x: T[keep].x, y: T[keep].y } : null;
+  for (const grp of groups) grp.collapsed = collapsed;
+  S.hoverGroup = -1; $('tip').hidden = true;
+  rebuildVisible();
+  renderLegend(); renderTask();
+  if (!before || S.view !== 'graph') return fit();
+  S.cam.x += (before.x - T[keep].x) * DX * S.cam.k;
+  S.cam.y += (before.y - T[keep].y) * DY * S.cam.k;
+  draw();
+}
+
+// The subtree group of task i (all its descendants), created on first use.
+function subtreeGroup(i) {
+  let grp = S.groups.find(x => x.kind === 'subtree' && x.anchor === i);
+  if (!grp && S.children[i].length) grp = makeGroup('subtree', i, S.g.tasks[i].loc, descendants(S.children[i]));
+  return grp;
+}
+
+// Half width and half height of a group node for node radius r.
+const groupSize = (grp, r) => [r * (1.6 + 0.45 * Math.log10(grp.n)), r * 1.15];
+
+// Colour of a group node: the most frequent colour among its tasks.
+function groupColor(grp) {
+  if (!grp.col) {
+    const count = new Map();
+    let best = 0;
+    for (const i of grp.members) {
+      const c = color(S.g.tasks[i]), k = (count.get(c) || 0) + 1;
+      count.set(c, k);
+      if (k > best) { best = k; grp.col = c; }
+    }
+  }
+  return grp.col;
+}
+
+// Group nodes: a stack of cards, wider with more tasks, with the task count below.
+function drawGroups(sx, sy, r, fade) {
+  const { css, cam } = S, T = S.g.tasks, off = Math.max(1.5, r * 0.32);
+  for (const grp of S.groups) {
+    if (!grp.drawn) continue;
+    const x = sx(T[grp.rep]), y = sy(T[grp.rep]), [hw, hh] = groupSize(grp, r);
+    if (x < -hw - 10 || x > S.w + hw + 10 || y < -hh - 20 || y > S.h + hh + 10) continue;
+    const grey = fade && !grp.inRegion;
+    ctx.lineWidth = Math.max(1, Math.min(1.5, r / 4)); ctx.strokeStyle = grey ? css.muted : css.ink;
+    for (const d of [2, 1]) {                       // the cards behind
+      ctx.fillStyle = css.surface;
+      ctx.beginPath(); ctx.roundRect(x - hw + d * off, y - hh - d * off, 2 * hw, 2 * hh, hh * 0.35); ctx.fill(); ctx.stroke();
+    }
+    ctx.fillStyle = grey ? css.axis : groupColor(grp);
+    ctx.beginPath(); ctx.roundRect(x - hw, y - hh, 2 * hw, 2 * hh, hh * 0.35); ctx.fill(); ctx.stroke();
+    if (S.showCrit && grp.cr > 0 && !grey) {
+      ctx.strokeStyle = css.critical; ctx.lineWidth = 2;   // around the whole stack
+      ctx.beginPath(); ctx.roundRect(x - hw - 3, y - hh - 2 * off - 3, 2 * hw + 2 * off + 6, 2 * hh + 2 * off + 6, hh * 0.5); ctx.stroke();
+    }
+    if (cam.k >= 0.45) {
+      ctx.fillStyle = css.ink2; ctx.font = `600 ${Math.max(10, Math.min(11 * cam.k, 13))}px system-ui, sans-serif`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+      ctx.fillText('×' + grp.n, x, y + hh + 7);
+    }
+  }
+}
+
+const GROUP_KIND = { taskloop: 'taskloop', fan: 'tasks from one source line', subtree: 'subtree' };
+
+function groupTip(grp) {
+  const g = S.g, l = g.locs[grp.loc], st = grp.stats;
+  const where = grp.kind === 'subtree' ? `below task ${g.tasks[grp.anchor].id}` : esc(locShort(l)) + (funcName(l) && l.file ? ' in ' + esc(funcName(l)) : '');
+  return `<b>${grp.n} tasks</b> · collapsed ${GROUP_KIND[grp.kind]}<br>${where}<br>` +
+    `work ${fmt(grp.w)} (${pctText(grp.w, g.work)} % of T₁) · avg ${fmt(grp.w / grp.n)} · min ${fmt(grp.min)} · max ${fmt(grp.max)}<br>` +
+    (grp.t1 > grp.t0 ? `ran ${fmt(grp.t0)} → ${fmt(grp.t1)} on ${grp.threads.size} thread${grp.threads.size === 1 ? '' : 's'}<br>` : '') +
+    (st ? `parallelism ${(st.work / Math.max(st.critical, 1)).toFixed(1)} · peak ${st.max} at once<br>` : '') +
+    (grp.cr > 0 ? `on critical path: ${fmt(grp.cr)} (${pctText(grp.cr, g.critical)} % of T∞)<br>` : '') +
+    `<span style="opacity:.75">click to expand · Shift+click to select its tasks</span>`;
+}
+
+// Parallelism and peak of a group come from the server's region analysis,
+// fetched the first time the group is hovered.
+async function loadGroupStats(grp) {
+  if (grp.stats || grp.loading) return;
+  grp.loading = true;
+  const rank = S.g.rank;
+  try {
+    const r = await (await fetch(`api/rank/${rank}/region`, { method: 'POST', body: grp.members.join(',') })).json();
+    grp.stats = r;
+    if (S.g.rank === rank && S.hoverGroup === grp.id && !$('tip').hidden) $('tip').innerHTML = groupTip(grp);
+  } finally { grp.loading = false; }
 }
 
 // Fans: parents with at least FAN children. Instead of one line per child,
@@ -512,11 +760,14 @@ function graphOverlay() {
 const FAN = 8;
 function findFans() {
   S.fans = [];
+  S.fanKids = new Map();   // parent -> its visible children
   S.fanChild = new Uint8Array(S.g.tasks.length);
   S.children.forEach((ch, p) => {
-    if (ch.length < FAN) return;
-    S.fans.push(p);
-    for (const c of ch) S.fanChild[c] = 1;
+    if (ch.length < FAN || S.hidden[p] >= 0) return;
+    const kids = ch.filter(c => S.hidden[c] < 0);
+    if (kids.length < FAN) return;
+    S.fans.push(p); S.fanKids.set(p, kids);
+    for (const c of kids) S.fanChild[c] = 1;
   });
 }
 function drawFans(sx, sy, r, fade, greyAlpha, alpha) {
@@ -526,7 +777,7 @@ function drawFans(sx, sy, r, fade, greyAlpha, alpha) {
     const pt = T[p], px = sx(pt), py = sy(pt), pSel = !fade || S.region.has(p);
     // Children by row (layout y), with their horizontal extent.
     const rows = new Map();
-    for (const c of S.children[p]) {
+    for (const c of S.fanKids.get(p)) {
       const t = T[c];
       let row = rows.get(t.y);
       if (!row) rows.set(t.y, row = { y: sy(t), x0: Infinity, x1: -Infinity, kids: [] });
@@ -652,8 +903,16 @@ function pick(mx, my) {
   const T = S.g.tasks;
   if (S.view === 'graph') {
     const { cam } = S, lim = Math.max(R * cam.k + 4, 6);
+    // A collapsed group is returned as -(group id + 2).
+    const r = Math.max(R * cam.k, 1.2);
+    for (const grp of S.groups) {
+      if (!grp.drawn) continue;
+      const t = T[grp.rep], [hw, hh] = groupSize(grp, r);
+      if (Math.abs(t.x * DX * cam.k + cam.x - mx) <= hw + 3 && Math.abs(t.y * DY * cam.k + cam.y - my) <= hh + 5) return -(grp.id + 2);
+    }
     let best = -1, bd = lim * lim;
     for (let i = 0; i < T.length; i++) {
+      if (S.hidden[i] >= 0) continue;
       const dx = T[i].x * DX * cam.k + cam.x - mx, dy = T[i].y * DY * cam.k + cam.y - my, d = dx * dx + dy * dy;
       if (d < bd) { bd = d; best = i; }
     }
@@ -669,9 +928,15 @@ function pick(mx, my) {
 
 function showTip(i, mx, my) {
   const tip = $('tip');
-  if (i < 0) { tip.hidden = true; return; }
-  const t = S.g.tasks[i];
-  tip.innerHTML = `<b>task ${t.id}</b> · ${KIND[t.k]} · ${fmt(t.w)}<br>${esc(locShort(S.g.locs[t.loc]))}`;
+  if (i === -1) { tip.hidden = true; return; }
+  if (i < -1) {
+    const grp = S.groups[-i - 2];
+    tip.innerHTML = groupTip(grp);
+    loadGroupStats(grp);
+  } else {
+    const t = S.g.tasks[i];
+    tip.innerHTML = `<b>task ${t.id}</b> · ${KIND[t.k]} · ${fmt(t.w)}<br>${esc(locShort(S.g.locs[t.loc]))}`;
+  }
   tip.hidden = false;
   tip.style.left = Math.min(mx + 14, S.w - tip.offsetWidth - 6) + 'px';
   tip.style.top = Math.max(my - tip.offsetHeight - 10, 4) + 'px';
@@ -692,8 +957,8 @@ canvas.addEventListener('pointermove', e => {
   if (!S.g) return;
   const [x, y] = pos(e), d = S.drag;
   if (!d) {
-    const h = pick(x, y);
-    if (h !== S.hover) { S.hover = h; draw(true); }
+    const h = pick(x, y), task = Math.max(h, -1), grp = h < -1 ? -h - 2 : -1;
+    if (task !== S.hover || grp !== S.hoverGroup) { S.hover = task; S.hoverGroup = grp; draw(true); }
     return showTip(h, x, y);
   }
   d.x = x; d.y = y;
@@ -712,7 +977,13 @@ canvas.addEventListener('pointerup', e => {
   const d = S.drag; S.drag = null;
   canvas.classList.remove('dragging', 'selecting');
   if (!d || !S.g) return;
-  if (!d.moved) { select(pick(d.x, d.y)); return; }
+  if (!d.moved) {
+    const p = pick(d.x, d.y);
+    if (p >= -1) return select(p);
+    // A collapsed group: Shift+click selects its tasks, a click expands it.
+    const grp = S.groups[-p - 2];
+    return e.shiftKey ? setRegion(new Set(grp.members)) : setCollapsed([grp], false, grp.rep);
+  }
   if (d.band) {
     const sel = new Set(), T = S.g.tasks;
     if (S.view === 'graph') {
@@ -729,7 +1000,7 @@ canvas.addEventListener('pointerup', e => {
   }
   draw();
 });
-canvas.addEventListener('pointerleave', () => { if (S.hover >= 0) { S.hover = -1; draw(true); } $('tip').hidden = true; });
+canvas.addEventListener('pointerleave', () => { if (S.hover >= 0 || S.hoverGroup >= 0) { S.hover = -1; S.hoverGroup = -1; draw(true); } $('tip').hidden = true; });
 canvas.addEventListener('wheel', e => {
   e.preventDefault();
   if (!S.g) return;
@@ -747,7 +1018,7 @@ canvas.addEventListener('wheel', e => {
 function select(i) { S.sel = i; renderTask(); draw(true); }   // only the ring changes
 
 $('rank').onchange = e => loadRank(e.target.value);
-$('color').onchange = e => { S.colorBy = e.target.value; assignSlots(); renderLegend(); renderOrigins(); renderTask(); draw(); };
+$('color').onchange = e => { S.colorBy = e.target.value; assignSlots(); for (const grp of S.groups) grp.col = null; renderLegend(); renderOrigins(); renderTask(); draw(); };
 for (const [id, key] of [['show-crit', 'showCrit'], ['show-create', 'showCreate'], ['show-dep', 'showDep'], ['fade-others', 'fadeOthers']])
   $(id).onchange = e => { S[key] = e.target.checked; renderLegend(); draw(); };
 for (const v of ['graph', 'timeline']) $('view-' + v).onclick = () => {
@@ -759,6 +1030,8 @@ for (const v of ['graph', 'timeline']) $('view-' + v).onclick = () => {
   draw();
 };
 $('fit').onclick = fit;
+$('collapse-all').onclick = () => S.g && setCollapsed(S.groups.filter(x => x.kind !== 'subtree'), true);
+$('expand-all').onclick = () => S.g && setCollapsed(S.groups, false);
 $('find').onchange = e => {
   const i = S.byId.get(Number(e.target.value));
   if (i !== undefined) { select(i); centerOn(i); }
@@ -819,7 +1092,7 @@ try {
   const saved = Number(localStorage.getItem('temanejo.asideWidth'));
   if (saved) document.documentElement.style.setProperty('--aside-w', saved + 'px');
 } catch { /* storage unavailable */ }
-window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { readCss(); draw(); });
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { readCss(); for (const grp of S.groups) grp.col = null; draw(); });
 
 // ------------------------------------------------------------------ legend
 
@@ -837,7 +1110,7 @@ function renderLegend() {
   }
   if (S.showCrit) html += `<span><span class="sw ring"></span>critical path</span>`;
   if (S.fadeOthers && S.region.size) html += `<span><span class="sw" style="background:${S.css.axis}"></span>not selected</span>`;
-  html += `<span class="muted">○ explicit · □ implicit · ◇ initial</span>`;
+  html += `<span class="muted">○ explicit · □ implicit · ◇ initial${S.groups.some(x => x.drawn) ? ' · ▭ collapsed group (×tasks)' : ''}</span>`;
   $('legend').innerHTML = html;
 }
 
@@ -885,7 +1158,7 @@ function renderTask() {
     <dt>Depends on</dt><dd>${list(S.pred[S.sel])}</dd>
     <dt>Required by</dt><dd>${list(S.succ[S.sel])}</dd>
   </dl>
-  <div class="actions"><button data-a="center">Centre</button><button data-a="subtree">Select subtree</button>${p ? '<button data-a="region">Select parallel region</button>' : ''}</div>`;
+  <div class="actions"><button data-a="center">Centre</button><button data-a="subtree">Select subtree</button>${p ? '<button data-a="region">Select parallel region</button>' : ''}${S.children[S.sel].length ? '<button data-a="collapse-subtree" title="Show all tasks created below this task as one node">Collapse subtree</button>' : ''}${S.groupOf[S.sel] >= 0 && !S.groups[S.groupOf[S.sel]].collapsed ? `<button data-a="collapse-group" title="Show this task and the ${S.groups[S.groupOf[S.sel]].n - 1} others of its ${GROUP_KIND[S.groups[S.groupOf[S.sel]].kind]} group as one node">Collapse its group (×${S.groups[S.groupOf[S.sel]].n})</button>` : ''}</div>`;
 
   if (t.deps.length) html += `<h3>depend clause items</h3><table><tr><th>type</th><th>address</th></tr>` +
     t.deps.map(d => `<tr><td>${DEP_TYPE[d[1]] || d[1]}</td><td class="mono">${d[0]}</td></tr>`).join('') + '</table>';
@@ -903,6 +1176,8 @@ $('task').addEventListener('click', e => {
   if (link) { const i = Number(link.dataset.t); select(i); centerOn(i); }
   if (!btn || S.sel < 0) return;
   if (btn.dataset.a === 'center') centerOn(S.sel);
+  if (btn.dataset.a === 'collapse-subtree') { const grp = subtreeGroup(S.sel); if (grp) setCollapsed([grp], true, S.sel); }
+  if (btn.dataset.a === 'collapse-group') { const grp = S.groups[S.groupOf[S.sel]]; setCollapsed([grp], true, grp.anchor); }
   if (btn.dataset.a === 'subtree') {
     const sel = new Set(), stack = [S.sel];
     while (stack.length) { const i = stack.pop(); if (!sel.has(i)) { sel.add(i); stack.push(...S.children[i]); } }
@@ -921,6 +1196,7 @@ $('task').addEventListener('click', e => {
 
 async function setRegion(sel) {
   S.region = sel; S.regionInfo = null; S.regionCrit = new Map(); S.regionEdges = new Set();
+  rebuildVisible(false);
   renderLegend();
   const el = $('region');
   if (!sel.size) {
@@ -935,6 +1211,7 @@ async function setRegion(sel) {
   S.regionInfo = r;
   S.regionCrit = new Map(r.crit_tasks);
   S.regionEdges = new Set(r.crit_edges.map(e => e[0] * S.g.tasks.length + e[1]));
+  rebuildVisible(false);
   renderRegion();
   draw();
 }
@@ -1002,6 +1279,7 @@ async function applyHash() {
   if (q.has('color')) { $('color').value = q.get('color'); $('color').onchange({ target: $('color') }); }
   if (q.get('view') === 'timeline') $('view-timeline').onclick();
   if (q.has('perf')) togglePerf(true);
+  if (q.get('collapse') === 'all') $('collapse-all').onclick();
   if (q.get('select') === 'critical') setRegion(criticalTasks());
   const i = S.byId.get(Number(q.get('task')));
   if (i !== undefined) {

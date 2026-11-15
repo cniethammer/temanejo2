@@ -80,6 +80,10 @@ Grey out unselected
    ring, or a bar below the node when zoomed out, and a bar above each
    segment in the timeline.
 
+Collapse groups, Expand all
+   Collapse all automatically detected task groups into one node each, or
+   expand all collapsed groups; see `Collapsing groups`_.
+
 Task id, Fit
    Jump to a task by its id; fit the view to the window (key ``F``).
 
@@ -99,7 +103,8 @@ This keeps thousands of long crossing lines from covering the graph and
 from slowing down drawing. Creation edges on the critical path are still
 drawn as direct red lines.
 
-The layout is layered: every edge points downwards. Layers with more tasks
+The layout is layered: every edge points downwards (except between
+collapsed groups that depend on each other). Layers with more tasks
 than fit on a line are wrapped over several rows.
 
 Drag to pan, use the wheel to zoom. While the view moves, the picture
@@ -108,6 +113,58 @@ border empty for a moment; it is redrawn sharp when the movement pauses for
 150 ms or the mouse button is released. Hovering and clicking a task only
 redraw the marks on top of the picture. Task ids are drawn once the zoom is large
 enough.
+
+Collapsing groups
+-----------------
+
+Large sets of similar tasks can be shown as a single node. Collapsing only
+changes what is drawn: all metrics, the task origins table and the region
+analysis are always computed on the full graph.
+
+Three kinds of groups exist:
+
+taskloop
+   The tasks one task created for a ``taskloop`` construct (including the
+   runtime's helper tasks, see :doc:`runtime-notes`). Detected
+   automatically.
+tasks from one source line
+   Eight or more sibling tasks created by the same task at the same source
+   location, e.g. a ``task`` construct inside a loop. Detected
+   automatically.
+subtree
+   All tasks created below a task, directly or indirectly. Made on demand
+   with *Collapse subtree* in the task details, e.g. for a recursion or a
+   whole parallel region.
+
+The automatically detected groups include the tasks their members create.
+
+A collapsed group is drawn as a stack of cards, wider the more tasks it
+holds, with the number of tasks (``×2300``) below it. Its colour is the most
+frequent colour among its tasks in the current colour mode, and it has a red
+outline if any of its tasks is on the critical path. All edges between two
+nodes are merged into one line. The graph is laid out again whenever groups
+are collapsed or expanded.
+
+*Collapse groups* in the toolbar collapses all automatically detected
+groups, *Expand all* expands everything. A click on a group node expands it;
+*Collapse its group* in the details of one of its tasks collapses it again.
+Shift+click on a group node selects its tasks for the region analysis, as
+does a selection rectangle around it.
+
+Hovering a group node shows its kind and source location, the number of
+tasks, their total work with the share of T\ :sub:`1`, the average, shortest
+and longest task, when and on how many threads they ran, their average
+parallelism and peak (as in the task origins table, fetched from the server
+on first hover) and their work on the critical path.
+
+Notes:
+
+* Groups that depend on each other in both directions, e.g. the task types
+  of a blocked factorisation, form a cycle once collapsed. The group created
+  first is then placed above the others, and some edges point upwards.
+* Repeated executions of the same ``taskloop`` or loop by the same task
+  form one group.
+* The timeline view always shows all tasks.
 
 Timeline view
 -------------
@@ -217,6 +274,8 @@ The state can be preset through the URL fragment, e.g.::
    ``create``, ``start`` or ``wait``
 ``task``
    task id to select and centre
+``collapse``
+   ``all``: collapse all automatically detected groups
 ``perf``
    show the frame time display (no value needed)
 ``gpubase``
