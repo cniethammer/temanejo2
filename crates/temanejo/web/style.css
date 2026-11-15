@@ -53,7 +53,7 @@ header h1 { font-size: 15px; margin: 0 6px 0 0; letter-spacing: .02em; }
 header label { color: var(--ink2); display: flex; align-items: center; gap: 6px; }
 header .chk { gap: 4px; }
 .grow { flex: 1; }
-select, button, input[type=search] {
+select, button, input[type=search], input[type=number] {
   font: inherit; color: var(--ink); background: var(--page);
   border: 1px solid var(--axis); border-radius: 6px; padding: 3px 8px;
 }

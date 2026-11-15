@@ -37,8 +37,11 @@
   <label class="chk" title="While a region is selected, draw all other tasks and edges in grey"><input type="checkbox" id="fade-others" checked> Grey out unselected</label>
   <span class="grow"></span>
   <input id="find" type="search" placeholder="Task id…" size="9" aria-label="Find task by id">
+  <label title="Largest number of nodes (tasks and sub-groups) a group shows when it is expanded. Larger groups are split into nested groups. Changing it regroups the tasks.">Max group size
+    <input id="max-group" type="number" min="16" step="100" value="1000" style="width:6em">
+  </label>
   <div class="seg" aria-label="Collapse or expand task groups">
-    <button id="collapse-all" title="Collapse all detected groups: taskloops, and 8 or more sibling tasks created at the same source line">Collapse groups</button>
+    <button id="collapse-all" title="Collapse all detected groups: taskloops, 8 or more sibling tasks created at the same source line, and large task trees">Collapse groups</button>
     <button id="expand-all" title="Expand all collapsed groups">Expand all</button>
   </div>
   <button id="fit" title="Fit to window (F)">Fit</button>

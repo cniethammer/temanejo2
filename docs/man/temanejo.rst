@@ -4,7 +4,7 @@ temanejo
 Synopsis
 --------
 
-**temanejo** *trace-dir* [**-p** *port*] [**--bind** *address*] [**--summary**]
+**temanejo** *trace-dir* [**-p** *port*] [**--bind** *address*] [**--max-group** *n*] [**--summary**]
 
 **temanejo** **-h** | **--help**
 
@@ -46,6 +46,11 @@ Options
    Address to listen on. Default: ``127.0.0.1``, which only accepts
    connections from the same machine. Use ``0.0.0.0`` to accept connections
    from other hosts; the server has no authentication.
+
+**--max-group** *n*
+   Largest number of nodes (tasks and nested groups) a task group shows in
+   the GUI when it is expanded. Groups with more tasks are split into nested
+   groups. Default: 1000, minimum: 16. The GUI can change it per rank.
 
 **--summary**
    Print the summary table and exit without starting the server.

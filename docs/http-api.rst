@@ -67,28 +67,47 @@ The server has no authentication and binds to ``127.0.0.1`` by default.
       ``wait`` (start − create).
    ``tasks``
       Records of the tasks outside groups, as in the full graph, without
-      ``x``/``y`` and with ``i``, the task's index.
+      ``x``/``y`` and with ``i``, the task's index, and the dependence lists
+      ``dp`` and ``ds`` (see ``/group`` below).
+   ``max_group``
+      The size limit the groups were made for.
    ``groups``
-      ``{kind, anchor, loc, top, sum, members}``: ``kind`` is ``taskloop``,
-      ``fan`` (sibling tasks from one source location) or ``subtree``;
-      ``anchor`` the creating task or subtree root; ``top`` is 1 for a group
-      not nested in another; ``members`` the task indices in ascending
-      order; ``sum`` a summary as returned by ``/summary`` below. The index
-      in this array is the group id.
-   ``edges``
-      Dependence edges ``[from, to, 1, critical]`` between tasks outside
-      groups.
-   ``pre``
-      Dependence edges into, out of and between outermost groups, merged
-      per pair of end points: ``[from, to, 1, critical, from group, to
-      group]``. A group is represented by its first member; the group ids
-      are -1 where the end point is a task outside groups.
+      The tree of groups: ``{kind, anchor, loc, parent, rep, part, sum,
+      tasks, sub}``. ``kind`` is ``taskloop``, ``fan`` (sibling tasks from
+      one source location) or ``subtree``; ``anchor`` the creating task or
+      subtree root; ``parent`` the enclosing group (-1 at the top level);
+      ``rep`` the first-created task of the group, which stands for it in
+      merged edges; ``part`` is ``[first, count, total]`` for a part of a
+      larger sibling group, else null; ``tasks`` the tasks shown when the
+      group is expanded and ``sub`` its child groups, together at most
+      ``max_group``; ``sum`` a summary as returned by ``/summary`` below,
+      over all tasks of the group including its child groups, with
+      ``own_cr`` and ``peak`` null. The index in this array is the group id.
+      Every task outside ``tasks`` at the top level is in the ``tasks`` of
+      exactly one group.
+
+   With the query ``?max_group=N`` (N ≥ 16) the server first regroups the
+   rank for that limit; group ids change, and the new grouping stays in
+   effect for all later requests.
 
 ``GET /api/rank/<rank>/group/<group>``
-   The content of a group: ``tasks``, the records of its members (with
-   ``i``), and ``edges``, all dependence edges ``[from, to, 1, critical]``
-   with at least one end point in the group. An edge between two groups is
-   part of both groups' answers.
+   ``tasks``: the records of the tasks the group shows when expanded (its
+   direct tasks, with ``i`` and the dependence lists ``dp``, tasks it
+   depends on, and ``ds``, tasks depending on it).
+
+``GET /api/rank/<rank>/group/<group>/stats``
+   ``own_cr``, the critical path through all tasks of the group alone, and
+   ``peak``, the largest number of them executing at the same time. Computed
+   on request with a pass over the graph.
+
+``POST /api/rank/<rank>/view``
+   The dependence edges between the nodes that are visible when certain
+   groups are expanded. Request body: the ids of the expanded groups,
+   separated by commas (empty: all collapsed). Response: ``deps``, a list of
+   ``[from, to, critical]``. A task whose enclosing groups are all expanded
+   is its own node; any other task is represented by the ``rep`` of the
+   outermost collapsed group around it. Edges between the same two nodes
+   are merged, edges inside one node dropped.
 
 ``POST /api/rank/<rank>/summary``
    Summary of a set of tasks. Request body: task indices separated by

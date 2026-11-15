@@ -23,13 +23,28 @@ struct Rank {
     /// Source locations and the index of each code address in them.
     locs: Vec<Loc>,
     loc_of: HashMap<u64, usize>,
-    groups: Vec<analysis::Group>,
-    /// What the GUI loads first: the graph with all groups collapsed.
-    graph_json: String,
+    /// The task groups for the current maximum group size and the collapsed
+    /// graph built from them; replaced when a client asks for another size.
+    view: std::sync::RwLock<Grouped>,
     /// Wall-clock time (ns since the Unix epoch) when the tool started in this process.
     epoch_ns: u64,
     /// False if the trace has no end marker: the run did not finish cleanly.
     complete: bool,
+}
+
+/// The groups of a rank for one maximum group size.
+struct Grouped {
+    grouping: analysis::Grouping,
+    /// What the GUI loads first: the graph with all groups collapsed.
+    graph_json: String,
+}
+
+impl Rank {
+    fn regroup(&self, max_group: usize) -> Grouped {
+        let grouping = analysis::group_tasks(&self.model, max_group);
+        let graph_json = graph_json(&self.model, &self.crit, &self.locs, &self.loc_of, &grouping);
+        Grouped { grouping, graph_json }
+    }
 }
 
 /// Describes the loaded run: trace directory and recording time.
@@ -81,9 +96,25 @@ fn summary_json(r: &Rank) -> String {
     )
 }
 
+/// Predecessors and successors by dependence of some tasks.
+type DepLists = HashMap<u32, (Vec<u32>, Vec<u32>)>;
+
+fn dep_lists(m: &Model, wanted: &[bool]) -> DepLists {
+    let mut lists = DepLists::new();
+    for e in m.edges.iter().filter(|e| e.kind == model::EdgeKind::Depend) {
+        if wanted[e.to as usize] {
+            lists.entry(e.to).or_default().0.push(e.from);
+        }
+        if wanted[e.from as usize] {
+            lists.entry(e.from).or_default().1.push(e.to);
+        }
+    }
+    lists
+}
+
 /// Writes one task record. Compact keys, see web/app.js for their meaning.
 /// `i` is the task's index; `x`, `y` are only written with a layout position.
-fn task_json(o: &mut String, m: &Model, crit: &PathResult, loc_of: &HashMap<u64, usize>, i: usize, pos: Option<(f32, f32)>) {
+fn task_json(o: &mut String, m: &Model, crit: &PathResult, loc_of: &HashMap<u64, usize>, i: usize, pos: Option<(f32, f32)>, deps: Option<&DepLists>) {
     let t = &m.tasks[i];
     let _ = write!(
         o,
@@ -105,6 +136,16 @@ fn task_json(o: &mut String, m: &Model, crit: &PathResult, loc_of: &HashMap<u64,
     );
     if let Some((x, y)) = pos {
         let _ = write!(o, "\"x\":{x},\"y\":{y},");
+    }
+    if let Some(deps) = deps {
+        // Tasks this one depends on (dp) and tasks depending on it (ds).
+        let empty = (Vec::new(), Vec::new());
+        let (pred, succ) = deps.get(&(i as u32)).unwrap_or(&empty);
+        o.push_str("\"dp\":");
+        list(o, pred.iter());
+        o.push_str(",\"ds\":");
+        list(o, succ.iter());
+        o.push(',');
     }
     o.push_str("\"segs\":[");
     for (j, s) in t.segs.iter().enumerate() {
@@ -210,7 +251,7 @@ fn full_json(m: &Model, crit: &PathResult, locs: &[Loc], loc_of: &HashMap<u64, u
         if i > 0 {
             o.push(',');
         }
-        task_json(&mut o, m, crit, loc_of, i, Some(pos[i]));
+        task_json(&mut o, m, crit, loc_of, i, Some(pos[i]), None);
     }
     let _ = write!(o, "],\"origins\":{},\"edges\":[", origins_json(m, crit, loc_of));
     for (i, e) in m.edges.iter().enumerate() {
@@ -229,7 +270,8 @@ fn list<T: std::fmt::Display>(o: &mut String, values: impl Iterator<Item = T>) {
     o.push(']');
 }
 
-/// Summary of a set of tasks: statistics and a "typical task" record (`typ`,
+/// Summary of a set of tasks (`own_cr` and `peak` are null where the
+/// parallelism was not computed): statistics and a "typical task" record (`typ`,
 /// with the keys of a task record) the GUI colours the group node with.
 fn group_summary_json(s: &analysis::Summary, loc_of: &HashMap<u64, usize>) -> String {
     let segs = if s.cpu >= 0 {
@@ -248,8 +290,8 @@ fn group_summary_json(s: &analysis::Summary, loc_of: &HashMap<u64, usize>) -> St
         s.t_begin,
         s.t_end,
         s.threads,
-        s.own_critical,
-        s.peak,
+        s.parallelism.map_or("null".to_string(), |p| p.0.to_string()),
+        s.parallelism.map_or("null".to_string(), |p| p.1.to_string()),
         s.kind,
         loc_of.get(&s.codeptr).map_or(-1, |&l| l as i64),
         idx(s.parallel),
@@ -268,15 +310,13 @@ fn group_summary_json(s: &analysis::Summary, loc_of: &HashMap<u64, usize>) -> St
 /// * `cats`, `ranges`: the values of each colour category and the range of
 ///   each time over all tasks, so colours do not change as groups load;
 /// * `tasks`: records of the tasks outside groups only;
-/// * `groups`: members and summary of every group;
-/// * `edges`: dependence edges between tasks outside groups;
-///   `pre`: dependence edges into, out of and between outermost groups,
-///   merged per pair of end points, with a group standing in by its first
-///   task: `[from, to, 1, critical, from group, to group]` (-1: a task).
+/// * `groups`: the tree of groups, each with its summary, its direct tasks
+///   and its child groups; `max_group`: the size limit they were made for.
 ///
-/// The records and dependence edges of a group are served by `group_json`.
-fn graph_json(m: &Model, crit: &PathResult, locs: &[Loc], loc_of: &HashMap<u64, usize>, groups: &[analysis::Group], top: &[u32]) -> String {
-    use std::collections::{BTreeMap, BTreeSet};
+/// The records of a group's direct tasks are served by `group_json`, the
+/// dependence edges between the visible nodes by `view_json`.
+fn graph_json(m: &Model, crit: &PathResult, locs: &[Loc], loc_of: &HashMap<u64, usize>, grouping: &analysis::Grouping) -> String {
+    use std::collections::BTreeSet;
     let loc = |addr: u64| loc_of.get(&addr).map_or(-1, |&i| i as i64);
     let n = m.tasks.len();
     let mut o = header_json(m, crit, locs, loc_of);
@@ -318,81 +358,85 @@ fn graph_json(m: &Model, crit: &PathResult, locs: &[Loc], loc_of: &HashMap<u64, 
         let _ = write!(o, "{}\"{name}\":[{},{}]", if i > 0 { "," } else { "" }, ranges[i][0].min(ranges[i][1]), ranges[i][1]);
     }
 
-    o.push_str("},\"tasks\":[");
+    let top: Vec<bool> = grouping.task_group.iter().map(|&g| g == NONE).collect();
+    let deps = dep_lists(m, &top);
+    let _ = write!(o, "}},\"max_group\":{},\"tasks\":[", grouping.max_group);
     let mut first = true;
-    for i in (0..n).filter(|&i| top[i] == NONE) {
+    for i in (0..n).filter(|&i| top[i]) {
         if !first {
             o.push(',');
         }
         first = false;
-        task_json(&mut o, m, crit, loc_of, i, None);
+        task_json(&mut o, m, crit, loc_of, i, None, Some(&deps));
     }
     o.push_str("],\"groups\":[");
-    for (g, grp) in groups.iter().enumerate() {
+    let summaries = analysis::summarize_groups(m, crit, grouping);
+    for (g, grp) in grouping.groups.iter().enumerate() {
         let kind = match grp.kind {
             analysis::GroupKind::Taskloop => "taskloop",
             analysis::GroupKind::Fan => "fan",
             analysis::GroupKind::Subtree => "subtree",
         };
+        let part = grp.part.map_or("null".to_string(), |(first, count, total)| format!("[{first},{count},{total}]"));
         let _ = write!(
             o,
-            "{}{{\"kind\":\"{kind}\",\"anchor\":{},\"loc\":{},\"top\":{},\"sum\":{},\"members\":",
+            "{}{{\"kind\":\"{kind}\",\"anchor\":{},\"loc\":{},\"parent\":{},\"rep\":{},\"part\":{part},\"sum\":{},\"tasks\":",
             if g > 0 { "," } else { "" },
             grp.anchor,
             loc(grp.codeptr),
-            (top[grp.members[0] as usize] == g as u32) as u8,
-            group_summary_json(&analysis::summarize(m, crit, &grp.members), loc_of)
+            idx(grp.parent),
+            grp.rep,
+            group_summary_json(&summaries[g], loc_of)
         );
-        list(&mut o, grp.members.iter());
+        list(&mut o, grp.tasks.iter());
+        o.push_str(",\"sub\":");
+        list(&mut o, grp.children.iter());
         o.push('}');
     }
-
-    // Dependence edges; a task inside a group is replaced by the first task
-    // of its outermost group, edges inside one group are dropped.
-    let end = |i: u32| match top[i as usize] {
-        NONE => (i, -1i64),
-        g => (groups[g as usize].members[0], g as i64),
-    };
-    let mut plain = Vec::new();
-    let mut merged: BTreeMap<(u32, u32), (bool, i64, i64)> = BTreeMap::new();
-    for e in m.edges.iter().filter(|e| e.kind == model::EdgeKind::Depend) {
-        let ((a, ga), (b, gb)) = (end(e.from), end(e.to));
-        let critical = on_path(e.from, e.to);
-        if ga < 0 && gb < 0 {
-            plain.push(format!("[{a},{b},1,{}]", critical as u8));
-        } else if ga != gb {
-            merged.entry((a, b)).or_insert((false, ga, gb)).0 |= critical;
-        }
-    }
-    o.push_str("],\"edges\":");
-    list(&mut o, plain.iter());
-    o.push_str(",\"pre\":");
-    list(&mut o, merged.iter().map(|(&(a, b), &(c, ga, gb))| format!("[{a},{b},1,{},{ga},{gb}]", c as u8)));
-    let _ = write!(o, ",\"origins\":{}}}", origins_json(m, crit, loc_of));
+    let _ = write!(o, "],\"origins\":{}}}", origins_json(m, crit, loc_of));
     o
 }
 
-/// The task records of a group and all dependence edges touching its tasks.
-fn group_json(r: &Rank, g: usize) -> String {
-    let (m, grp) = (&r.model, &r.groups[g]);
+/// The records of the tasks a group shows when it is expanded.
+fn group_json(r: &Rank, grouping: &analysis::Grouping, g: usize) -> String {
+    let (m, grp) = (&r.model, &grouping.groups[g]);
     let mut member = vec![false; m.tasks.len()];
-    let mut o = String::from("{\"tasks\":[");
-    for (j, &i) in grp.members.iter().enumerate() {
+    for &i in &grp.tasks {
         member[i as usize] = true;
+    }
+    let deps = dep_lists(m, &member);
+    let mut o = String::from("{\"tasks\":[");
+    for (j, &i) in grp.tasks.iter().enumerate() {
         if j > 0 {
             o.push(',');
         }
-        task_json(&mut o, m, &r.crit, &r.loc_of, i as usize, None);
+        task_json(&mut o, m, &r.crit, &r.loc_of, i as usize, None, Some(&deps));
     }
-    o.push_str("],\"edges\":");
-    let touching = m.edges.iter().filter(|e| e.kind == model::EdgeKind::Depend && (member[e.from as usize] || member[e.to as usize]));
-    list(
-        &mut o,
-        touching.map(|e| {
-            let on_path = r.crit.transitions.contains(&(e.from, e.to)) || r.crit.transitions.contains(&(e.to, e.from));
-            format!("[{},{},1,{}]", e.from, e.to, on_path as u8)
-        }),
-    );
+    o.push_str("]}");
+    o
+}
+
+/// Parallelism of a group: critical path through its tasks alone and their
+/// peak concurrency. Computed on request, since it needs a pass over the graph.
+fn group_stats_json(r: &Rank, grouping: &analysis::Grouping, g: usize) -> String {
+    let mut selected = vec![false; r.model.tasks.len()];
+    for i in grouping.members(g) {
+        selected[i as usize] = true;
+    }
+    let region = analysis::analyze_region(&r.model, &selected);
+    format!("{{\"own_cr\":{},\"peak\":{}}}", region.critical, region.max_concurrency)
+}
+
+/// Dependence edges `[from, to, critical]` between the nodes visible when
+/// the groups listed in the request body are expanded; a collapsed group is
+/// represented by its `rep` task.
+fn view_json(r: &Rank, grouping: &analysis::Grouping, body: &str) -> String {
+    let mut expanded = vec![false; grouping.groups.len()];
+    for g in parse_indices(body, grouping.groups.len()) {
+        expanded[g as usize] = true;
+    }
+    let mut o = String::from("{\"deps\":");
+    list(&mut o, analysis::visible_dependences(&r.model, &r.crit, grouping, &expanded).iter().map(|&(a, b, c)| format!("[{a},{b},{}]", c as u8)));
     o.push('}');
     o
 }
@@ -467,7 +511,8 @@ fn handle(mut stream: TcpStream, info: &str, ranks: &[Rank]) {
     }
     let mut it = line.split_whitespace();
     let (method, path) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
-    let path = path.split('?').next().unwrap_or("").to_string();
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
+    let (path, query) = (path.to_string(), query.to_string());
     let method = method.to_string();
     let mut content_length = 0usize;
     loop {
@@ -499,15 +544,44 @@ fn handle(mut stream: TcpStream, info: &str, ranks: &[Rank]) {
         }
         ("GET", ["api", "rank", r, "group", g]) => {
             let rank = r.parse::<u32>().ok().and_then(|r| ranks.iter().find(|x| x.model.rank == r));
-            match (rank, g.parse::<usize>()) {
-                (Some(rank), Ok(g)) if g < rank.groups.len() => respond(&mut stream, "200 OK", JSON, group_json(rank, g).as_bytes()),
-                _ => respond(&mut stream, "404 Not Found", "text/plain", b"not found"),
+            let json = rank.zip(g.parse::<usize>().ok()).and_then(|(rank, g)| {
+                let view = rank.view.read().unwrap();
+                (g < view.grouping.groups.len()).then(|| group_json(rank, &view.grouping, g))
+            });
+            match json {
+                Some(json) => respond(&mut stream, "200 OK", JSON, json.as_bytes()),
+                None => respond(&mut stream, "404 Not Found", "text/plain", b"not found"),
+            }
+        }
+        ("GET", ["api", "rank", r, "group", g, "stats"]) => {
+            let rank = r.parse::<u32>().ok().and_then(|r| ranks.iter().find(|x| x.model.rank == r));
+            let json = rank.zip(g.parse::<usize>().ok()).and_then(|(rank, g)| {
+                let view = rank.view.read().unwrap();
+                (g < view.grouping.groups.len()).then(|| group_stats_json(rank, &view.grouping, g))
+            });
+            match json {
+                Some(json) => respond(&mut stream, "200 OK", JSON, json.as_bytes()),
+                None => respond(&mut stream, "404 Not Found", "text/plain", b"not found"),
             }
         }
         (_, ["api", "rank", r, what]) => {
             let rank = r.parse::<u32>().ok().and_then(|r| ranks.iter().find(|x| x.model.rank == r));
             match (method.as_str(), rank, *what) {
-                ("GET", Some(rank), "graph") => respond(&mut stream, "200 OK", JSON, rank.graph_json.as_bytes()),
+                ("GET", Some(rank), "graph") => {
+                    // "?max_group=N" regroups the rank for another size limit.
+                    let wanted = query.split('&').find_map(|kv| kv.strip_prefix("max_group=")).and_then(|v| v.parse::<usize>().ok());
+                    if let Some(max) = wanted.map(|m| m.max(analysis::MIN_MAX_GROUP)) {
+                        if rank.view.read().unwrap().grouping.max_group != max {
+                            let regrouped = rank.regroup(max);
+                            *rank.view.write().unwrap() = regrouped;
+                        }
+                    }
+                    respond(&mut stream, "200 OK", JSON, rank.view.read().unwrap().graph_json.as_bytes());
+                }
+                ("POST", Some(rank), "view") => {
+                    let json = view_json(rank, &rank.view.read().unwrap().grouping, &String::from_utf8_lossy(&body));
+                    respond(&mut stream, "200 OK", JSON, json.as_bytes());
+                }
                 ("GET", Some(rank), "full") => {
                     let json = full_json(&rank.model, &rank.crit, &rank.locs, &rank.loc_of);
                     respond(&mut stream, "200 OK", JSON, json.as_bytes());
@@ -530,7 +604,7 @@ fn handle(mut stream: TcpStream, info: &str, ranks: &[Rank]) {
 
 // ------------------------------------------------------------------ main
 
-fn load(dir: &str) -> Vec<Rank> {
+fn load(dir: &str, max_group: usize) -> Vec<Rank> {
     let mut files: Vec<_> = match std::fs::read_dir(dir) {
         Ok(d) => d.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "tmj")).collect(),
         Err(e) => {
@@ -565,10 +639,11 @@ fn load(dir: &str) -> Vec<Rank> {
         let crit = analysis::critical_path(&model, None);
         let locs = symbolize::symbolize(&trace.syms);
         let loc_of: HashMap<u64, usize> = locs.iter().enumerate().map(|(i, l)| (l.addr, i)).collect();
-        let groups = analysis::groups(&model);
-        let top = analysis::top_group(model.tasks.len(), &groups);
-        let graph_json = graph_json(&model, &crit, &locs, &loc_of, &groups, &top);
-        ranks.push(Rank { model, crit, locs, loc_of, groups, graph_json, epoch_ns: trace.epoch_ns, complete: trace.complete });
+        let empty = Grouped { grouping: analysis::Grouping { max_group: 0, groups: Vec::new(), task_group: Vec::new() }, graph_json: String::new() };
+        let rank = Rank { model, crit, locs, loc_of, view: std::sync::RwLock::new(empty), epoch_ns: trace.epoch_ns, complete: trace.complete };
+        let grouped = rank.regroup(max_group);
+        *rank.view.write().unwrap() = grouped;
+        ranks.push(rank);
     }
     ranks.sort_by_key(|r| r.model.rank);
     ranks
@@ -583,7 +658,8 @@ fn main() {
     let mut port = 8700u16;
     let mut bind = "127.0.0.1".to_string();
     let mut summary_only = false;
-    const USAGE: &str = "usage: temanejo <trace-dir> [-p|--port PORT] [--bind ADDR] [--summary] [-h|--help]";
+    let mut max_group = analysis::DEFAULT_MAX_GROUP;
+    const USAGE: &str = "usage: temanejo <trace-dir> [-p|--port PORT] [--bind ADDR] [--max-group N] [--summary] [-h|--help]";
     let usage_error = |msg: String| -> ! {
         eprintln!("temanejo: {msg}\n{USAGE}");
         std::process::exit(2);
@@ -598,6 +674,12 @@ fn main() {
                 }
             }
             "--bind" => bind = args.next().unwrap_or_else(|| usage_error("--bind needs an address".into())),
+            "--max-group" => {
+                max_group = match args.next().map(|v| v.parse::<usize>()) {
+                    Some(Ok(n)) if n >= analysis::MIN_MAX_GROUP => n,
+                    _ => usage_error(format!("--max-group needs a number of at least {}", analysis::MIN_MAX_GROUP)),
+                }
+            }
             "--summary" => summary_only = true,
             "--help" | "-h" => {
                 println!("{USAGE}\n\nSee temanejo(1) for details.");
@@ -610,7 +692,7 @@ fn main() {
     }
     let Some(dir) = dir else { usage_error("no trace directory given".into()) };
 
-    let ranks = load(&dir);
+    let ranks = load(&dir, max_group);
     if ranks.is_empty() {
         eprintln!("temanejo: no rank-*.tmj files in {dir}");
         std::process::exit(1);

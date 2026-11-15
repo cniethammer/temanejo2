@@ -12,11 +12,14 @@
 //   deps [address, ompt dependence type]
 //   i    index of the task (position in S.g.tasks)
 //
-// The graph is loaded with all groups collapsed (graph_json in main.rs):
-// S.g.tasks has an entry for every task, but the tasks inside groups start
-// as stubs with only id, parent and critical time (`loaded` is false). Their
-// records and dependence edges are fetched when their outermost group is
-// first expanded or one of them is needed (loadGroup).
+// The graph is loaded with all groups collapsed (graph_json in main.rs).
+// Groups form a tree: expanding one shows its direct tasks and child groups,
+// never more than the server's size limit (S.g.max_group). S.g.tasks has an
+// entry for every task, but tasks inside groups start as stubs with only id,
+// parent and critical time (`loaded` is false); the records of a group's
+// direct tasks are fetched when it is first expanded (loadGroup). The
+// dependence edges between the visible nodes come from the server
+// (refreshView); creation edges are derived from the parents.
 'use strict';
 
 const $ = id => document.getElementById(id);
@@ -181,45 +184,36 @@ async function loadRanks() {
   if (ranks.length) await loadRank(ranks[0].rank);
 }
 
-async function loadRank(rank) {
-  const g = await (await fetch(`api/rank/${rank}/graph`)).json();
+async function loadRank(rank, maxGroup) {
+  const g = await (await fetch(`api/rank/${rank}/graph` + (maxGroup ? `?max_group=${maxGroup}` : ''))).json();
   S.g = g;
   S.sel = -1; S.hover = -1;
   const n = g.n;
+  $('max-group').value = g.max_group;
   // Every task gets an entry; those inside groups are stubs until loaded.
   const records = g.tasks;
-  g.tasks = g.ids.map((id, i) => ({ i, id, par: g.par[i], k: 2, fl: 0, pr: -1, ix: 0, ct: 0, cth: 0, loc: -1, e: 0, w: 0, tl: 0, cr: 0, segs: [], deps: [], x: 0, y: 0, loaded: false }));
+  g.tasks = g.ids.map((id, i) => ({ i, id, par: g.par[i], k: 2, fl: 0, pr: -1, ix: 0, ct: 0, cth: 0, loc: -1, e: 0, w: 0, tl: 0, cr: 0, segs: [], deps: [], dp: [], ds: [], x: 0, y: 0, loaded: false }));
   for (const r of records) Object.assign(g.tasks[r.i], r, { loaded: true });
   for (const [i, cr] of g.crit) g.tasks[i].cr = cr;
   S.byId = new Map(g.ids.map((id, i) => [id, i]));
   // Creation edges are the parent relation, known for all tasks.
   const critCreate = new Set(g.cc);
   S.children = Array.from({ length: n }, () => []);
-  const depEdges = g.edges;
   g.edges = [];
   g.par.forEach((p, i) => { if (p >= 0) { S.children[p].push(i); g.edges.push([p, i, 0, critCreate.has(i) ? 1 : 0]); } });
-  // Dependence edges arrive with their tasks; S.pre holds the merged edges
-  // of groups that are not loaded yet.
-  S.succ = Array.from({ length: n }, () => []);
-  S.pred = Array.from({ length: n }, () => []);
-  S.depKeys = new Set();
-  addDepEdges(depEdges);
-  S.pre = g.pre;
+  S.depView = [];   // dependence edges between the visible nodes, see refreshView
   S.tl = { t0: 0, t1: Math.max(g.wall, 1) };
   assignSlots();
   S.hoverGroup = -1; S.region = new Set(); S.regionPairs = [];
-  // Groups detected by the server, all collapsed.
-  S.groups = [];
-  S.groupOf = new Int32Array(n).fill(-1);   // smallest group containing a task
-  S.topOf = new Int32Array(n).fill(-1);     // outermost server group containing a task
-  for (const sg of g.groups) {
-    const grp = makeGroup(sg.kind, sg.anchor, sg.loc, sg.members, sg.sum);
-    grp.server = true; grp.top = !!sg.top; grp.collapsed = true;
-    for (const i of grp.members) {
-      if (S.groupOf[i] < 0 || S.groups[S.groupOf[i]].n > grp.n) S.groupOf[i] = grp.id;
-      if (grp.top) S.topOf[i] = grp.id;
-    }
-  }
+  // The server's group tree, all collapsed. `tasks` are a group's direct
+  // tasks, `sub` its child groups.
+  S.groups = g.groups.map((sg, id) => ({ id, kind: sg.kind, anchor: sg.anchor, loc: sg.loc, parent: sg.parent, rep: sg.rep, part: sg.part,
+    sum: sg.sum, n: sg.sum.n, cr: sg.sum.cr, tasks: sg.tasks, sub: sg.sub, members: null,
+    collapsed: true, drawn: false, inRegion: false, server: true, loaded: false, loading: null }));
+  S.groupOf = new Int32Array(n).fill(-1);   // group a task is a direct member of
+  for (const grp of S.groups) for (const i of grp.tasks) S.groupOf[i] = grp.id;
+  await refreshView();
+  if (S.g !== g) return;
   rebuildVisible();
   setRegion(new Set());
   renderSummary();
@@ -231,42 +225,67 @@ async function loadRank(rank) {
   if (S.view === 'timeline') ensureLoaded().then(() => { if (S.g === g) draw(); });
 }
 
-// Adds dependence edges [from, to, 1, critical], skipping known ones (an
-// edge between two groups is delivered with each of them).
-function addDepEdges(edges) {
-  const n = S.g.n;
-  for (const e of edges) {
-    const key = e[0] * n + e[1];
-    if (S.depKeys.has(key)) continue;
-    S.depKeys.add(key);
-    S.g.edges.push(e);
-    S.succ[e[0]].push(e[1]); S.pred[e[1]].push(e[0]);
+// All tasks of a group: its direct tasks and those of its child groups.
+// Groups made in the browser ("Collapse subtree") have an explicit list.
+function membersOf(grp) {
+  if (grp.members) return grp.members;
+  const out = [], stack = [grp];
+  while (stack.length) {
+    const x = stack.pop();
+    for (const i of x.tasks) out.push(i);
+    for (const c of x.sub) stack.push(S.groups[c]);
   }
+  return out;
 }
 
-// Fetches the task records and dependence edges of an outermost server
-// group; resolves at once if they are loaded. Concurrent calls share one request.
+// Asks the server for the dependence edges between the nodes visible with
+// the currently expanded server groups: [from, to, critical], a collapsed
+// group standing in by its `rep` task.
+async function refreshView() {
+  const g = S.g;
+  const expanded = S.groups.filter(x => x.server && !x.collapsed).map(x => x.id);
+  const view = await (await fetch(`api/rank/${g.rank}/view`, { method: 'POST', body: expanded.join(',') })).json();
+  if (S.g === g) S.depView = view.deps;
+}
+
+// Fetches the records of a server group's direct tasks; resolves at once if
+// they are loaded. Concurrent calls share one request.
 function loadGroup(grp) {
-  if (grp.loaded) return Promise.resolve();
+  if (grp.loaded || !grp.server) return Promise.resolve();
   if (!grp.loading) {
     const g = S.g;
     grp.loading = fetch(`api/rank/${g.rank}/group/${grp.id}`).then(r => r.json()).then(data => {
       if (S.g !== g) return;   // another rank was loaded meanwhile
       for (const r of data.tasks) Object.assign(g.tasks[r.i], r, { loaded: true });
-      addDepEdges(data.edges);
-      S.pre = S.pre.filter(e => e[4] !== grp.id && e[5] !== grp.id);
-      // The groups nested inside are loaded with it.
-      for (const x of S.groups) if (x.server && S.topOf[x.rep] === grp.id) x.loaded = true;
+      grp.loaded = true;
     });
   }
   return grp.loading;
 }
-// Loads whatever is missing of the given tasks (default: all tasks).
+// Loads the records of the given tasks, group by group. Without argument
+// all tasks are loaded in one request (the complete graph document).
 function ensureLoaded(tasks) {
-  const tops = new Set();
-  if (tasks) { for (const i of tasks) if (!S.g.tasks[i].loaded) tops.add(S.groups[S.topOf[i]]); }
-  else for (const grp of S.groups) if (grp.top && !grp.loaded) tops.add(grp);
-  return Promise.all([...tops].map(loadGroup));
+  const g = S.g;
+  if (tasks) {
+    const need = new Set();
+    for (const i of tasks) if (!g.tasks[i].loaded) need.add(S.groups[S.groupOf[i]]);
+    return Promise.all([...need].map(loadGroup));
+  }
+  if (S.groups.every(x => x.loaded || !x.server)) return Promise.resolve();
+  if (!g.loadingAll) {
+    g.loadingAll = fetch(`api/rank/${g.rank}/full`).then(r => r.json()).then(full => {
+      if (S.g !== g) return;
+      for (const [i, r] of full.tasks.entries()) if (!g.tasks[i].loaded) Object.assign(g.tasks[i], r, { i, x: g.tasks[i].x, y: g.tasks[i].y, dp: [], ds: [], loaded: 'all' });
+      // The complete document lists dependences as edges, not per task.
+      for (const [a, b, kind] of full.edges) {
+        if (kind !== 1) continue;
+        if (g.tasks[b].loaded === 'all') g.tasks[b].dp.push(a);
+        if (g.tasks[a].loaded === 'all') g.tasks[a].ds.push(b);
+      }
+      for (const x of S.groups) x.loaded = true;
+    });
+  }
+  return g.loadingAll;
 }
 
 function renderSummary() {
@@ -621,10 +640,11 @@ function descendants(roots) {
 // `sum` is the server's summary of the members (group_summary_json): their
 // statistics and a typical task used for the node's colour.
 function makeGroup(kind, anchor, loc, members, sum) {
-  // The representative is the first-created task: its position is the group
+  // A group made in the browser, with an explicit member list. The
+  // representative is the first-created task: its position is the group
   // node's, and it decides where a dependence cycle between groups is cut.
   const grp = { id: S.groups.length, kind, anchor, loc, members, rep: members.reduce((a, b) => Math.min(a, b)), sum, n: sum.n, cr: sum.cr,
-    collapsed: false, drawn: false, inRegion: false, server: false, top: false, loaded: false, loading: null };
+    parent: -1, part: null, tasks: members, sub: [], collapsed: false, drawn: false, inRegion: false, server: false, loaded: false, loading: null };
   S.groups.push(grp);
   return grp;
 }
@@ -635,15 +655,33 @@ function rebuildVisible(relayout = true) {
   const g = S.g, T = g.tasks, n = T.length;
   S.hidden = new Int32Array(n).fill(-1);
   S.repGroup = new Int32Array(n).fill(-1);
-  // Larger groups first: a group inside a collapsed group is not drawn.
-  for (const grp of S.groups.filter(x => x.collapsed).sort((a, b) => b.n - a.n)) {
-    grp.drawn = false;
-    for (const i of grp.members) if (S.hidden[i] < 0) { S.hidden[i] = grp.id; grp.drawn = true; }
-    if (grp.drawn) S.repGroup[grp.rep] = grp.id;
+  for (const grp of S.groups) grp.drawn = false;
+  // Server groups: walk the tree from the top; a collapsed group hides all
+  // its tasks, an expanded one shows its direct tasks and its child groups.
+  const walk = S.groups.filter(x => x.server && x.parent < 0);
+  while (walk.length) {
+    const grp = walk.pop();
+    if (grp.collapsed) {
+      for (const i of membersOf(grp)) S.hidden[i] = grp.id;
+      grp.drawn = true;
+    } else for (const c of grp.sub) walk.push(S.groups[c]);
+  }
+  // Groups made in the browser lie across those; larger ones first. A
+  // server group whose tasks they cover is not drawn.
+  for (const grp of S.groups.filter(x => !x.server && x.collapsed).sort((a, b) => b.n - a.n)) {
+    let any = false;
+    for (const i of grp.members) {
+      const h = S.hidden[i];
+      if (h >= 0 && !S.groups[h].server) continue;   // inside a larger browser group
+      if (h >= 0) S.groups[h].drawn = false;
+      S.hidden[i] = grp.id; any = true;
+    }
+    grp.drawn = any;
   }
   for (const grp of S.groups) {
-    if (!grp.collapsed) grp.drawn = false;
-    grp.inRegion = grp.drawn && S.region.size > 0 && grp.members.some(i => S.region.has(i));
+    if (!grp.drawn) { grp.inRegion = false; continue; }
+    S.repGroup[grp.rep] = grp.id;
+    grp.inRegion = S.region.size > 0 && membersOf(grp).some(i => S.region.has(i));
   }
   const rep = i => S.hidden[i] < 0 ? i : S.groups[S.hidden[i]].rep;
   // Edges between visible nodes: [from, to, kind, critical, region critical].
@@ -657,15 +695,15 @@ function rebuildVisible(relayout = true) {
     if (!v) merged.set(key, v = [a, b, e[2], 0, 0]);
     if (e[3]) v[3] = 1;
   }
-  // Merged edges of the groups not loaded yet; their end points are group
-  // representatives, which `rep` maps on if the group is inside a collapsed one.
-  for (const e of S.pre) {
+  // Dependence edges of the current view from the server; `rep` maps their
+  // end points on if a group made in the browser hides them.
+  for (const e of S.depView) {
     const a = rep(e[0]), b = rep(e[1]);
     if (a === b) continue;
     const key = (a * n + b) * 2 + 1;
     let v = merged.get(key);
     if (!v) merged.set(key, v = [a, b, 1, 0, 0]);
-    if (e[3]) v[3] = 1;
+    if (e[2]) v[3] = 1;
   }
   // Edges on the critical path of the selected region.
   for (const [p, q] of S.regionPairs) {
@@ -742,12 +780,16 @@ const slots = i => S.repGroup[i] >= 0 ? 3 : 1;
 async function setCollapsed(groups, collapsed, keep = -1) {
   const g = S.g, T = g.tasks;
   if (!collapsed) {
-    // A group can only be expanded once its tasks are loaded.
-    await Promise.all(groups.filter(x => x.server).map(x => loadGroup(S.groups[S.topOf[x.rep]])));
+    // A group can only be expanded once its direct tasks are loaded.
+    await Promise.all(groups.map(loadGroup));
     if (S.g !== g) return;
   }
   const before = keep >= 0 ? { x: T[keep].x, y: T[keep].y } : null;
   for (const grp of groups) grp.collapsed = collapsed;
+  if (groups.some(x => x.server)) {
+    await refreshView();
+    if (S.g !== g) return;
+  }
   S.hoverGroup = -1; $('tip').hidden = true;
   rebuildVisible();
   renderLegend(); renderTask();
@@ -808,13 +850,30 @@ const GROUP_KIND = { taskloop: 'taskloop', fan: 'tasks from one source line', su
 
 function groupTip(grp) {
   const g = S.g, l = g.locs[grp.loc], s = grp.sum;
-  const where = grp.kind === 'subtree' ? `below task ${g.tasks[grp.anchor].id}` : esc(locShort(l)) + (funcName(l) && l.file ? ' in ' + esc(funcName(l)) : '');
+  let where = grp.kind === 'subtree' ? `below task ${g.tasks[grp.anchor].id}` : esc(locShort(l)) + (funcName(l) && l.file ? ' in ' + esc(funcName(l)) : '');
+  if (grp.part) where += ` · sibling tasks ${grp.part[0] + 1}–${grp.part[0] + grp.part[1]} of ${grp.part[2]}`;
+  const opens = grp.server && grp.sub.length
+    ? `click to expand: shows ${grp.tasks.length} task${grp.tasks.length === 1 ? '' : 's'} and ${grp.sub.length} group${grp.sub.length === 1 ? '' : 's'}`
+    : 'click to expand';
   return `<b>${s.n} tasks</b> · collapsed ${GROUP_KIND[grp.kind]}<br>${where}<br>` +
     `work ${fmt(s.w)} (${pctText(s.w, g.work)} % of T₁) · avg ${fmt(s.w / s.n)} · min ${fmt(s.min)} · max ${fmt(s.max)}<br>` +
     (s.t1 > s.t0 ? `ran ${fmt(s.t0)} → ${fmt(s.t1)} on ${s.threads} thread${s.threads === 1 ? '' : 's'}<br>` : '') +
-    `parallelism ${(s.w / Math.max(s.own_cr, 1)).toFixed(1)} · peak ${s.peak} at once<br>` +
+    (s.own_cr != null ? `parallelism ${(s.w / Math.max(s.own_cr, 1)).toFixed(1)} · peak ${s.peak} at once<br>` : `<span style="opacity:.75">parallelism: computing…</span><br>`) +
     (s.cr > 0 ? `on critical path: ${fmt(s.cr)} (${pctText(s.cr, g.critical)} % of T∞)<br>` : '') +
-    `<span style="opacity:.75">click to expand${grp.server && !grp.loaded && !S.groups[S.topOf[grp.rep]].loaded ? ' (loads its tasks)' : ''} · Shift+click to select its tasks</span>`;
+    `<span style="opacity:.75">${opens} · Shift+click to select its tasks</span>`;
+}
+
+// Parallelism and peak of a server group need a pass over the graph, so
+// the server computes them when the group is first hovered.
+async function loadGroupStats(grp) {
+  if (grp.sum.own_cr != null || grp.statsLoading || !grp.server) return;
+  grp.statsLoading = true;
+  const g = S.g;
+  try {
+    const st = await (await fetch(`api/rank/${g.rank}/group/${grp.id}/stats`)).json();
+    grp.sum.own_cr = st.own_cr; grp.sum.peak = st.peak;
+    if (S.g === g && S.hoverGroup === grp.id && !$('tip').hidden) $('tip').innerHTML = groupTip(grp);
+  } finally { grp.statsLoading = false; }
 }
 
 // Fans: parents with at least FAN children. Instead of one line per child,
@@ -996,6 +1055,7 @@ function showTip(i, mx, my) {
   if (i < -1) {
     const grp = S.groups[-i - 2];
     tip.innerHTML = groupTip(grp);
+    loadGroupStats(grp);
   } else {
     const t = S.g.tasks[i];
     tip.innerHTML = `<b>task ${t.id}</b> · ${KIND[t.k]} · ${fmt(t.w)}<br>${esc(locShort(S.g.locs[t.loc]))}`;
@@ -1045,7 +1105,7 @@ canvas.addEventListener('pointerup', e => {
     if (p >= -1) return select(p);
     // A collapsed group: Shift+click selects its tasks, a click expands it.
     const grp = S.groups[-p - 2];
-    return e.shiftKey ? setRegion(new Set(grp.members)) : setCollapsed([grp], false, grp.rep);
+    return e.shiftKey ? setRegion(new Set(membersOf(grp))) : setCollapsed([grp], false, grp.rep);
   }
   if (d.band) {
     const sel = new Set(), T = S.g.tasks;
@@ -1104,7 +1164,19 @@ for (const v of ['graph', 'timeline']) $('view-' + v).onclick = async () => {
 };
 $('fit').onclick = fit;
 $('collapse-all').onclick = () => S.g && setCollapsed(S.groups.filter(x => x.server), true);
-$('expand-all').onclick = () => S.g && setCollapsed(S.groups, false);
+$('expand-all').onclick = async () => {
+  if (!S.g) return;
+  // Everything at once is only reasonable for small graphs.
+  if (S.g.n > 50000 && !window.confirm(`Expanding all groups loads and draws all ${S.g.n} tasks, which will be slow and needs a lot of memory. Continue?`)) return;
+  const g = S.g;
+  await ensureLoaded();
+  if (S.g === g) setCollapsed(S.groups, false);
+};
+$('max-group').onchange = e => {
+  const v = Math.max(16, Math.round(Number(e.target.value)) || 0);
+  if (S.g && v !== S.g.max_group) loadRank(S.g.rank, v);
+  else if (S.g) e.target.value = S.g.max_group;
+};
 $('find').onchange = e => {
   const i = S.byId.get(Number(e.target.value));
   if (i !== undefined) { select(i); centerOn(i); }   // a task inside a collapsed group is shown at its group
@@ -1228,8 +1300,8 @@ function renderTask() {
     <dt>Threads</dt><dd>${threads.join(', ') || '–'}</dd>
     <dt>CPUs</dt><dd>${cpus.join(', ') || '–'} <span class="muted">NUMA ${[...new Set(t.segs.map(s => s[3]))].join(', ') || '–'}</span></dd>
     <dt>Children</dt><dd>${S.children[S.sel].length}</dd>
-    <dt>Depends on</dt><dd>${list(S.pred[S.sel])}</dd>
-    <dt>Required by</dt><dd>${list(S.succ[S.sel])}</dd>
+    <dt>Depends on</dt><dd>${list(t.dp || [])}</dd>
+    <dt>Required by</dt><dd>${list(t.ds || [])}</dd>
   </dl>
   <div class="actions"><button data-a="center">Centre</button><button data-a="subtree">Select subtree</button>${p ? '<button data-a="region">Select parallel region</button>' : ''}${S.children[S.sel].length ? '<button data-a="collapse-subtree" title="Show all tasks created below this task as one node">Collapse subtree</button>' : ''}${S.groupOf[S.sel] >= 0 && !S.groups[S.groupOf[S.sel]].collapsed ? `<button data-a="collapse-group" title="Show this task and the ${S.groups[S.groupOf[S.sel]].n - 1} others of its ${GROUP_KIND[S.groups[S.groupOf[S.sel]].kind]} group as one node">Collapse its group (×${S.groups[S.groupOf[S.sel]].n})</button>` : ''}</div>`;
 
@@ -1355,7 +1427,7 @@ async function applyHash() {
   const q = new URLSearchParams(location.hash.slice(1));
   if (q.has('rank') && String(S.g.rank) !== q.get('rank')) { $('rank').value = q.get('rank'); await loadRank(q.get('rank')); }
   if (q.has('color')) { $('color').value = q.get('color'); $('color').onchange({ target: $('color') }); }
-  if (q.get('expand') === 'all') await setCollapsed(S.groups, false);
+  if (q.get('expand') === 'all') { await ensureLoaded(); await setCollapsed(S.groups, false); }
   if (q.get('view') === 'timeline') await $('view-timeline').onclick();
   if (q.has('perf')) togglePerf(true);
   if (q.get('select') === 'critical') setRegion(criticalTasks());

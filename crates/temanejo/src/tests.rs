@@ -472,8 +472,49 @@ fn creation_trace(spec: &[(u64, u64, u64)]) -> Trace {
     b.build()
 }
 
-fn member_ids(m: &Model, g: &analysis::Group) -> Vec<u64> {
-    g.members.iter().map(|&i| m.tasks[i as usize].id).collect()
+fn ids(m: &Model, tasks: &[u32]) -> Vec<u64> {
+    tasks.iter().map(|&i| m.tasks[i as usize].id).collect()
+}
+
+/// A binary recursion below task 1001: node j of a heap has the id 1000 + j
+/// and is created by node j / 2. The two children of a node have different
+/// code locations, so no sibling group exists.
+fn recursion(descendants: u64) -> Vec<(u64, u64, u64)> {
+    let mut spec = vec![(1001, 1, 0x1)];
+    spec.extend((2..2 + descendants).map(|j| (1000 + j, 1000 + j / 2, 0x100 + (j % 2))));
+    spec
+}
+
+/// Properties every grouping must have: each task is a direct member of at
+/// most one group, group sizes add up over the tree, no expansion reveals
+/// more than the limit, and a group is represented by its first task.
+fn check_grouping(m: &Model, gr: &analysis::Grouping) {
+    use crate::model::NONE;
+    let mut direct = vec![0usize; m.tasks.len()];
+    for (g, grp) in gr.groups.iter().enumerate() {
+        assert!(grp.tasks.windows(2).all(|w| w[0] < w[1]), "direct tasks are sorted");
+        for &i in &grp.tasks {
+            direct[i as usize] += 1;
+            assert_eq!(gr.task_group[i as usize], g as u32);
+        }
+        let below: usize = grp.children.iter().map(|&c| gr.groups[c as usize].n).sum();
+        assert_eq!(grp.n, grp.tasks.len() + below, "group {g}: size adds up over its children");
+        assert!(grp.n >= 1 && grp.tasks.len() + grp.children.len() >= 1);
+        assert!(grp.tasks.len() + grp.children.len() <= gr.max_group, "group {g} reveals {} nodes", grp.tasks.len() + grp.children.len());
+        for &c in &grp.children {
+            assert!(c as usize > g, "child groups come after their parent");
+            assert_eq!(gr.groups[c as usize].parent, g as u32);
+            assert!(gr.groups[c as usize].n < grp.n, "a child group is smaller than its parent");
+        }
+        let members = gr.members(g);
+        assert_eq!(members.len(), grp.n);
+        assert_eq!(grp.rep, members[0], "the representative is the first-created member");
+        assert!(!members.contains(&grp.anchor), "the anchor is outside the group");
+    }
+    assert!(direct.iter().all(|&c| c <= 1), "a task is a direct member of at most one group");
+    for (i, &g) in gr.task_group.iter().enumerate() {
+        assert_eq!(g == NONE, direct[i] == 0);
+    }
 }
 
 #[test]
@@ -483,82 +524,142 @@ fn siblings_from_one_location_form_a_group() {
     let mut spec: Vec<(u64, u64, u64)> = (0..GROUP_MIN_SIBLINGS as u64).map(|k| (10 + k, 1, 0xA)).collect();
     spec.extend((0..GROUP_MIN_SIBLINGS as u64 - 1).map(|k| (100 + k, 1, 0xB)));
     let m = Model::build(&creation_trace(&spec));
-    let groups = analysis::groups(&m);
-    assert_eq!(groups.len(), 1);
-    assert!(groups[0].kind == GroupKind::Fan);
-    assert_eq!(groups[0].anchor as usize, task(&m, 1));
-    assert_eq!(groups[0].codeptr, 0xA);
-    assert_eq!(member_ids(&m, &groups[0]), (10..18).collect::<Vec<_>>());
-    // Tasks outside groups have no outermost group.
-    let top = analysis::top_group(m.tasks.len(), &groups);
-    assert_eq!(top[task(&m, 10)], 0);
-    assert_eq!(top[task(&m, 100)], crate::model::NONE);
-    assert_eq!(top[task(&m, 1)], crate::model::NONE);
+    let gr = analysis::group_tasks(&m, 1000);
+    assert_eq!(gr.groups.len(), 1);
+    let g = &gr.groups[0];
+    assert!(g.kind == GroupKind::Fan && g.parent == crate::model::NONE && g.part.is_none());
+    assert_eq!(g.anchor as usize, task(&m, 1));
+    assert_eq!(g.codeptr, 0xA);
+    assert_eq!(ids(&m, &g.tasks), (10..18).collect::<Vec<_>>());
+    assert_eq!(gr.task_group[task(&m, 100)], crate::model::NONE, "tasks outside groups have none");
+    check_grouping(&m, &gr);
 }
 
 #[test]
-fn group_includes_descendants_and_nests() {
-    // 8 siblings at 0xA; sibling 10 itself creates 8 tasks at 0xB.
+fn small_group_shows_its_descendants() {
+    // 8 siblings at 0xA; sibling 10 itself creates 8 tasks at 0xB. All 16
+    // fit into one group, so the inner tasks are shown with it.
     let mut spec: Vec<(u64, u64, u64)> = (0..8).map(|k| (10 + k, 1, 0xA)).collect();
     spec.extend((0..8).map(|k| (100 + k, 10, 0xB)));
     let m = Model::build(&creation_trace(&spec));
-    let groups = analysis::groups(&m);
-    assert_eq!(groups.len(), 2);
-    let outer = groups.iter().find(|g| g.codeptr == 0xA).unwrap();
-    let inner = groups.iter().find(|g| g.codeptr == 0xB).unwrap();
-    assert_eq!(outer.members.len(), 16, "siblings and their descendants");
-    assert_eq!(inner.members.len(), 8);
-    assert!(inner.members.iter().all(|i| outer.members.contains(i)), "nested groups are subsets");
-    // The outermost group of an inner task is the outer group.
-    let top = analysis::top_group(m.tasks.len(), &groups);
-    let outer_id = groups.iter().position(|g| g.codeptr == 0xA).unwrap() as u32;
-    assert_eq!(top[task(&m, 100)], outer_id);
+    let gr = analysis::group_tasks(&m, 1000);
+    assert_eq!(gr.groups.len(), 1);
+    assert_eq!((gr.groups[0].n, gr.groups[0].tasks.len()), (16, 16));
+    check_grouping(&m, &gr);
 }
 
 #[test]
 fn deep_task_tree_forms_a_subtree_group() {
     use analysis::{GroupKind, GROUP_MIN_SUBTREE};
-    // A binary recursion below task 1001: node j of a heap has the id
-    // 1000 + j and is created by node j / 2. The two children of a node have
-    // different code locations, so no sibling group exists.
-    let tree = |descendants: u64| -> Vec<(u64, u64, u64)> {
-        let mut spec = vec![(1001, 1, 0x1)];
-        spec.extend((2..2 + descendants).map(|j| (1000 + j, 1000 + j / 2, 0x100 + (j % 2))));
-        spec
-    };
     let n = GROUP_MIN_SUBTREE as u64;
-    let m = Model::build(&creation_trace(&tree(n)));
-    let groups = analysis::groups(&m);
-    assert_eq!(groups.len(), 1);
-    assert!(groups[0].kind == GroupKind::Subtree);
-    assert_eq!(groups[0].anchor as usize, task(&m, 1001), "the topmost explicit task is the root");
-    assert_eq!(groups[0].members.len() as u64, n);
-    assert!(!groups[0].members.contains(&(task(&m, 1001) as u32)), "the root is not a member");
-
+    let m = Model::build(&creation_trace(&recursion(n)));
+    let gr = analysis::group_tasks(&m, 1000);
+    assert_eq!(gr.groups.len(), 1);
+    assert!(gr.groups[0].kind == GroupKind::Subtree);
+    assert_eq!(gr.groups[0].anchor as usize, task(&m, 1001), "the topmost explicit task is the root");
+    assert_eq!(gr.groups[0].n as u64, n);
+    check_grouping(&m, &gr);
     // One task fewer than the minimum: no group.
-    assert!(analysis::groups(&Model::build(&creation_trace(&tree(n - 1)))).is_empty());
+    assert!(analysis::group_tasks(&Model::build(&creation_trace(&recursion(n - 1))), 1000).groups.is_empty());
 }
 
 #[test]
-fn groups_partition_or_nest() {
-    // Every pair of groups is either disjoint or one contains the other, and
-    // members are sorted, in the three scenario traces and a mixed one.
-    let mut spec: Vec<(u64, u64, u64)> = (0..12).map(|k| (10 + k, 1, 0xA)).collect();
-    spec.extend((0..40).map(|k| (100 + k, 10 + k % 3, 0xB + k % 2)));
-    for trace in [creation_trace(&spec), taskwait_trace(0xA, 0xB), parallel_trace()] {
-        let m = Model::build(&trace);
-        let groups = analysis::groups(&m);
-        for g in &groups {
-            assert!(g.members.windows(2).all(|w| w[0] < w[1]));
-            assert!(!g.members.contains(&g.anchor));
-        }
-        for a in &groups {
-            for b in &groups {
-                let common = a.members.iter().filter(|i| b.members.contains(i)).count();
-                assert!(common == 0 || common == a.members.len().min(b.members.len()));
-            }
+fn large_sibling_group_is_split_into_parts() {
+    // 100 leaf tasks from one location with a limit of 16: parts of 16
+    // siblings each (the last one smaller), labelled by their position.
+    let spec: Vec<(u64, u64, u64)> = (0..100).map(|k| (10 + k, 1, 0xA)).collect();
+    let m = Model::build(&creation_trace(&spec));
+    let gr = analysis::group_tasks(&m, 16);
+    check_grouping(&m, &gr);
+    let top: Vec<_> = gr.groups.iter().filter(|g| g.parent == crate::model::NONE).collect();
+    assert_eq!(top.len(), 1);
+    assert_eq!(top[0].n, 100);
+    let leaves: Vec<_> = gr.groups.iter().filter(|g| g.children.is_empty()).collect();
+    assert!(leaves.iter().all(|g| g.kind == analysis::GroupKind::Fan && g.codeptr == 0xA && g.anchor == top[0].anchor));
+    assert!(leaves.iter().all(|g| g.n <= 16));
+    assert_eq!(leaves.iter().map(|g| g.n).sum::<usize>() + gr.groups.iter().filter(|g| !g.children.is_empty()).map(|g| g.tasks.len()).sum::<usize>(), 100);
+    // Parts cover the siblings 0..100 without gaps, in creation order.
+    let mut parts: Vec<(usize, usize, usize)> = leaves.iter().filter_map(|g| g.part).collect();
+    parts.sort();
+    assert!(parts.iter().all(|p| p.2 == 100));
+    let mut next = 0;
+    for (first, count, _) in parts {
+        if first == next {
+            next += count;
         }
     }
+    let shown: usize = gr.groups.iter().filter(|g| !g.children.is_empty()).map(|g| g.tasks.len()).sum();
+    assert_eq!(next + shown, 100, "parts and directly shown siblings cover all siblings");
+}
+
+#[test]
+fn large_recursion_is_nested() {
+    // 3000 tasks in a binary recursion, limits of 64 and 500.
+    let m = Model::build(&creation_trace(&recursion(3000)));
+    for max in [16, 64, 500] {
+        let gr = analysis::group_tasks(&m, max);
+        check_grouping(&m, &gr);
+        let top: Vec<_> = gr.groups.iter().filter(|g| g.parent == crate::model::NONE).collect();
+        assert_eq!((top.len(), top[0].n), (1, 3000));
+        assert!(top[0].children.len() > 1, "limit {max}: the recursion is split");
+        // Leaf groups are filled reasonably: far fewer groups than tasks.
+        assert!(gr.groups.len() <= 3000 * 4 / max + 4, "limit {max}: {} groups", gr.groups.len());
+    }
+    // A limit above the size gives one group showing everything.
+    let gr = analysis::group_tasks(&m, 5000);
+    assert_eq!((gr.groups.len(), gr.groups[0].tasks.len()), (1, 3000));
+}
+
+#[test]
+fn grouping_properties_hold_for_mixed_graphs() {
+    // Fans with descendants, nested fans, recursion below fan members.
+    let mut spec: Vec<(u64, u64, u64)> = (0..40).map(|k| (10 + k, 1, 0xA)).collect();
+    spec.extend((0..200).map(|k| (100 + k, 10 + k % 5, 0xB + k % 2)));
+    spec.extend((0..300).map(|k| (1000 + k, 100 + k / 3, 0xD)));
+    for trace in [creation_trace(&spec), taskwait_trace(0xA, 0xB), parallel_trace()] {
+        let m = Model::build(&trace);
+        for max in [16, 40, 1000] {
+            check_grouping(&m, &analysis::group_tasks(&m, max));
+        }
+    }
+}
+
+#[test]
+fn grouping_properties_hold_for_random_trees() {
+    // Random task trees from a fixed pseudo-random sequence: every new task
+    // picks its parent among the tasks so far (biased towards recent ones or
+    // towards a few hubs) and one of a few code locations.
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = |bound: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % bound.max(1)
+    };
+    for shape in 0..12 {
+        let n = 200 + 150 * shape as u64;
+        let mut spec: Vec<(u64, u64, u64)> = Vec::new();
+        for k in 0..n {
+            let parent = match shape % 4 {
+                0 => 1 + next(k + 1),                           // uniform: bushy
+                1 => (k + 1).saturating_sub(next(3)).max(1),    // recent: deep chains
+                2 => 1 + next((k + 1).min(6)),                  // hubs: wide fans
+                _ => if next(4) == 0 { 1 + next(k + 1) } else { (k + 1).saturating_sub(next(40)).max(1) },
+            };
+            spec.push((k + 2, parent, 0xA0 + next(1 + shape as u64 % 5)));
+        }
+        let m = Model::build(&creation_trace(&spec));
+        assert_eq!(m.tasks.len() as u64, n + 1);
+        for max in [16, 17, 30, 100, 1000] {
+            check_grouping(&m, &analysis::group_tasks(&m, max));
+        }
+    }
+}
+
+#[test]
+fn minimum_limit_is_enforced() {
+    let m = Model::build(&creation_trace(&recursion(200)));
+    assert_eq!(analysis::group_tasks(&m, 1).max_group, analysis::MIN_MAX_GROUP);
 }
 
 #[test]
@@ -568,9 +669,98 @@ fn summary_of_a_task_set() {
     let s = analysis::summarize(&m, &crit, &[task(&m, 2) as u32, task(&m, 3) as u32]);
     assert_eq!((s.n, s.work, s.min_work, s.max_work, s.mean_work), (2, 80, 30, 50, 40));
     assert_eq!(s.critical, 50, "only B is on the critical path of the graph");
-    assert_eq!((s.own_critical, s.peak, s.threads), (50, 1, 1));
+    assert_eq!((s.parallelism, s.threads), (Some((50, 1)), 1));
     assert_eq!((s.t_begin, s.t_end), (21, 101));
     assert_eq!((s.thread, s.codeptr, s.kind), (0, 0xC, 2));
     assert_eq!(s.mean_create, (10 + 12) / 2);
     assert_eq!(s.mean_start, (21 + 51) / 2);
+}
+
+/// One thread: task 1 creates 10 tasks at 0xA (ids 10..19, a group) and task
+/// X (id 50, 0xB). Each runs for 5; 10 -> 11 and 12 -> X depend on each other.
+fn fan_with_dependences() -> Trace {
+    let mut b = TraceBuilder::default();
+    b.thread_begin(0, 0, true).initial_begin(0, 0, 1, 1);
+    for k in 0..10 {
+        b.create(0, 1 + k, 10 + k, 1, 0xA);
+    }
+    b.create(0, 11, 50, 1, 0xB);
+    b.dependence(0, 11, 10, 11).dependence(0, 11, 12, 50).dependence(0, 11, 13, 50);
+    b.sync_begin(0, 20, SYNC_TASKWAIT, 1, 1);
+    let mut prev = (1, STATUS_SWITCH);
+    for (k, id) in (10..20).chain([50]).enumerate() {
+        b.schedule(0, 20 + 5 * k as u64, prev.0, prev.1, id);
+        prev = (id, STATUS_COMPLETE);
+    }
+    b.schedule(0, 75, 50, STATUS_COMPLETE, 1);
+    b.sync_end(0, 76, SYNC_TASKWAIT, 1, 1).initial_end(0, 80, 1, 1);
+    b.build()
+}
+
+#[test]
+fn group_summaries_match_summarize() {
+    // The one-pass summaries equal a direct summary of each group's members
+    // (which also computes the parallelism), also for nested groups.
+    let cases = [(fan_with_dependences(), 1000), (fan_with_dependences(), 16), (creation_trace(&recursion(300)), 16)];
+    for (trace, max) in cases {
+        let (m, crit) = analyse(&trace);
+        let gr = analysis::group_tasks(&m, max);
+        let sums = analysis::summarize_groups(&m, &crit, &gr);
+        assert_eq!(sums.len(), gr.groups.len());
+        for (g, s) in sums.iter().enumerate() {
+            let d = analysis::summarize(&m, &crit, &gr.members(g));
+            assert!(s.parallelism.is_none() && d.parallelism.is_some());
+            assert_eq!((s.n, s.work, s.critical, s.min_work, s.max_work, s.threads), (d.n, d.work, d.critical, d.min_work, d.max_work, d.threads), "group {g}");
+            assert_eq!((s.t_begin, s.t_end), (d.t_begin, d.t_end), "group {g}");
+            assert_eq!((s.thread, s.cpu, s.numa, s.codeptr, s.parallel, s.kind), (d.thread, d.cpu, d.numa, d.codeptr, d.parallel, d.kind), "group {g}");
+            assert_eq!((s.mean_work, s.mean_create, s.mean_start), (d.mean_work, d.mean_create, d.mean_start), "group {g}");
+        }
+    }
+    // Values of the fan group: 10 tasks of 5 each, run from 20 to 70.
+    let (m, crit) = analyse(&fan_with_dependences());
+    let gr = analysis::group_tasks(&m, 1000);
+    let s = &analysis::summarize_groups(&m, &crit, &gr)[0];
+    assert_eq!((s.n, s.work, s.min_work, s.max_work, s.t_begin, s.t_end, s.threads), (10, 50, 5, 5, 20, 70, 1));
+}
+
+#[test]
+fn dependences_follow_the_expanded_groups() {
+    let (m, crit) = analyse(&fan_with_dependences());
+    let gr = analysis::group_tasks(&m, 1000);
+    assert_eq!(gr.groups.len(), 1);
+    let (rep, x) = (gr.groups[0].rep, task(&m, 50) as u32);
+    assert_eq!(rep as usize, task(&m, 10));
+    let pairs = |expanded: &[bool]| analysis::visible_dependences(&m, &crit, &gr, expanded).iter().map(|e| (e.0, e.1)).collect::<Vec<_>>();
+    // Collapsed: the edge inside the group disappears, the two edges to X merge.
+    assert_eq!(pairs(&[false]), [(rep, x)]);
+    // Expanded: the three dependences between the tasks themselves.
+    let t = |id| task(&m, id) as u32;
+    assert_eq!(pairs(&[true]), [(t(10), t(11)), (t(12), x), (t(13), x)]);
+    // Every task is its own node when expanded, the representative otherwise.
+    assert_eq!(gr.visible(&[true])[task(&m, 15)], t(15));
+    assert_eq!(gr.visible(&[false])[task(&m, 15)], rep);
+    assert_eq!(gr.visible(&[false])[x as usize], x);
+}
+
+#[test]
+fn nested_groups_are_visible_one_level_at_a_time() {
+    let m = Model::build(&creation_trace(&recursion(3000)));
+    let gr = analysis::group_tasks(&m, 64);
+    let top = gr.groups.iter().position(|g| g.parent == crate::model::NONE).unwrap();
+    let mut expanded = vec![false; gr.groups.len()];
+    // All collapsed: every member is represented by the top group.
+    let all = gr.visible(&expanded);
+    assert!(gr.members(top).iter().all(|&i| all[i as usize] == gr.groups[top].rep));
+    // Top group expanded: its direct tasks are themselves, every other member
+    // is represented by the child group it is in.
+    expanded[top] = true;
+    let v = gr.visible(&expanded);
+    assert!(gr.groups[top].tasks.iter().all(|&i| v[i as usize] == i));
+    for &c in &gr.groups[top].children {
+        assert!(gr.members(c as usize).iter().all(|&i| v[i as usize] == gr.groups[c as usize].rep));
+    }
+    // Expanding only a child changes nothing while its parent is collapsed.
+    let mut inner = vec![false; gr.groups.len()];
+    inner[gr.groups[top].children[0] as usize] = true;
+    assert_eq!(gr.visible(&inner), all);
 }

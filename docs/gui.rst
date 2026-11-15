@@ -80,6 +80,10 @@ Grey out unselected
    ring, or a bar below the node when zoomed out, and a bar above each
    segment in the timeline.
 
+Max group size
+   The largest number of nodes a group shows when it is expanded; see
+   `Collapsing groups`_. Changing it regroups the rank.
+
 Collapse groups, Expand all
    Collapse all detected task groups into one node each (the state the GUI
    opens in), or expand all groups; see `Collapsing groups`_.
@@ -135,9 +139,25 @@ subtree
    there are at least 32 of them, e.g. a recursion. The topmost such task is
    taken, and it stays visible above its group.
 
-The first two include the tasks their members create, so groups can be
-nested. In addition, *Collapse subtree* in the task details collapses
-everything below any task, e.g. a whole parallel region.
+The first two include the tasks their members create. In addition,
+*Collapse subtree* in the task details collapses everything below any task,
+e.g. a whole parallel region.
+
+**Maximum group size.** Expanding a group never shows more than *Max group
+size* nodes (default 1000, set in the toolbar or with ``--max-group``). A
+group with more tasks is split into nested groups, which are expanded one
+after the other:
+
+* many sibling tasks are split by creation order into parts of at most that
+  many tasks; the tooltip of a part says which siblings it holds
+  (*sibling tasks 1001–2000 of 147440*);
+* of a large task tree the upper levels are shown, as many as half the
+  limit allows, and what is below becomes subtree groups, each filled up to
+  the limit where the tree allows.
+
+Changing *Max group size* regroups the tasks of the rank on the server and
+reloads it collapsed; a smaller value keeps the graph lighter, a larger one
+needs fewer clicks. The minimum is 16.
 
 A collapsed group is drawn as a stack of cards, wider the more tasks it
 holds, with the number of tasks (``×2300``) below it. Its colour is that of
@@ -149,7 +169,7 @@ expanded.
 
 A click on a group node expands it; *Collapse its group* in the details of
 one of its tasks collapses it again. *Expand all* in the toolbar expands
-everything, *Collapse groups* collapses all detected groups. Shift+click on
+everything, *Collapse groups* collapses all detected groups at all levels. Shift+click on
 a group node selects its tasks for the region analysis, as does a selection
 rectangle around it.
 
@@ -161,11 +181,14 @@ critical path.
 
 **Loading on demand.** To keep large traces manageable, the browser first
 receives only the tasks outside groups and a summary of every group. The
-tasks of a group are fetched from the server when the group is expanded for
-the first time, or when one of them is needed, e.g. after entering its id in
-the *Task id* field. For the example trace with 15,231 tasks the first
-transfer is 0.3 MB instead of 3.5 MB. Three actions need all tasks and load
-them: *Expand all*, the timeline view, and *Select parallel region*.
+tasks a group shows are fetched from the server when it is expanded for the
+first time, or when one of them is needed, e.g. after entering its id in the
+*Task id* field; the dependence edges between the visible nodes are fetched
+with every collapse and expansion. Parallelism and peak in a group's tooltip
+are computed by the server when the group is first hovered. Three actions
+need all tasks and load them in one piece: *Expand all* (which asks for
+confirmation above 50,000 tasks), the timeline view, and *Select parallel
+region*.
 
 Notes:
 

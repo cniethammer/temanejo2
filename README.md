@@ -68,7 +68,7 @@ The trace directory must be on a file system all ranks can write to.
 On a cluster, run the server where the traces are and forward the port:
 `ssh -L 8700:localhost:8700 login-node`.
 
-Server options: `temanejo <trace-dir> [--port 8700] [--bind 127.0.0.1] [--summary]`
+Server options: `temanejo <trace-dir> [--port 8700] [--bind 127.0.0.1] [--max-group 1000] [--summary]`
 (`--summary` prints the per-rank table and exits).
 
 ## The GUI
