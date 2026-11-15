@@ -11,6 +11,18 @@ the divider to reset it. With the divider focused, the arrow keys change the
 width in steps of 20 pixels (80 with Shift). The width is remembered by the
 browser. On narrow windows the panel is placed below the graph instead.
 
+Keyboard
+--------
+
+:kbd:`F`
+   Fit the view to the window.
+:kbd:`Esc`
+   Clear the region selection and the selected task; while drawing a
+   selection rectangle, cancel it.
+Arrow keys
+   With the divider between graph and side panel focused: change the panel
+   width.
+
 Toolbar
 -------
 
@@ -117,6 +129,12 @@ Clicking a task shows:
 * every execution segment: thread, CPU (start → end if it changed), NUMA
   node, start and duration.
 
+*Select critical path* below the process summary selects every task with
+work on the critical path of the whole graph. The region's critical path
+T\ :sub:`∞` then equals that of the graph; its work T\ :sub:`1` is larger,
+because only part of some tasks' work lies on the path, and its measured
+concurrency shows whether the critical tasks ever ran at the same time.
+
 *Select subtree* selects the task and all tasks created from it, transitively.
 *Select parallel region* selects all tasks of the task's parallel region and
 everything they create, including nested regions.
@@ -139,7 +157,7 @@ the panel shows:
 Tasks on the selection's own critical path get a thick black outline, and
 the path is drawn as a thick black line. With *Grey out unselected* (the
 default) the rest of the graph is drawn in grey. *Clear selection* in the
-panel ends the selection. The quantities are defined in :doc:`metrics`.
+panel, or the :kbd:`Esc` key, ends the selection. The quantities are defined in :doc:`metrics`.
 
 Links
 -----
@@ -158,4 +176,5 @@ The state can be preset through the URL fragment, e.g.::
 ``task``
    task id to select and centre
 ``select``
-   ``subtree`` or ``region``: select relative to ``task``
+   ``critical``: select all tasks on the critical path; ``subtree`` or
+   ``region``: select relative to ``task``

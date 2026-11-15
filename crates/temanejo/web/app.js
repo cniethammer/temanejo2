@@ -165,6 +165,18 @@ function renderSummary() {
     tile(g.tasks.length, 'tasks') + tile(g.threads.length, 'threads') +
     tile(fmt(g.work), 'total work T₁') + tile(fmt(g.critical), 'critical path T∞') +
     tile(fmt(g.wall), 'wall time') + tile((g.work / Math.max(g.wall, 1)).toFixed(2), 'measured avg. concurrency');
+  const n = criticalTasks().size;
+  $('summary-actions').innerHTML =
+    `<button id="sel-crit" title="Select all tasks with work on the critical path for the region analysis">Select critical path</button>` +
+    `<span class="muted">${n} task${n === 1 ? '' : 's'} on the path</span>`;
+  $('sel-crit').onclick = () => setRegion(criticalTasks());
+}
+
+// Indices of all tasks with work on the critical path of the whole graph.
+function criticalTasks() {
+  const sel = new Set();
+  S.g.tasks.forEach((t, i) => { if (t.cr > 0) sel.add(i); });
+  return sel;
 }
 
 // ------------------------------------------------------------------ task origins
@@ -510,8 +522,8 @@ for (const v of ['graph', 'timeline']) $('view-' + v).onclick = () => {
   S.view = v;
   $('view-graph').setAttribute('aria-selected', v === 'graph'); $('view-timeline').setAttribute('aria-selected', v === 'timeline');
   $('hint').innerHTML = v === 'graph'
-    ? 'Drag to pan · wheel to zoom · click a task · <kbd>Shift</kbd>+drag to select a region'
-    : 'Drag to pan · wheel to zoom time · click a segment · <kbd>Shift</kbd>+drag to select a time range';
+    ? 'Drag to pan · wheel to zoom · click a task · <kbd>Shift</kbd>+drag to select a region · <kbd>Esc</kbd> to clear'
+    : 'Drag to pan · wheel to zoom time · click a segment · <kbd>Shift</kbd>+drag to select a time range · <kbd>Esc</kbd> to clear';
   draw();
 };
 $('fit').onclick = fit;
@@ -519,7 +531,21 @@ $('find').onchange = e => {
   const i = S.byId.get(Number(e.target.value));
   if (i !== undefined) { select(i); centerOn(i); }
 };
-window.addEventListener('keydown', e => { if (e.key === 'f' && e.target.tagName !== 'INPUT') fit(); });
+window.addEventListener('keydown', e => {
+  if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName) || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key === 'f') fit();
+  if (e.key === 'Escape') {
+    // Cancel a selection rectangle being drawn; otherwise clear the region
+    // selection and the clicked task.
+    if (S.drag) {
+      S.drag = null;
+      canvas.classList.remove('dragging', 'selecting');
+      return draw();
+    }
+    if (S.region.size) setRegion(new Set());
+    if (S.sel >= 0) select(-1);
+  }
+});
 window.addEventListener('resize', () => { setAsideWidth(asideWidth()); resize(); });
 
 // ------------------------------------------------------------------ side panel width
@@ -689,7 +715,7 @@ function renderRegion() {
     <div class="chart" id="chart"></div>
     <h3>Work per thread</h3>
     <table>${r.per_thread.map(([th, w]) => `<tr><td>thread ${th}</td><td style="width:45%"><div class="bar" style="width:${(100 * w / total).toFixed(1)}%"></div></td><td>${fmt(w)}</td><td>${(100 * w / total).toFixed(0)} %</td></tr>`).join('')}</table>
-    <div class="actions"><button id="clear-region">Clear selection</button></div>`;
+    <div class="actions"><button id="clear-region" title="Esc">Clear selection</button></div>`;
   $('clear-region').onclick = () => setRegion(new Set());
   renderChart(r);
 }
@@ -735,6 +761,7 @@ async function applyHash() {
   if (q.has('rank') && String(S.g.rank) !== q.get('rank')) { $('rank').value = q.get('rank'); await loadRank(q.get('rank')); }
   if (q.has('color')) { $('color').value = q.get('color'); $('color').onchange({ target: $('color') }); }
   if (q.get('view') === 'timeline') $('view-timeline').onclick();
+  if (q.get('select') === 'critical') setRegion(criticalTasks());
   const i = S.byId.get(Number(q.get('task')));
   if (i !== undefined) {
     select(i); centerOn(i);
