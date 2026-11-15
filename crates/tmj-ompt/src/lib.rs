@@ -52,6 +52,7 @@ const CB_TASK_CREATE: c_int = 5;
 const CB_TASK_SCHEDULE: c_int = 6;
 const CB_IMPLICIT_TASK: c_int = 7;
 const CB_SYNC_REGION_WAIT: c_int = 16;
+const CB_WORK: c_int = 20;
 const CB_DEPENDENCES: c_int = 18;
 const CB_TASK_DEPENDENCE: c_int = 19;
 const CB_SYNC_REGION: c_int = 23;
@@ -82,6 +83,8 @@ extern "C" {
     fn gettid() -> c_int;
     fn gethostname(name: *mut c_char, len: usize) -> c_int;
     fn dladdr1(addr: *const c_void, info: *mut DlInfo, extra: *mut *mut c_void, flags: c_int) -> c_int;
+    fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
+    fn backtrace(buffer: *mut *mut c_void, size: c_int) -> c_int;
 }
 
 #[inline]
@@ -100,6 +103,38 @@ struct ThreadBuf {
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static EPOCH_NS: AtomicU64 = AtomicU64::new(0);
+/// Load addresses of the OpenMP runtime and of this tool, to recognise code
+/// addresses that do not belong to the program.
+static RUNTIME_BASE: AtomicU64 = AtomicU64::new(0);
+static TOOL_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// Base address of the loaded module containing `addr`, 0 if none.
+fn module_base(addr: u64) -> u64 {
+    let mut info = DlInfo {
+        dli_fname: std::ptr::null(),
+        dli_fbase: std::ptr::null_mut(),
+        dli_sname: std::ptr::null(),
+        dli_saddr: std::ptr::null_mut(),
+    };
+    if unsafe { dladdr(addr as *const c_void, &mut info) } == 0 { 0 } else { info.dli_fbase as u64 }
+}
+
+fn in_runtime(addr: u64) -> bool {
+    let rt = RUNTIME_BASE.load(Relaxed);
+    rt != 0 && module_base(addr) == rt
+}
+
+/// First return address on the current stack that lies neither in this tool
+/// nor in the OpenMP runtime: the call site of the construct in the program.
+fn program_caller() -> Option<u64> {
+    let mut frames = [std::ptr::null_mut::<c_void>(); 48];
+    let n = unsafe { backtrace(frames.as_mut_ptr(), frames.len() as c_int) }.max(0) as usize;
+    let (rt, tool) = (RUNTIME_BASE.load(Relaxed), TOOL_BASE.load(Relaxed));
+    frames[..n].iter().map(|&p| p as u64).find(|&a| {
+        let b = module_base(a);
+        b != 0 && b != rt && b != tool
+    })
+}
 static NEXT_THREAD: AtomicU32 = AtomicU32::new(0);
 static NEXT_TASK: AtomicU64 = AtomicU64::new(1);
 static NEXT_PARALLEL: AtomicU64 = AtomicU64::new(1);
@@ -255,6 +290,28 @@ unsafe extern "C" fn on_sync_region(
     rec(kind::SYNC_REGION, endpoint as u8, 0, sync_kind as u64, id_of(task), id_of(parallel), codeptr as u64);
 }
 
+unsafe extern "C" fn on_work(
+    work_type: c_int,
+    endpoint: c_int,
+    _parallel: *mut OmptData,
+    task: *mut OmptData,
+    count: u64,
+    codeptr: *const c_void,
+) {
+    let mut d = codeptr as u64;
+    let mut flags = 0;
+    // libomp reports an address inside __kmpc_taskloop for taskloop constructs.
+    // Taskloop begin/end events are rare (one per construct instance), so
+    // unwinding the stack here is cheap.
+    if work_type as u64 == tmj_trace::WORK_TASKLOOP && d != 0 && in_runtime(d) {
+        if let Some(a) = program_caller() {
+            d = a;
+            flags = tmj_trace::WORK_CODEPTR_UNWOUND;
+        }
+    }
+    rec(kind::WORK, endpoint as u8, flags, work_type as u64, id_of(task), count, d);
+}
+
 unsafe extern "C" fn on_sync_region_wait(
     sync_kind: c_int,
     endpoint: c_int,
@@ -297,7 +354,13 @@ unsafe extern "C" fn initialize(lookup: Lookup, _initial_device_num: c_int, _too
     register!(CB_TASK_DEPENDENCE, on_task_dependence);
     register!(CB_SYNC_REGION, on_sync_region);
     register!(CB_SYNC_REGION_WAIT, on_sync_region_wait);
+    register!(CB_WORK, on_work);
 
+    RUNTIME_BASE.store(module_base(lookup as usize as u64), Relaxed);
+    TOOL_BASE.store(module_base(on_work as *const () as usize as u64), Relaxed);
+    // The first backtrace() call loads the unwinder; do it outside callbacks.
+    let mut warm = [std::ptr::null_mut::<c_void>(); 2];
+    backtrace(warm.as_mut_ptr(), 2);
     EPOCH_NS.store(now(CLOCK_REALTIME), Relaxed);
     ACTIVE.store(true, Relaxed);
     1 // non-zero keeps the tool active
@@ -344,6 +407,43 @@ unsafe fn resolve(addr: u64) -> Sym {
     sym
 }
 
+/// libomp creates the tasks of a `taskloop` inside the runtime and reports a
+/// code address in the runtime (`__kmpc_taskloop`) for them, also for its
+/// internal helper tasks, which create tasks on other threads later on. The
+/// WORK event of the construct carries the program's address (found by
+/// `on_work`). This gives every task whose reported address lies in the
+/// runtime the address of the latest taskloop its encountering task started
+/// before the task was created, keeping the reported address in `c`.
+unsafe fn attribute_taskloop_tasks(events: &mut [Event]) {
+    use std::collections::HashMap;
+    let mut taskloops: HashMap<u64, Vec<(u64, u64)>> = HashMap::new(); // task -> (ts, codeptr)
+    for e in events.iter() {
+        if e.kind == kind::WORK && e.endpoint == tmj_trace::ENDPOINT_BEGIN && e.a == tmj_trace::WORK_TASKLOOP && e.d != 0 {
+            taskloops.entry(e.b).or_default().push((e.ts, e.d));
+        }
+    }
+    if taskloops.is_empty() {
+        return;
+    }
+    for v in taskloops.values_mut() {
+        v.sort_unstable();
+    }
+    let mut inside_runtime: HashMap<u64, bool> = HashMap::new();
+    for e in events.iter_mut().filter(|e| e.kind == kind::TASK_CREATE && e.d != 0) {
+        let Some(v) = taskloops.get(&e.b) else { continue };
+        let inside = *inside_runtime.entry(e.d).or_insert_with(|| in_runtime(e.d));
+        if !inside {
+            continue;
+        }
+        // Latest taskloop of the encountering task that began before the creation.
+        let i = v.partition_point(|&(ts, _)| ts <= e.ts);
+        if i > 0 {
+            e.c = e.d;
+            e.d = v[i - 1].1;
+        }
+    }
+}
+
 unsafe extern "C" fn finalize(_tool_data: *mut OmptData) {
     if !ACTIVE.swap(false, Relaxed) {
         return;
@@ -354,10 +454,13 @@ unsafe extern "C" fn finalize(_tool_data: *mut OmptData) {
         events.extend_from_slice(&(*(p as *const ThreadBuf)).events);
     }
 
+    attribute_taskloop_tasks(&mut events);
+
     let mut addrs: Vec<u64> = events
         .iter()
-        .filter(|e| matches!(e.kind, kind::PARALLEL_BEGIN | kind::TASK_CREATE | kind::SYNC_REGION) && e.d != 0)
-        .map(|e| e.d)
+        .filter(|e| matches!(e.kind, kind::PARALLEL_BEGIN | kind::TASK_CREATE | kind::SYNC_REGION | kind::WORK))
+        .flat_map(|e| [e.d, if e.kind == kind::TASK_CREATE { e.c } else { 0 }])
+        .filter(|&a| a != 0)
         .collect();
     addrs.sort_unstable();
     addrs.dedup();

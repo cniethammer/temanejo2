@@ -95,7 +95,8 @@ Server options: `temanejo <trace-dir> [--port 8700] [--bind 127.0.0.1] [--summar
 
 **Recording.** The tool registers the OMPT callbacks `thread_begin/end`,
 `parallel_begin/end`, `implicit_task`, `task_create`, `task_schedule`,
-`dependences`, `task_dependence`, `sync_region` and `sync_region_wait`. Each
+`dependences`, `task_dependence`, `sync_region`, `sync_region_wait` and
+`work`. Each
 callback appends one 56-byte record (timestamp from `CLOCK_MONOTONIC`, CPU
 and NUMA node from `getcpu`, ids stored in the `ompt_data_t` slots) to a
 per-thread buffer – no locks, no I/O while the program runs. Code addresses

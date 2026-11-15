@@ -63,6 +63,9 @@ pub struct Task {
     pub create_ts: u64,
     pub create_thread: u32,
     pub codeptr: u64,
+    /// Created by a taskloop construct (the tool replaced the runtime-internal
+    /// code address by the construct's address).
+    pub taskloop: bool,
     pub end: u64,
     /// Exclusive work time: time executing, without time suspended or waiting.
     pub work: u64,
@@ -212,6 +215,7 @@ impl Builder {
             create_ts: e.ts,
             create_thread: e.thread,
             codeptr: 0,
+            taskloop: false,
             end: 0,
             work: 0,
             segs: vec![],
@@ -365,6 +369,7 @@ impl Builder {
                 };
                 let t = self.new_task(e.a, TaskKind::Explicit, e.flags, parent, parallel, e);
                 self.tasks[t as usize].codeptr = e.d;
+                self.tasks[t as usize].taskloop = e.c != 0;
                 if let Some(p) = enc {
                     let (before, _) = self.split(p, e.ts);
                     self.parts.edges.push((before, self.tasks[t as usize].first_part));

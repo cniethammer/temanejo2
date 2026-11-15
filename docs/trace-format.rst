@@ -189,7 +189,8 @@ callback's arguments are described in the OpenMP specification, section
 
        ``task_create``
      - –
-     - ``a`` new task id, ``b`` creating task id, ``d`` code address
+     - ``a`` new task id, ``b`` creating task id, ``c`` reported code
+       address (6), ``d`` code address
    * - 6
      - ``TASK_SCHEDULE``
 
@@ -226,12 +227,20 @@ callback's arguments are described in the OpenMP specification, section
        ``sync_region_wait``
      - begin / end
      - same as ``SYNC_REGION``; brackets the time actually spent waiting
+   * - 12
+     - ``WORK``
+
+       ``work``
+     - begin / end
+     - ``a`` work type (7), ``b`` task id, ``c`` iteration count, ``d`` code
+       address (8)
 
 ``flags`` holds the OMPT ``flags`` argument for ``PARALLEL_BEGIN`` and
 ``PARALLEL_END`` (``ompt_parallel_flag_t``) and for ``TASK_CREATE`` and
 ``IMPLICIT_TASK`` (``ompt_task_flag_t``: 0x1 initial, 0x2 implicit, 0x4
 explicit, 0x8 target, 0x08000000 undeferred, 0x10000000 untied, 0x20000000
-final, 0x40000000 mergeable, 0x80000000 merged). It is 0 for the other kinds.
+final, 0x40000000 mergeable, 0x80000000 merged). For ``WORK`` events bit 0x1 means that ``d`` was found by unwinding the
+stack (8). It is 0 for the other kinds.
 
 "Code address" is the ``codeptr_ra`` argument: the return address of the
 runtime call made by the construct, used to find its source location through
@@ -257,6 +266,23 @@ Notes:
     construct, 9 implicit barrier at the end of a parallel region,
     10 barrier of a teams region.
 
+(6) 0, unless the runtime reported an address inside the OpenMP runtime for
+    a task created by a ``taskloop``. Then ``c`` holds that reported address
+    and ``d`` the address of the ``taskloop`` construct, taken from the
+    latest ``WORK`` begin event of type ``taskloop`` of the creating task
+    before the creation. Readers can use ``c != 0`` to recognise tasks
+    created by a ``taskloop``. See :doc:`runtime-notes`.
+
+(7) ``ompt_work_t``: 1 loop, 2 sections, 3 single (executing thread),
+    4 single (other threads), 5 workshare, 6 distribute, 7 taskloop, 8 scope,
+    9 workdistribute, 10–13 loop with static, dynamic, guided or other
+    schedule.
+
+(8) For ``taskloop`` constructs libomp reports an address inside the runtime.
+    The tool then unwinds the stack and stores the first return address
+    outside the runtime and the tool, i.e. the call site in the program, and
+    sets bit 0x1 in ``flags``.
+
 Runtime-specific behaviour
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -266,6 +292,9 @@ traces (see also :doc:`runtime-notes`):
 * The initial task is announced through ``task_create`` with the initial
   flag and again through ``implicit_task``; both carry the same id.
 * The end event of an implicit task carries no region id (``b`` is 0).
+* Tasks created by ``taskloop``, and the construct itself in the ``work``
+  callback, are reported with an address inside ``__kmpc_taskloop``; the
+  tool corrects this as described in (6) and (8).
 * Worker threads report the end of the barrier at the end of a parallel
   region only when they are reused for the next region, if at all. Nothing
   is executed in the implicit task after that barrier has begun.
@@ -274,8 +303,9 @@ Symbol records
 --------------
 
 One record exists for every distinct non-zero code address in the
-``d`` field of ``PARALLEL_BEGIN``, ``TASK_CREATE`` and ``SYNC_REGION``
-events, sorted by address. The records are produced with ``dladdr1(3)`` while
+``d`` field of ``PARALLEL_BEGIN``, ``TASK_CREATE``, ``SYNC_REGION`` and
+``WORK`` events and in the ``c`` field of ``TASK_CREATE`` events, sorted by
+address. The records are produced with ``dladdr1(3)`` while
 the process still runs, so the server can resolve addresses after the process
 has exited:
 
@@ -321,7 +351,7 @@ only the Python standard library:
    NAMES = {1: "THREAD_BEGIN", 2: "THREAD_END", 3: "PARALLEL_BEGIN",
             4: "PARALLEL_END", 5: "TASK_CREATE", 6: "TASK_SCHEDULE",
             7: "IMPLICIT_TASK", 8: "DEPENDENCE_VAR", 9: "TASK_DEPENDENCE",
-            10: "SYNC_REGION", 11: "SYNC_WAIT"}
+            10: "SYNC_REGION", 11: "SYNC_WAIT", 12: "WORK"}
    EVENT = struct.Struct("<BBHH2xIIQQQQQ")   # 56 bytes
 
    def read_str(f):

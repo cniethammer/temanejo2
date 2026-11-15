@@ -63,6 +63,7 @@ The server has no authentication and binds to ``127.0.0.1`` by default.
       ``e``    completion time
       ``w``    exclusive work time
       ``cr``   work time on the critical path (0 if not on it)
+      ``tl``   1 if the task was created by a ``taskloop``, else 0
       ``x``    layout position, horizontal (grid units)
       ``y``    layout row
       ``segs`` execution segments: ``[thread, cpu, cpu_end, numa, start,

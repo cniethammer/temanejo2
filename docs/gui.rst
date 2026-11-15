@@ -61,8 +61,8 @@ Task origins
 A table of all source locations that create tasks, with, for each:
 
 * the location (file and line, or function and library without debug
-  information) and whether it is a ``task`` construct or a parallel region
-  (whose implicit tasks are counted);
+  information) and whether it is a ``task`` construct, a ``taskloop`` or a
+  parallel region (whose implicit tasks are counted);
 * the number of tasks created there;
 * their total work time and its share of T\ :sub:`1`, also drawn as a bar;
 * the part of that work on the critical path, and its share of the critical
@@ -80,7 +80,7 @@ Task details
 Clicking a task shows:
 
 * kind and OMPT flags (``undeferred``, ``untied``, ``final``, ...), and badges
-  for tasks on the critical path, tasks that started on a different thread
+  for tasks created by a ``taskloop``, tasks on the critical path, tasks that started on a different thread
   than the one that created them (stolen), tasks that ran on several threads
   (untied tasks resumed elsewhere) and tasks the OS moved between CPUs;
 * source file, line and function of the construct, with its address;

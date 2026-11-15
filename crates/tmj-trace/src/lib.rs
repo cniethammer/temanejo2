@@ -25,7 +25,9 @@ pub mod kind {
     pub const PARALLEL_BEGIN: u8 = 3;
     /// a = parallel id, b = encountering task
     pub const PARALLEL_END: u8 = 4;
-    /// a = new task, b = encountering task, d = codeptr; flags = ompt task flags
+    /// a = new task, b = encountering task, d = codeptr; flags = ompt task flags.
+    /// c = codeptr as reported by the runtime if it pointed into the runtime
+    /// and `d` was replaced by the codeptr of the enclosing taskloop, else 0.
     pub const TASK_CREATE: u8 = 5;
     /// a = prior task, b = prior task status, c = next task
     pub const TASK_SCHEDULE: u8 = 6;
@@ -40,7 +42,16 @@ pub mod kind {
     pub const SYNC_REGION: u8 = 10;
     /// Same payload as SYNC_REGION; brackets the time actually spent waiting.
     pub const SYNC_WAIT: u8 = 11;
+    /// endpoint; a = ompt work type, b = task, c = count, d = codeptr
+    pub const WORK: u8 = 12;
 }
+
+/// `ompt_work_t` value of a taskloop construct.
+pub const WORK_TASKLOOP: u64 = 7;
+
+/// `flags` bit of a WORK event: the runtime reported a code address inside
+/// itself, and `d` was found by unwinding the stack instead.
+pub const WORK_CODEPTR_UNWOUND: u32 = 0x1;
 
 pub const ENDPOINT_BEGIN: u8 = 1;
 pub const ENDPOINT_END: u8 = 2;

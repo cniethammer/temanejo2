@@ -111,7 +111,7 @@ fn graph_json(m: &Model, crit: &PathResult, pos: &[(f32, f32)], locs: &[Loc]) ->
     for (i, t) in m.tasks.iter().enumerate() {
         let _ = write!(
             o,
-            "{}{{\"id\":{},\"k\":{},\"fl\":{},\"par\":{},\"pr\":{},\"ix\":{},\"ct\":{},\"cth\":{},\"loc\":{},\"e\":{},\"w\":{},\"x\":{},\"y\":{},\"cr\":{},\"segs\":[",
+            "{}{{\"id\":{},\"k\":{},\"fl\":{},\"par\":{},\"pr\":{},\"ix\":{},\"ct\":{},\"cth\":{},\"loc\":{},\"e\":{},\"w\":{},\"tl\":{},\"x\":{},\"y\":{},\"cr\":{},\"segs\":[",
             if i > 0 { "," } else { "" },
             t.id,
             t.kind as u8,
@@ -124,6 +124,7 @@ fn graph_json(m: &Model, crit: &PathResult, pos: &[(f32, f32)], locs: &[Loc]) ->
             loc(t.codeptr),
             t.end,
             t.work,
+            t.taskloop as u8,
             pos[i].0,
             pos[i].1,
             crit.task_time[i]

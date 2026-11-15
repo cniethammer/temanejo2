@@ -7,6 +7,7 @@
 //   ct   creation time [ns]         cth  creating thread
 //   loc  index into g.locs          e    completion time [ns]
 //   w    exclusive work time [ns]   cr   work time on the critical path [ns]
+//   tl   1 if created by a taskloop construct
 //   x,y  layout position (grid)     segs [thread, cpu, cpu_end, numa, start, end]
 //   deps [address, ompt dependence type]
 'use strict';
@@ -159,13 +160,13 @@ function origins() {
     const key = t.k === 0 ? 'initial' : t.loc;
     let o = m.get(key);
     if (!o) m.set(key, o = { key, loc: t.k === 0 ? -1 : t.loc, kinds: new Set(), n: 0, w: 0, cr: 0, tasks: [] });
-    o.kinds.add(t.k); o.n++; o.w += t.w; o.cr += t.cr; o.tasks.push(i);
+    o.kinds.add(t.k === 2 && t.tl ? 3 : t.k); o.n++; o.w += t.w; o.cr += t.cr; o.tasks.push(i);
   });
   for (const o of m.values()) {
     const l = S.g.locs[o.loc];
     o.name = o.key === 'initial' ? 'initial task' : l ? locShort(l) : 'unknown location';
     o.func = o.key === 'initial' ? 'serial code outside parallel regions' : l ? (l.func || l.module) : '';
-    o.kind = o.key === 'initial' ? 'initial' : [...o.kinds].sort().map(k => k === 1 ? 'parallel region' : 'task').join(' + ');
+    o.kind = o.key === 'initial' ? 'initial' : [...o.kinds].sort().map(k => ['', 'parallel region', 'task', 'taskloop'][k]).join(' + ');
   }
   return [...m.values()];
 }
@@ -556,6 +557,7 @@ function renderTask() {
   const threads = [...new Set(t.segs.map(s => s[0]))], cpus = [...new Set(t.segs.flatMap(s => [s[1], s[2]]))];
   const first = t.segs[0], start = first ? first[4] : t.ct;
   const badges = [`<span class="badge">${KIND[t.k]}</span>`];
+  if (t.tl) badges.push(`<span class="badge" title="Created by the runtime for a taskloop construct; this may also be an internal helper task of the runtime">taskloop</span>`);
   for (const [bit, name] of FLAGS) if (t.fl & bit) badges.push(`<span class="badge">${name}</span>`);
   if (t.cr > 0) badges.push(`<span class="badge crit">critical path</span>`);
   if (t.k === 2 && first && first[0] !== t.cth) badges.push(`<span class="badge">ran on another thread than its creator</span>`);

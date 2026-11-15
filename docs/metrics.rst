@@ -106,11 +106,13 @@ the process.
 
 The location shown is only as good as the address the runtime reports.
 LLVM ``libomp`` 23 reports an address inside the runtime for tasks created by
-``taskloop`` (shown as ``__kmpc_taskloop (libomp.so)``, together with
-internal helper tasks of the runtime) and for the implicit tasks of nested
-parallel regions (``__kmp_invoke_microtask (libomp.so)``). All tasks with
-such an address are grouped into one row, even if they come from different
-constructs. Details are in :doc:`runtime-notes`.
+``taskloop``; the tool replaces it with the address of the ``taskloop``
+construct, so these tasks appear under the construct's line with the kind
+*taskloop* (their row includes internal helper tasks of the runtime). For the
+implicit tasks of nested parallel regions libomp also reports a runtime
+address (``__kmp_invoke_microtask (libomp.so)``); all such tasks are grouped
+into one row, even if they come from different constructs. Details are in
+:doc:`runtime-notes`.
 
 Per-process metrics
 -------------------
