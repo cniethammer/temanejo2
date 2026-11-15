@@ -103,6 +103,24 @@ Avg.
    points to tasks too fine-grained for the overhead of creating and
    scheduling them.
 
+Par.
+   Average parallelism of the group's tasks on their own:
+   Work / T\ :sub:`∞,G`, where T\ :sub:`∞,G` is the critical path through the
+   group's tasks only, computed as for a selected region (see `Region
+   metrics`_). It answers how many threads these tasks alone could keep
+   busy.
+
+Peak
+   The largest number of the group's tasks that were executing at the same
+   time, computed as the measured peak concurrency of a region.
+
+   Compare *Par.* and *Peak*: an average parallelism far above the peak means the
+   tasks would allow more parallelism than the run achieved, e.g. because
+   there were not more threads (the peak cannot exceed the thread count).
+   An average parallelism close to 1 means the tasks form a chain.
+   The *all tasks* row shows T\ :sub:`1` / T\ :sub:`∞` and the peak of the
+   whole graph.
+
 Every task belongs to exactly one group, so the rows add up to the totals of
 the process.
 

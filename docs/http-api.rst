@@ -30,7 +30,8 @@ The server has no authentication and binds to ``127.0.0.1`` by default.
 
 ``GET /api/rank/<rank>/graph``
    The analysed task graph of one rank. Top-level fields: ``rank``,
-   ``host``, ``pid``, ``wall``, ``work``, ``critical`` as above, and these
+   ``host``, ``pid``, ``wall``, ``work``, ``critical`` as above, ``peak``
+   (the largest number of tasks executing at the same time), and these
    arrays:
 
    ``threads``
@@ -73,13 +74,15 @@ The server has no authentication and binds to ``127.0.0.1`` by default.
 
    ``origins``
       Task origins, as in the GUI's task origins table, sorted by work:
-      ``{initial, loc, k, n, w, cr, tasks}``. ``initial`` is 1 for the group
+      ``{initial, loc, k, n, w, cr, own_cr, peak, tasks}``. ``initial`` is 1 for the group
       of the initial task (``loc`` is then -1); otherwise ``loc`` is the
       source location of the creating construct. ``k`` is a bit set of the
       kinds in the group: 1 implicit tasks of a parallel region, 2 tasks of
       a ``task`` construct, 4 tasks of a ``taskloop``. ``n`` is the number
       of tasks, ``w`` their total work, ``cr`` their work on the critical
-      path, ``tasks`` their indices. The groups partition the tasks, so the
+      path, ``own_cr`` the critical path through these tasks alone
+      (``w / own_cr`` is their average parallelism), ``peak`` the largest
+      number of them executing at the same time, ``tasks`` their indices. The groups partition the tasks, so the
       sums of ``w`` and ``cr`` are ``work`` and ``critical``.
 
    ``edges``

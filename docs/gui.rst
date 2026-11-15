@@ -7,7 +7,7 @@ Layout
 The side panel on the right holds the summary, the task origins, the task
 details and the region analysis. Drag the divider between graph and panel to
 change its width (between 260 pixels and 70 % of the window); double-click
-the divider to reset it. With the divider focused, the arrow keys change the
+the divider to reset it to the default of 400 pixels. With the divider focused, the arrow keys change the
 width in steps of 20 pixels (80 with Shift). The width is remembered by the
 browser. On narrow windows the panel is placed below the graph instead.
 
@@ -101,7 +101,9 @@ A table of all source locations that create tasks, with, for each:
 * the number of tasks created there and their average work per task;
 * their total work time and its share of T\ :sub:`1`, also drawn as a bar;
 * the part of that work on the critical path, and its share of the critical
-  path length T\ :sub:`∞`.
+  path length T\ :sub:`∞`;
+* the average parallelism of these tasks on their own (*Par.*);
+* the measured peak number of them running at the same time (*Peak*).
 
 The initial task, which holds the serial code outside parallel regions, has
 its own row. The last row sums up all tasks. Click a column header to sort,

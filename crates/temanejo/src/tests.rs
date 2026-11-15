@@ -139,6 +139,11 @@ fn check_invariants(m: &Model, crit: &PathResult) {
     assert_eq!(origins.iter().map(|o| o.tasks.len()).sum::<usize>(), m.tasks.len());
     assert_eq!(origins.iter().map(|o| o.work).sum::<u64>(), m.total_work(), "origin work must add up to T_1");
     assert_eq!(origins.iter().map(|o| o.critical).sum::<u64>(), crit.length, "origin critical times must add up to T_inf");
+    for o in &origins {
+        assert!(o.own_critical <= o.work, "an origin's own critical path cannot exceed its work");
+        assert!(o.peak as usize <= m.threads.len(), "peak concurrency cannot exceed the thread count");
+        assert_eq!(o.peak == 0, o.work == 0, "tasks that worked were running at some point");
+    }
 }
 
 // ------------------------------------------------------------------ scenarios
@@ -218,6 +223,9 @@ fn origins_separate_locations() {
     assert_eq!((init.tasks.len(), init.work, init.critical), (1, 50, 42));
     assert_eq!((a.tasks.len(), a.work, a.critical), (1, 30, 0));
     assert_eq!((b.tasks.len(), b.work, b.critical), (1, 50, 50));
+    // A single task: its own critical path is its work, peak 1.
+    assert_eq!((init.own_critical, init.peak), (50, 1));
+    assert_eq!((a.own_critical, a.peak), (30, 1));
     assert!(a.has_explicit && !a.has_implicit && !a.has_taskloop);
     // Sorted by work, largest first.
     assert!(origins.windows(2).all(|w| w[0].work >= w[1].work));
@@ -232,6 +240,9 @@ fn origins_merge_same_location() {
     assert_eq!(origins.len(), 2);
     let c = origins.iter().find(|o| o.codeptr == 0xC).unwrap();
     assert_eq!((c.tasks.len(), c.work, c.critical), (2, 80, 50));
+    // A and B are independent: own critical path max(30, 50) = 50, so the
+    // average parallelism is 80 / 50; on one thread they never overlap.
+    assert_eq!((c.own_critical, c.peak), (50, 1));
     check_invariants(&m, &crit);
 }
 
@@ -368,6 +379,9 @@ fn parallel_region_critical_path() {
     let region = origins.iter().find(|o| o.codeptr == 0x100).unwrap();
     assert!(region.has_implicit && !region.has_explicit);
     assert_eq!((region.tasks.len(), region.work, region.critical), (2, 9, 5));
+    // Implicit tasks 10 (5 + 1 before the barrier) and 11 (3) run side by side
+    // on two threads: own critical path 6, peak 2.
+    assert_eq!((region.own_critical, region.peak), (6, 2));
     check_invariants(&m, &crit);
 }
 

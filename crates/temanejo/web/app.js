@@ -191,6 +191,8 @@ function origins() {
     return {
       key: g.initial ? 'initial' : g.loc, loc: g.loc, n: g.n, w: g.w, cr: g.cr, tasks: g.tasks,
       avg: g.n ? g.w / g.n : 0,   // average work per task
+      // Average parallelism of these tasks alone, and measured peak.
+      par: g.own_cr ? g.w / g.own_cr : 0, peak: g.peak,
       name: g.initial ? 'initial task' : l ? locShort(l) : 'unknown location',
       func: g.initial ? 'serial code outside parallel regions' : l ? (l.func || l.module) : '',
       kind: g.initial ? 'initial' : kinds.join(' + '),
@@ -205,20 +207,21 @@ function renderOrigins() {
   const head = (k, label, title) =>
     `<th data-k="${k}" title="${title}" class="sortable">${label}${k === key ? (dir < 0 ? ' ▾' : ' ▴') : ''}</th>`;
   $('origins').innerHTML = `<div class="scroll"><table class="origins">
-    <thead><tr class="name">${head('name', 'Location', 'Source location of the task or parallel construct').replace('<th ', '<th colspan="4" ')}</tr>
-      <tr>${head('n', 'Tasks', 'Number of tasks created there')}${head('avg', 'Avg.', 'Average work per task (work ÷ tasks)')}${head('w', 'Work', 'Total exclusive work time of these tasks')}${head('cr', 'Crit.', 'Part of that work on the critical path, and its share of the critical path length T∞')}</tr></thead>
+    <thead><tr class="name">${head('name', 'Location', 'Source location of the task or parallel construct').replace('<th ', '<th colspan="6" ')}</tr>
+      <tr>${head('n', 'Tasks', 'Number of tasks created there')}${head('avg', 'Avg.', 'Average work per task (work ÷ tasks)')}${head('w', 'Work', 'Total exclusive work time of these tasks')}${head('cr', 'Crit.', 'Part of that work on the critical path, and its share of the critical path length T∞')}${head('par', 'Par.', 'Average parallelism of these tasks alone: their work ÷ their own critical path')}${head('peak', 'Peak', 'Measured peak: the largest number of these tasks running at the same time')}</tr></thead>
     ${rows.map(o => {
       const dot = showDot ? `<span class="dot" style="background:${S.css.cat[(S.catSlots.get(o.loc) ?? 0) % 8]}"></span>` : '';
       const pct = 100 * o.w / total;
       // One tbody per origin: the location on its own line, the numbers below it.
       return `<tbody data-o="${esc(String(o.key))}" title="${esc(o.func)} · click to select these tasks">
-        <tr class="name"><td colspan="4">${dot}<span class="mono">${esc(o.name)}</span> <span class="muted">· ${esc(o.kind)}</span>
+        <tr class="name"><td colspan="6">${dot}<span class="mono">${esc(o.name)}</span> <span class="muted">· ${esc(o.kind)}</span>
           <div class="bar" style="width:${pct.toFixed(1)}%"></div></td></tr>
         <tr><td>${o.n}</td><td>${fmt(o.avg)}</td><td>${fmt(o.w)}<br><span class="muted">${pctText(o.w, total)} %</span></td>
-        <td>${o.cr ? `${fmt(o.cr)}<br><span class="muted">${pctText(o.cr, g.critical)} %</span>` : '–'}</td></tr></tbody>`;
+        <td>${o.cr ? `${fmt(o.cr)}<br><span class="muted">${pctText(o.cr, g.critical)} %</span>` : '–'}</td>
+        <td>${o.par ? o.par.toFixed(1) : '–'}</td><td>${o.peak}</td></tr></tbody>`;
     }).join('')}
-    <tbody><tr class="name"><td colspan="4"><b>all tasks</b></td></tr><tr class="total"><td>${g.tasks.length}</td><td>${fmt(g.work / Math.max(g.tasks.length, 1))}</td><td>${fmt(g.work)}</td><td>${fmt(g.critical)}</td></tr></tbody>
-  </table></div><p class="muted">Work is exclusive task time; Avg. is work per task. Percentages: share of T₁ under Work, share of the critical path T∞ under Crit. Click a row to analyse its tasks as a region.</p>`;
+    <tbody><tr class="name"><td colspan="6"><b>all tasks</b></td></tr><tr class="total"><td>${g.tasks.length}</td><td>${fmt(g.work / Math.max(g.tasks.length, 1))}</td><td>${fmt(g.work)}</td><td>${fmt(g.critical)}</td><td>${(g.work / Math.max(g.critical, 1)).toFixed(1)}</td><td>${g.peak}</td></tr></tbody>
+  </table></div><p class="muted">Work is exclusive task time; Avg. is work per task. Percentages: share of T₁ under Work, share of the critical path T∞ under Crit. Par.: average parallelism of the row's tasks alone (work ÷ their own critical path); Peak: most of them running at once. Click a row to analyse its tasks as a region.</p>`;
 }
 
 $('origins').addEventListener('click', e => {
@@ -550,7 +553,7 @@ window.addEventListener('resize', () => { setAsideWidth(asideWidth()); resize();
 
 // ------------------------------------------------------------------ side panel width
 
-const splitter = $('splitter'), ASIDE_DEFAULT = 360, ASIDE_MIN = 260;
+const splitter = $('splitter'), ASIDE_DEFAULT = 400, ASIDE_MIN = 260;
 const asideWidth = () => document.querySelector('aside').getBoundingClientRect().width;
 function setAsideWidth(w, save = false) {
   w = Math.round(Math.min(Math.max(w, ASIDE_MIN), Math.max(ASIDE_MIN, window.innerWidth * 0.7)));

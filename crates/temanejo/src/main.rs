@@ -65,16 +65,18 @@ fn summary_json(r: &Rank) -> String {
 fn graph_json(m: &Model, crit: &PathResult, pos: &[(f32, f32)], locs: &[Loc]) -> String {
     let loc_of: HashMap<u64, usize> = locs.iter().enumerate().map(|(i, l)| (l.addr, i)).collect();
     let loc = |addr: u64| loc_of.get(&addr).map_or(-1, |&i| i as i64);
+    let peak = analysis::analyze_region(m, &vec![true; m.tasks.len()]).max_concurrency;
     let mut o = String::with_capacity(m.tasks.len() * 200);
     let _ = write!(
         o,
-        "{{\"rank\":{},\"host\":{},\"pid\":{},\"wall\":{},\"work\":{},\"critical\":{},",
+        "{{\"rank\":{},\"host\":{},\"pid\":{},\"wall\":{},\"work\":{},\"critical\":{},\"peak\":{},",
         m.rank,
         esc(&m.host),
         m.pid,
         m.wall,
         m.total_work(),
-        crit.length
+        crit.length,
+        peak
     );
     o.push_str("\"threads\":[");
     for (i, t) in m.threads.iter().enumerate() {
@@ -157,14 +159,16 @@ fn graph_json(m: &Model, crit: &PathResult, pos: &[(f32, f32)], locs: &[Loc]) ->
         let kinds = g.has_implicit as u8 | (g.has_explicit as u8) << 1 | (g.has_taskloop as u8) << 2;
         let _ = write!(
             o,
-            "{}{{\"initial\":{},\"loc\":{},\"k\":{},\"n\":{},\"w\":{},\"cr\":{},\"tasks\":[",
+            "{}{{\"initial\":{},\"loc\":{},\"k\":{},\"n\":{},\"w\":{},\"cr\":{},\"own_cr\":{},\"peak\":{},\"tasks\":[",
             if i > 0 { "," } else { "" },
             g.initial as u8,
             if g.initial { -1 } else { loc(g.codeptr) },
             kinds,
             g.tasks.len(),
             g.work,
-            g.critical
+            g.critical,
+            g.own_critical,
+            g.peak
         );
         for (j, t) in g.tasks.iter().enumerate() {
             let _ = write!(o, "{}{}", if j > 0 { "," } else { "" }, t);

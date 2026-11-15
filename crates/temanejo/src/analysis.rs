@@ -190,6 +190,11 @@ pub struct Origin {
     pub work: u64,
     /// Part of that work on the critical path (ns).
     pub critical: u64,
+    /// Critical path through these tasks alone (ns), as in `analyze_region`;
+    /// `work / own_critical` is their average parallelism.
+    pub own_critical: u64,
+    /// Largest number of these tasks executing at the same time.
+    pub peak: u32,
     pub has_implicit: bool,
     pub has_explicit: bool,
     pub has_taskloop: bool,
@@ -216,6 +221,18 @@ pub fn origins(m: &Model, crit: &PathResult) -> Vec<Origin> {
         }
     }
     let mut v: Vec<Origin> = groups.into_values().collect();
+    let mut sel = vec![false; m.tasks.len()];
+    for o in &mut v {
+        for &t in &o.tasks {
+            sel[t as usize] = true;
+        }
+        let r = analyze_region(m, &sel);
+        o.own_critical = r.critical;
+        o.peak = r.max_concurrency;
+        for &t in &o.tasks {
+            sel[t as usize] = false;
+        }
+    }
     v.sort_by(|a, b| b.work.cmp(&a.work).then(a.initial.cmp(&b.initial)).then(a.codeptr.cmp(&b.codeptr)));
     v
 }
