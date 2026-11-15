@@ -133,6 +133,9 @@ table.origins tr.name td { border-bottom: 0; padding-top: 6px; padding-bottom: 0
 table.origins tbody[data-o] { cursor: pointer; }
 table.origins tbody[data-o]:hover td { background: color-mix(in srgb, var(--ink) 5%, transparent); }
 table.origins .bar { height: 4px; margin-top: 3px; }
+table.origins td:first-child, table.origins th:first-child { text-align: right; }
+table.origins tr.name td, table.origins tr.name th { text-align: left; padding-left: 0; border-bottom: 0; }
+table.origins thead tr:last-child th { border-bottom: 1px solid var(--grid); }
 table.origins tr.total td { font-weight: 600; border-bottom: 0; }
 th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
 th.sortable:hover { color: var(--ink); }

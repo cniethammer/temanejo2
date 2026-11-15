@@ -98,8 +98,10 @@ Crit.
    Σ\ :sub:`t∈G` of each task's work on the critical path, and its share of
    T\ :sub:`∞` in percent. The column sums to T\ :sub:`∞` (100 %).
 
-Average per task (tooltip)
-   Work / number of tasks.
+Avg.
+   Average work per task: Work / Tasks. A small average with many tasks
+   points to tasks too fine-grained for the overhead of creating and
+   scheduling them.
 
 Every task belongs to exactly one group, so the rows add up to the totals of
 the process.

@@ -63,15 +63,14 @@ A table of all source locations that create tasks, with, for each:
 * the location (file and line, or function and library without debug
   information) and whether it is a ``task`` construct, a ``taskloop`` or a
   parallel region (whose implicit tasks are counted);
-* the number of tasks created there;
+* the number of tasks created there and their average work per task;
 * their total work time and its share of T\ :sub:`1`, also drawn as a bar;
 * the part of that work on the critical path, and its share of the critical
   path length T\ :sub:`∞`.
 
 The initial task, which holds the serial code outside parallel regions, has
 its own row. The last row sums up all tasks. Click a column header to sort,
-hover a row for the function name and the average work per task, and click a
-row to select all its tasks for the region analysis. With *Colour by: Source
+hover a row for the function name, and click a row to select all its tasks for the region analysis. With *Colour by: Source
 location*, each row shows the colour its tasks have in the graph.
 
 Task details

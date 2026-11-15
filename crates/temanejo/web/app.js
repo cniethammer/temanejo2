@@ -160,6 +160,7 @@ function origins() {
     const kinds = [[1, 'parallel region'], [2, 'task'], [4, 'taskloop']].filter(([bit]) => g.k & bit).map(k => k[1]);
     return {
       key: g.initial ? 'initial' : g.loc, loc: g.loc, n: g.n, w: g.w, cr: g.cr, tasks: g.tasks,
+      avg: g.n ? g.w / g.n : 0,   // average work per task
       name: g.initial ? 'initial task' : l ? locShort(l) : 'unknown location',
       func: g.initial ? 'serial code outside parallel regions' : l ? (l.func || l.module) : '',
       kind: g.initial ? 'initial' : kinds.join(' + '),
@@ -174,19 +175,20 @@ function renderOrigins() {
   const head = (k, label, title) =>
     `<th data-k="${k}" title="${title}" class="sortable">${label}${k === key ? (dir < 0 ? ' ▾' : ' ▴') : ''}</th>`;
   $('origins').innerHTML = `<div class="scroll"><table class="origins">
-    <thead><tr>${head('name', 'Location', 'Source location of the task or parallel construct')}${head('n', 'Tasks', 'Number of tasks created there')}${head('w', 'Work', 'Total exclusive work time of these tasks')}${head('cr', 'Crit.', 'Part of that work on the critical path, and its share of the critical path length T∞')}</tr></thead>
+    <thead><tr class="name">${head('name', 'Location', 'Source location of the task or parallel construct').replace('<th ', '<th colspan="4" ')}</tr>
+      <tr>${head('n', 'Tasks', 'Number of tasks created there')}${head('avg', 'Avg.', 'Average work per task (work ÷ tasks)')}${head('w', 'Work', 'Total exclusive work time of these tasks')}${head('cr', 'Crit.', 'Part of that work on the critical path, and its share of the critical path length T∞')}</tr></thead>
     ${rows.map(o => {
       const dot = showDot ? `<span class="dot" style="background:${S.css.cat[(S.catSlots.get(o.loc) ?? 0) % 8]}"></span>` : '';
       const pct = 100 * o.w / total;
       // One tbody per origin: the location on its own line, the numbers below it.
-      return `<tbody data-o="${esc(String(o.key))}" title="${esc(o.func)} · avg. ${fmt(o.w / o.n)} per task · click to select these tasks">
-        <tr class="name"><td colspan="4">${dot}<span class="mono">${esc(o.name)}</span></td></tr>
-        <tr><td><span class="muted">${esc(o.kind)}</span><div class="bar" style="width:${pct.toFixed(1)}%"></div></td>
-        <td>${o.n}</td><td>${fmt(o.w)}<br><span class="muted">${pctText(o.w, total)} %</span></td>
+      return `<tbody data-o="${esc(String(o.key))}" title="${esc(o.func)} · click to select these tasks">
+        <tr class="name"><td colspan="4">${dot}<span class="mono">${esc(o.name)}</span> <span class="muted">· ${esc(o.kind)}</span>
+          <div class="bar" style="width:${pct.toFixed(1)}%"></div></td></tr>
+        <tr><td>${o.n}</td><td>${fmt(o.avg)}</td><td>${fmt(o.w)}<br><span class="muted">${pctText(o.w, total)} %</span></td>
         <td>${o.cr ? `${fmt(o.cr)}<br><span class="muted">${pctText(o.cr, g.critical)} %</span>` : '–'}</td></tr></tbody>`;
     }).join('')}
-    <tbody><tr class="total"><td>all tasks</td><td>${g.tasks.length}</td><td>${fmt(g.work)}</td><td>${fmt(g.critical)}</td></tr></tbody>
-  </table></div><p class="muted">Work is exclusive task time. Percentages: share of T₁ under Work, share of the critical path T∞ under Crit. Click a row to analyse its tasks as a region.</p>`;
+    <tbody><tr class="name"><td colspan="4"><b>all tasks</b></td></tr><tr class="total"><td>${g.tasks.length}</td><td>${fmt(g.work / Math.max(g.tasks.length, 1))}</td><td>${fmt(g.work)}</td><td>${fmt(g.critical)}</td></tr></tbody>
+  </table></div><p class="muted">Work is exclusive task time; Avg. is work per task. Percentages: share of T₁ under Work, share of the critical path T∞ under Crit. Click a row to analyse its tasks as a region.</p>`;
 }
 
 $('origins').addEventListener('click', e => {
