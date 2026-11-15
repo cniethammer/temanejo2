@@ -236,3 +236,220 @@ pub fn origins(m: &Model, crit: &PathResult) -> Vec<Origin> {
     v.sort_by(|a, b| b.work.cmp(&a.work).then(a.initial.cmp(&b.initial)).then(a.codeptr.cmp(&b.codeptr)));
     v
 }
+
+// ------------------------------------------------------------------ groups
+
+/// Minimum number of sibling tasks from one location that form a group.
+pub const GROUP_MIN_SIBLINGS: usize = 8;
+/// Minimum number of descendants for which an explicit task's subtree
+/// becomes a group.
+pub const GROUP_MIN_SUBTREE: usize = 32;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GroupKind {
+    /// The tasks one task created for a taskloop construct.
+    Taskloop,
+    /// Sibling tasks created by one task at the same code location.
+    Fan,
+    /// All descendants of an explicit task (e.g. a recursion).
+    Subtree,
+}
+
+/// A set of tasks the GUI can show as one node and load on demand.
+#[derive(Debug)]
+pub struct Group {
+    pub kind: GroupKind,
+    /// Creating task of the siblings, or the root of the subtree (not a member).
+    pub anchor: u32,
+    pub codeptr: u64,
+    /// Task indices in ascending (creation) order.
+    pub members: Vec<u32>,
+}
+
+/// Children of every task, in creation order.
+pub fn children(m: &Model) -> Vec<Vec<u32>> {
+    let mut ch = vec![Vec::new(); m.tasks.len()];
+    for (i, t) in m.tasks.iter().enumerate() {
+        if t.parent != NONE {
+            ch[t.parent as usize].push(i as u32);
+        }
+    }
+    ch
+}
+
+fn descendants(children: &[Vec<u32>], roots: &[u32]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut stack = roots.to_vec();
+    while let Some(i) = stack.pop() {
+        out.push(i);
+        stack.extend_from_slice(&children[i as usize]);
+    }
+    out.sort_unstable();
+    out
+}
+
+/// Detects the task groups of a graph:
+///
+/// 1. For every task, its explicit children are bucketed by code location
+///    (taskloop tasks separately); a bucket of at least
+///    `GROUP_MIN_SIBLINGS` tasks forms a group together with everything
+///    these tasks create.
+/// 2. Of the explicit tasks outside those groups, the topmost ones with at
+///    least `GROUP_MIN_SUBTREE` descendants get a subtree group of their
+///    descendants, unless a group of step 1 already hangs below them.
+///
+/// Groups may nest (a group inside another one is a subset of it); they
+/// never overlap partially.
+pub fn groups(m: &Model) -> Vec<Group> {
+    let n = m.tasks.len();
+    let ch = children(m);
+    let mut groups = Vec::new();
+    let mut in_group = vec![false; n];
+    let mut has_fan = vec![false; n];
+    for (p, kids) in ch.iter().enumerate() {
+        if kids.len() < GROUP_MIN_SIBLINGS {
+            continue;
+        }
+        let mut buckets: Vec<((u64, bool), Vec<u32>)> = Vec::new();
+        for &c in kids {
+            let t = &m.tasks[c as usize];
+            if t.kind != TaskKind::Explicit {
+                continue;
+            }
+            let key = (t.codeptr, t.taskloop);
+            match buckets.iter_mut().find(|b| b.0 == key) {
+                Some(b) => b.1.push(c),
+                None => buckets.push((key, vec![c])),
+            }
+        }
+        for ((codeptr, taskloop), sib) in buckets {
+            if sib.len() < GROUP_MIN_SIBLINGS {
+                continue;
+            }
+            let members = descendants(&ch, &sib);
+            for &i in &members {
+                in_group[i as usize] = true;
+            }
+            has_fan[p] = true;
+            let kind = if taskloop { GroupKind::Taskloop } else { GroupKind::Fan };
+            groups.push(Group { kind, anchor: p as u32, codeptr, members });
+        }
+    }
+    // Subtree sizes: parents are created before their children, so one
+    // backward sweep accumulates them.
+    let mut size = vec![0usize; n];
+    for i in (0..n).rev() {
+        let p = m.tasks[i].parent;
+        if p != NONE {
+            size[p as usize] += size[i] + 1;
+        }
+    }
+    let mut stack: Vec<u32> = (0..n as u32).filter(|&i| m.tasks[i as usize].parent == NONE).collect();
+    while let Some(i) = stack.pop() {
+        let iu = i as usize;
+        if in_group[iu] {
+            continue;
+        }
+        if m.tasks[iu].kind == TaskKind::Explicit && size[iu] >= GROUP_MIN_SUBTREE && !has_fan[iu] {
+            groups.push(Group { kind: GroupKind::Subtree, anchor: i, codeptr: m.tasks[iu].codeptr, members: descendants(&ch, &ch[iu]) });
+        } else {
+            stack.extend_from_slice(&ch[iu]);
+        }
+    }
+    groups
+}
+
+/// For every task the outermost group containing it (`NONE` if none).
+pub fn top_group(n_tasks: usize, groups: &[Group]) -> Vec<u32> {
+    let mut order: Vec<usize> = (0..groups.len()).collect();
+    order.sort_by_key(|&g| std::cmp::Reverse(groups[g].members.len()));
+    let mut top = vec![NONE; n_tasks];
+    for g in order {
+        for &i in &groups[g].members {
+            if top[i as usize] == NONE {
+                top[i as usize] = g as u32;
+            }
+        }
+    }
+    top
+}
+
+/// What the GUI shows for a set of tasks without having their records.
+#[derive(Debug, Default)]
+pub struct Summary {
+    pub n: usize,
+    pub work: u64,
+    /// Work on the critical path of the whole graph.
+    pub critical: u64,
+    pub min_work: u64,
+    pub max_work: u64,
+    /// Start of the first and end of the last execution segment.
+    pub t_begin: u64,
+    pub t_end: u64,
+    pub threads: usize,
+    /// Critical path through these tasks alone; `work / own_critical` is their parallelism.
+    pub own_critical: u64,
+    pub peak: u32,
+    // A typical task, used to colour the group node: the most frequent
+    // value of each category and the mean of each time.
+    pub thread: i64,
+    pub cpu: i64,
+    pub numa: i64,
+    pub codeptr: u64,
+    pub parallel: u32,
+    pub kind: u8,
+    pub mean_work: u64,
+    pub mean_create: u64,
+    pub mean_start: u64,
+}
+
+fn most_frequent<T: Copy + Ord + std::hash::Hash>(values: impl Iterator<Item = T>) -> Option<T> {
+    let mut count: std::collections::HashMap<T, usize> = Default::default();
+    for v in values {
+        *count.entry(v).or_default() += 1;
+    }
+    // Ties go to the smaller value, so the result does not depend on hash order.
+    count.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))).map(|(v, _)| v)
+}
+
+/// Thread a task counts as running on: that of its first segment, or the
+/// creating thread if it never ran. (The GUI uses the same rule.)
+pub fn task_thread(t: &crate::model::Task) -> i64 {
+    t.segs.first().map_or(t.create_thread as i64, |s| s.thread as i64)
+}
+
+/// Start of a task: begin of its first segment, or its creation if it never ran.
+pub fn task_start(t: &crate::model::Task) -> u64 {
+    t.segs.first().map_or(t.create_ts, |s| s.start)
+}
+
+pub fn summarize(m: &Model, crit: &PathResult, members: &[u32]) -> Summary {
+    let mut selected = vec![false; m.tasks.len()];
+    for &i in members {
+        selected[i as usize] = true;
+    }
+    let region = analyze_region(m, &selected);
+    let tasks = || members.iter().map(|&i| &m.tasks[i as usize]);
+    let n = members.len().max(1) as u64;
+    Summary {
+        n: members.len(),
+        work: region.work,
+        critical: members.iter().map(|&i| crit.task_time[i as usize]).sum(),
+        min_work: tasks().map(|t| t.work).min().unwrap_or(0),
+        max_work: tasks().map(|t| t.work).max().unwrap_or(0),
+        t_begin: region.t_begin,
+        t_end: region.t_end,
+        threads: region.per_thread.len(),
+        own_critical: region.critical,
+        peak: region.max_concurrency,
+        thread: most_frequent(tasks().map(task_thread)).unwrap_or(-1),
+        cpu: most_frequent(tasks().map(|t| t.segs.first().map_or(-1, |s| s.cpu as i64))).unwrap_or(-1),
+        numa: most_frequent(tasks().map(|t| t.segs.first().map_or(-1, |s| s.numa as i64))).unwrap_or(-1),
+        codeptr: most_frequent(tasks().map(|t| t.codeptr)).unwrap_or(0),
+        parallel: most_frequent(tasks().map(|t| t.parallel)).unwrap_or(NONE),
+        kind: most_frequent(tasks().map(|t| t.kind as u8)).unwrap_or(2),
+        mean_work: region.work / n,
+        mean_create: tasks().map(|t| t.create_ts).sum::<u64>() / n,
+        mean_start: tasks().map(task_start).sum::<u64>() / n,
+    }
+}

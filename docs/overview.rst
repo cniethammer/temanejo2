@@ -91,8 +91,8 @@ Source layout
 ``crates/tmj-trace``       trace file format (reader and writer)
 ``crates/tmj-ompt``        OMPT tool
 ``crates/temanejo/src``    server: ``model.rs`` graph reconstruction,
-                           ``analysis.rs`` critical path, parallelism and
-                           task origins, ``tests.rs``,
+                           ``analysis.rs`` critical path, parallelism,
+                           task origins and groups, ``tests.rs``,
                            ``layout.rs``, ``symbolize.rs``, ``main.rs``
                            (command line, HTTP, JSON)
 ``crates/temanejo/web``    GUI

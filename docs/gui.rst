@@ -81,8 +81,8 @@ Grey out unselected
    segment in the timeline.
 
 Collapse groups, Expand all
-   Collapse all automatically detected task groups into one node each, or
-   expand all collapsed groups; see `Collapsing groups`_.
+   Collapse all detected task groups into one node each (the state the GUI
+   opens in), or expand all groups; see `Collapsing groups`_.
 
 Task id, Fit
    Jump to a task by its id; fit the view to the window (key ``F``).
@@ -117,45 +117,55 @@ enough.
 Collapsing groups
 -----------------
 
-Large sets of similar tasks can be shown as a single node. Collapsing only
-changes what is drawn: all metrics, the task origins table and the region
-analysis are always computed on the full graph.
+Large sets of similar tasks are shown as a single node, and the GUI opens
+with all of them collapsed. Collapsing only changes what is drawn: all
+metrics, the task origins table and the region analysis are always computed
+on the full graph.
 
-Three kinds of groups exist:
+The server detects these groups:
 
 taskloop
    The tasks one task created for a ``taskloop`` construct (including the
-   runtime's helper tasks, see :doc:`runtime-notes`). Detected
-   automatically.
+   runtime's helper tasks, see :doc:`runtime-notes`).
 tasks from one source line
    Eight or more sibling tasks created by the same task at the same source
-   location, e.g. a ``task`` construct inside a loop. Detected
-   automatically.
+   location, e.g. a ``task`` construct inside a loop.
 subtree
-   All tasks created below a task, directly or indirectly. Made on demand
-   with *Collapse subtree* in the task details, e.g. for a recursion or a
-   whole parallel region.
+   All tasks created below an explicit task, directly or indirectly, if
+   there are at least 32 of them, e.g. a recursion. The topmost such task is
+   taken, and it stays visible above its group.
 
-The automatically detected groups include the tasks their members create.
+The first two include the tasks their members create, so groups can be
+nested. In addition, *Collapse subtree* in the task details collapses
+everything below any task, e.g. a whole parallel region.
 
 A collapsed group is drawn as a stack of cards, wider the more tasks it
-holds, with the number of tasks (``×2300``) below it. Its colour is the most
-frequent colour among its tasks in the current colour mode, and it has a red
-outline if any of its tasks is on the critical path. All edges between two
-nodes are merged into one line. The graph is laid out again whenever groups
-are collapsed or expanded.
+holds, with the number of tasks (``×2300``) below it. Its colour is that of
+its typical task in the current colour mode (most frequent thread, CPU,
+source location ..., mean times), and it has a red outline if any of its
+tasks is on the critical path. All edges between two nodes are merged into
+one line. The graph is laid out again whenever groups are collapsed or
+expanded.
 
-*Collapse groups* in the toolbar collapses all automatically detected
-groups, *Expand all* expands everything. A click on a group node expands it;
-*Collapse its group* in the details of one of its tasks collapses it again.
-Shift+click on a group node selects its tasks for the region analysis, as
-does a selection rectangle around it.
+A click on a group node expands it; *Collapse its group* in the details of
+one of its tasks collapses it again. *Expand all* in the toolbar expands
+everything, *Collapse groups* collapses all detected groups. Shift+click on
+a group node selects its tasks for the region analysis, as does a selection
+rectangle around it.
 
 Hovering a group node shows its kind and source location, the number of
 tasks, their total work with the share of T\ :sub:`1`, the average, shortest
 and longest task, when and on how many threads they ran, their average
-parallelism and peak (as in the task origins table, fetched from the server
-on first hover) and their work on the critical path.
+parallelism and peak (as in the task origins table) and their work on the
+critical path.
+
+**Loading on demand.** To keep large traces manageable, the browser first
+receives only the tasks outside groups and a summary of every group. The
+tasks of a group are fetched from the server when the group is expanded for
+the first time, or when one of them is needed, e.g. after entering its id in
+the *Task id* field. For the example trace with 15,231 tasks the first
+transfer is 0.3 MB instead of 3.5 MB. Three actions need all tasks and load
+them: *Expand all*, the timeline view, and *Select parallel region*.
 
 Notes:
 
@@ -274,8 +284,8 @@ The state can be preset through the URL fragment, e.g.::
    ``create``, ``start`` or ``wait``
 ``task``
    task id to select and centre
-``collapse``
-   ``all``: collapse all automatically detected groups
+``expand``
+   ``all``: expand all groups (loads all tasks)
 ``perf``
    show the frame time display (no value needed)
 ``gpubase``

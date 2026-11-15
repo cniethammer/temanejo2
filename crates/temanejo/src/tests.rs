@@ -457,3 +457,120 @@ fn downsample_preserves_area() {
     assert!((area - 150.0).abs() < 1e-9, "area {area}");
     assert!((samples[0].1 - 2.0).abs() < 1e-9 && (samples[9].1 - 1.0).abs() < 1e-9);
 }
+
+// ------------------------------------------------------------------ groups
+
+/// The initial task (1) creates explicit tasks; `spec` lists (id, parent id,
+/// code location). The tasks never run, which grouping does not need.
+fn creation_trace(spec: &[(u64, u64, u64)]) -> Trace {
+    let mut b = TraceBuilder::default();
+    b.thread_begin(0, 0, true).initial_begin(0, 0, 1, 1);
+    for (k, &(id, parent, codeptr)) in spec.iter().enumerate() {
+        b.create(0, 10 + k as u64, id, parent, codeptr);
+    }
+    b.initial_end(0, 10_000, 1, 1);
+    b.build()
+}
+
+fn member_ids(m: &Model, g: &analysis::Group) -> Vec<u64> {
+    g.members.iter().map(|&i| m.tasks[i as usize].id).collect()
+}
+
+#[test]
+fn siblings_from_one_location_form_a_group() {
+    use analysis::{GroupKind, GROUP_MIN_SIBLINGS};
+    // 8 tasks at 0xA (a group), 7 at 0xB (one too few), all children of task 1.
+    let mut spec: Vec<(u64, u64, u64)> = (0..GROUP_MIN_SIBLINGS as u64).map(|k| (10 + k, 1, 0xA)).collect();
+    spec.extend((0..GROUP_MIN_SIBLINGS as u64 - 1).map(|k| (100 + k, 1, 0xB)));
+    let m = Model::build(&creation_trace(&spec));
+    let groups = analysis::groups(&m);
+    assert_eq!(groups.len(), 1);
+    assert!(groups[0].kind == GroupKind::Fan);
+    assert_eq!(groups[0].anchor as usize, task(&m, 1));
+    assert_eq!(groups[0].codeptr, 0xA);
+    assert_eq!(member_ids(&m, &groups[0]), (10..18).collect::<Vec<_>>());
+    // Tasks outside groups have no outermost group.
+    let top = analysis::top_group(m.tasks.len(), &groups);
+    assert_eq!(top[task(&m, 10)], 0);
+    assert_eq!(top[task(&m, 100)], crate::model::NONE);
+    assert_eq!(top[task(&m, 1)], crate::model::NONE);
+}
+
+#[test]
+fn group_includes_descendants_and_nests() {
+    // 8 siblings at 0xA; sibling 10 itself creates 8 tasks at 0xB.
+    let mut spec: Vec<(u64, u64, u64)> = (0..8).map(|k| (10 + k, 1, 0xA)).collect();
+    spec.extend((0..8).map(|k| (100 + k, 10, 0xB)));
+    let m = Model::build(&creation_trace(&spec));
+    let groups = analysis::groups(&m);
+    assert_eq!(groups.len(), 2);
+    let outer = groups.iter().find(|g| g.codeptr == 0xA).unwrap();
+    let inner = groups.iter().find(|g| g.codeptr == 0xB).unwrap();
+    assert_eq!(outer.members.len(), 16, "siblings and their descendants");
+    assert_eq!(inner.members.len(), 8);
+    assert!(inner.members.iter().all(|i| outer.members.contains(i)), "nested groups are subsets");
+    // The outermost group of an inner task is the outer group.
+    let top = analysis::top_group(m.tasks.len(), &groups);
+    let outer_id = groups.iter().position(|g| g.codeptr == 0xA).unwrap() as u32;
+    assert_eq!(top[task(&m, 100)], outer_id);
+}
+
+#[test]
+fn deep_task_tree_forms_a_subtree_group() {
+    use analysis::{GroupKind, GROUP_MIN_SUBTREE};
+    // A binary recursion below task 1001: node j of a heap has the id
+    // 1000 + j and is created by node j / 2. The two children of a node have
+    // different code locations, so no sibling group exists.
+    let tree = |descendants: u64| -> Vec<(u64, u64, u64)> {
+        let mut spec = vec![(1001, 1, 0x1)];
+        spec.extend((2..2 + descendants).map(|j| (1000 + j, 1000 + j / 2, 0x100 + (j % 2))));
+        spec
+    };
+    let n = GROUP_MIN_SUBTREE as u64;
+    let m = Model::build(&creation_trace(&tree(n)));
+    let groups = analysis::groups(&m);
+    assert_eq!(groups.len(), 1);
+    assert!(groups[0].kind == GroupKind::Subtree);
+    assert_eq!(groups[0].anchor as usize, task(&m, 1001), "the topmost explicit task is the root");
+    assert_eq!(groups[0].members.len() as u64, n);
+    assert!(!groups[0].members.contains(&(task(&m, 1001) as u32)), "the root is not a member");
+
+    // One task fewer than the minimum: no group.
+    assert!(analysis::groups(&Model::build(&creation_trace(&tree(n - 1)))).is_empty());
+}
+
+#[test]
+fn groups_partition_or_nest() {
+    // Every pair of groups is either disjoint or one contains the other, and
+    // members are sorted, in the three scenario traces and a mixed one.
+    let mut spec: Vec<(u64, u64, u64)> = (0..12).map(|k| (10 + k, 1, 0xA)).collect();
+    spec.extend((0..40).map(|k| (100 + k, 10 + k % 3, 0xB + k % 2)));
+    for trace in [creation_trace(&spec), taskwait_trace(0xA, 0xB), parallel_trace()] {
+        let m = Model::build(&trace);
+        let groups = analysis::groups(&m);
+        for g in &groups {
+            assert!(g.members.windows(2).all(|w| w[0] < w[1]));
+            assert!(!g.members.contains(&g.anchor));
+        }
+        for a in &groups {
+            for b in &groups {
+                let common = a.members.iter().filter(|i| b.members.contains(i)).count();
+                assert!(common == 0 || common == a.members.len().min(b.members.len()));
+            }
+        }
+    }
+}
+
+#[test]
+fn summary_of_a_task_set() {
+    // A (30) and B (50) of the taskwait scenario, both on thread 0.
+    let (m, crit) = analyse(&taskwait_trace(0xC, 0xC));
+    let s = analysis::summarize(&m, &crit, &[task(&m, 2) as u32, task(&m, 3) as u32]);
+    assert_eq!((s.n, s.work, s.min_work, s.max_work, s.mean_work), (2, 80, 30, 50, 40));
+    assert_eq!(s.critical, 50, "only B is on the critical path of the graph");
+    assert_eq!((s.own_critical, s.peak, s.threads), (50, 1, 1));
+    assert_eq!((s.t_begin, s.t_end), (21, 101));
+    assert_eq!((s.thread, s.codeptr, s.kind), (0, 0xC, 2));
+    assert_eq!(s.mean_create, (10 + 12) / 2);
+    assert_eq!(s.mean_start, (21 + 51) / 2);
+}

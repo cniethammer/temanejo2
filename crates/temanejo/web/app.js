@@ -10,6 +10,13 @@
 //   tl   1 if created by a taskloop construct
 //   x,y  layout position (grid)     segs [thread, cpu, cpu_end, numa, start, end]
 //   deps [address, ompt dependence type]
+//   i    index of the task (position in S.g.tasks)
+//
+// The graph is loaded with all groups collapsed (graph_json in main.rs):
+// S.g.tasks has an entry for every task, but the tasks inside groups start
+// as stubs with only id, parent and critical time (`loaded` is false). Their
+// records and dependence edges are fetched when their outermost group is
+// first expanded or one of them is needed (loadGroup).
 'use strict';
 
 const $ = id => document.getElementById(id);
@@ -33,7 +40,7 @@ const FLAGS = [[0x08000000, 'undeferred'], [0x10000000, 'untied'], [0x20000000, 
 const S = {
   g: null, view: 'graph', colorBy: 'thread',
   showCrit: true, showCreate: true, showDep: true, fadeOthers: true,
-  sel: -1, region: new Set(), regionInfo: null, regionCrit: new Map(), regionEdges: new Set(),
+  sel: -1, region: new Set(), regionInfo: null, regionCrit: new Map(), regionPairs: [],
   cam: { x: 0, y: 0, k: 1 },           // graph camera: screen = world * k + (x, y)
   tl: { t0: 0, t1: 1 },                // visible time window of the timeline
   drag: null, hover: -1, hoverGroup: -1, css: {}, children: [], succ: [], pred: [],
@@ -127,15 +134,13 @@ function color(t) {
 }
 // Colour follows the entity: slots are assigned in sorted value order per rank and mode.
 function assignSlots() {
-  const vals = [...new Set(S.g.tasks.map(catValue))].sort((a, b) => a - b);
-  S.catSlots = new Map(vals.map((v, i) => [v, i]));
+  // Categories and ranges cover all tasks, loaded or not (computed by the
+  // server), so colours stay the same while groups are loaded.
+  S.catSlots = new Map((S.g.cats[S.colorBy] || []).map((v, i) => [v, i]));
   const seq = SEQUENTIAL[S.colorBy];
   if (seq) {
-    let min = Infinity, max = -Infinity;
-    for (const t of S.g.tasks) {
-      const v = seq.log ? Math.max(seq.value(t), 1) : seq.value(t);
-      min = Math.min(min, v); max = Math.max(max, v);
-    }
+    let [min, max] = S.g.ranges[S.colorBy];
+    if (seq.log) { min = Math.max(min, 1); max = Math.max(max, 1); }
     S.seqRange = { min, max, lo: seq.log ? Math.log(min) : min, hi: seq.log ? Math.log(max) : max };
   }
 }
@@ -180,19 +185,41 @@ async function loadRank(rank) {
   const g = await (await fetch(`api/rank/${rank}/graph`)).json();
   S.g = g;
   S.sel = -1; S.hover = -1;
-  const n = g.tasks.length;
+  const n = g.n;
+  // Every task gets an entry; those inside groups are stubs until loaded.
+  const records = g.tasks;
+  g.tasks = g.ids.map((id, i) => ({ i, id, par: g.par[i], k: 2, fl: 0, pr: -1, ix: 0, ct: 0, cth: 0, loc: -1, e: 0, w: 0, tl: 0, cr: 0, segs: [], deps: [], x: 0, y: 0, loaded: false }));
+  for (const r of records) Object.assign(g.tasks[r.i], r, { loaded: true });
+  for (const [i, cr] of g.crit) g.tasks[i].cr = cr;
+  S.byId = new Map(g.ids.map((id, i) => [id, i]));
+  // Creation edges are the parent relation, known for all tasks.
+  const critCreate = new Set(g.cc);
   S.children = Array.from({ length: n }, () => []);
+  const depEdges = g.edges;
+  g.edges = [];
+  g.par.forEach((p, i) => { if (p >= 0) { S.children[p].push(i); g.edges.push([p, i, 0, critCreate.has(i) ? 1 : 0]); } });
+  // Dependence edges arrive with their tasks; S.pre holds the merged edges
+  // of groups that are not loaded yet.
   S.succ = Array.from({ length: n }, () => []);
   S.pred = Array.from({ length: n }, () => []);
-  for (const [a, b, kind] of g.edges) {
-    if (kind === 0) S.children[a].push(b);
-    else { S.succ[a].push(b); S.pred[b].push(a); }
-  }
-  S.byId = new Map(g.tasks.map((t, i) => [t.id, i]));
+  S.depKeys = new Set();
+  addDepEdges(depEdges);
+  S.pre = g.pre;
   S.tl = { t0: 0, t1: Math.max(g.wall, 1) };
   assignSlots();
-  S.hoverGroup = -1; S.region = new Set(); S.regionEdges = new Set();
-  detectGroups();
+  S.hoverGroup = -1; S.region = new Set(); S.regionPairs = [];
+  // Groups detected by the server, all collapsed.
+  S.groups = [];
+  S.groupOf = new Int32Array(n).fill(-1);   // smallest group containing a task
+  S.topOf = new Int32Array(n).fill(-1);     // outermost server group containing a task
+  for (const sg of g.groups) {
+    const grp = makeGroup(sg.kind, sg.anchor, sg.loc, sg.members, sg.sum);
+    grp.server = true; grp.top = !!sg.top; grp.collapsed = true;
+    for (const i of grp.members) {
+      if (S.groupOf[i] < 0 || S.groups[S.groupOf[i]].n > grp.n) S.groupOf[i] = grp.id;
+      if (grp.top) S.topOf[i] = grp.id;
+    }
+  }
   rebuildVisible();
   setRegion(new Set());
   renderSummary();
@@ -200,6 +227,46 @@ async function loadRank(rank) {
   renderTask();
   renderLegend();
   fit();
+  // The timeline needs all tasks (see the view switch).
+  if (S.view === 'timeline') ensureLoaded().then(() => { if (S.g === g) draw(); });
+}
+
+// Adds dependence edges [from, to, 1, critical], skipping known ones (an
+// edge between two groups is delivered with each of them).
+function addDepEdges(edges) {
+  const n = S.g.n;
+  for (const e of edges) {
+    const key = e[0] * n + e[1];
+    if (S.depKeys.has(key)) continue;
+    S.depKeys.add(key);
+    S.g.edges.push(e);
+    S.succ[e[0]].push(e[1]); S.pred[e[1]].push(e[0]);
+  }
+}
+
+// Fetches the task records and dependence edges of an outermost server
+// group; resolves at once if they are loaded. Concurrent calls share one request.
+function loadGroup(grp) {
+  if (grp.loaded) return Promise.resolve();
+  if (!grp.loading) {
+    const g = S.g;
+    grp.loading = fetch(`api/rank/${g.rank}/group/${grp.id}`).then(r => r.json()).then(data => {
+      if (S.g !== g) return;   // another rank was loaded meanwhile
+      for (const r of data.tasks) Object.assign(g.tasks[r.i], r, { loaded: true });
+      addDepEdges(data.edges);
+      S.pre = S.pre.filter(e => e[4] !== grp.id && e[5] !== grp.id);
+      // The groups nested inside are loaded with it.
+      for (const x of S.groups) if (x.server && S.topOf[x.rep] === grp.id) x.loaded = true;
+    });
+  }
+  return grp.loading;
+}
+// Loads whatever is missing of the given tasks (default: all tasks).
+function ensureLoaded(tasks) {
+  const tops = new Set();
+  if (tasks) { for (const i of tasks) if (!S.g.tasks[i].loaded) tops.add(S.groups[S.topOf[i]]); }
+  else for (const grp of S.groups) if (grp.top && !grp.loaded) tops.add(grp);
+  return Promise.all([...tops].map(loadGroup));
 }
 
 function renderSummary() {
@@ -220,9 +287,7 @@ function renderSummary() {
 
 // Indices of all tasks with work on the critical path of the whole graph.
 function criticalTasks() {
-  const sel = new Set();
-  S.g.tasks.forEach((t, i) => { if (t.cr > 0) sel.add(i); });
-  return sel;
+  return new Set(S.g.crit.map(c => c[0]));
 }
 
 // ------------------------------------------------------------------ task origins
@@ -448,7 +513,7 @@ function drawGraph() {
   if (S.showCreate) drawFans(sx, sy, r, fade, greyAlpha, createAlpha);
   if (S.showCreate) pass(e => e[2] === 0 && !isCrit(e) && inSel(e) && direct(e), css.edgeCreate, 1, createAlpha);
   if (S.showDep) pass(e => e[2] === 1 && !isCrit(e) && inSel(e), css.edgeDep, 1, far ? 0.35 : 0.7);
-  if (S.regionEdges.size) pass(e => e[4], css.ink, 2.5, 1);
+  if (S.regionPairs.length) pass(e => e[4], css.ink, 2.5, 1);
   if (S.showCrit) pass(e => e[3] && shown(e) && inSel(e), css.critical, Math.max(2, 3 * Math.min(k, 1)), 1);
 
   // Nodes, batched: one path per fill colour and one per kind of mark, so a
@@ -533,39 +598,15 @@ function descendants(roots) {
   return out;
 }
 
-function makeGroup(kind, anchor, loc, members) {
+// `sum` is the server's summary of the members (group_summary_json): their
+// statistics and a typical task used for the node's colour.
+function makeGroup(kind, anchor, loc, members, sum) {
   // The representative is the first-created task: its position is the group
   // node's, and it decides where a dependence cycle between groups is cut.
-  const T = S.g.tasks, g = { id: S.groups.length, kind, anchor, loc, members, rep: members.reduce((a, b) => Math.min(a, b)), collapsed: false, drawn: false,
-    n: members.length, w: 0, cr: 0, min: Infinity, max: 0, t0: Infinity, t1: 0, threads: new Set(), col: null, stats: null, inRegion: false };
-  for (const i of members) {
-    const t = T[i];
-    g.w += t.w; g.cr += t.cr; g.min = Math.min(g.min, t.w); g.max = Math.max(g.max, t.w);
-    for (const s of t.segs) { g.t0 = Math.min(g.t0, s[4]); g.t1 = Math.max(g.t1, s[5]); g.threads.add(s[0]); }
-  }
-  S.groups.push(g);
-  return g;
-}
-
-function detectGroups() {
-  const T = S.g.tasks, n = T.length;
-  S.groups = [];
-  S.groupOf = new Int32Array(n).fill(-1);   // smallest detected group containing a task
-  S.children.forEach((ch, p) => {
-    if (ch.length < FAN) return;
-    const buckets = new Map();
-    for (const c of ch) {
-      if (T[c].k !== 2) continue;
-      const key = T[c].loc * 2 + (T[c].tl ? 1 : 0);
-      if (!buckets.has(key)) buckets.set(key, []);
-      buckets.get(key).push(c);
-    }
-    for (const sib of buckets.values()) {
-      if (sib.length < FAN) continue;
-      const g = makeGroup(T[sib[0]].tl ? 'taskloop' : 'fan', p, T[sib[0]].loc, descendants(sib));
-      for (const i of g.members) if (S.groupOf[i] < 0 || S.groups[S.groupOf[i]].n > g.n) S.groupOf[i] = g.id;
-    }
-  });
+  const grp = { id: S.groups.length, kind, anchor, loc, members, rep: members.reduce((a, b) => Math.min(a, b)), sum, n: sum.n, cr: sum.cr,
+    collapsed: false, drawn: false, inRegion: false, server: false, top: false, loaded: false, loading: null };
+  S.groups.push(grp);
+  return grp;
 }
 
 // Recomputes which tasks are hidden, the merged edges and the fans; lays the
@@ -595,7 +636,21 @@ function rebuildVisible(relayout = true) {
     let v = merged.get(key);
     if (!v) merged.set(key, v = [a, b, e[2], 0, 0]);
     if (e[3]) v[3] = 1;
-    if (S.regionEdges.size && (S.regionEdges.has(e[0] * n + e[1]) || S.regionEdges.has(e[1] * n + e[0]))) v[4] = 1;
+  }
+  // Merged edges of the groups not loaded yet; their end points are group
+  // representatives, which `rep` maps on if the group is inside a collapsed one.
+  for (const e of S.pre) {
+    const a = rep(e[0]), b = rep(e[1]);
+    if (a === b) continue;
+    const key = (a * n + b) * 2 + 1;
+    let v = merged.get(key);
+    if (!v) merged.set(key, v = [a, b, 1, 0, 0]);
+    if (e[3]) v[3] = 1;
+  }
+  // Edges on the critical path of the selected region.
+  for (const [p, q] of S.regionPairs) {
+    const a = rep(p), b = rep(q);
+    for (const key of [(a * n + b) * 2, (a * n + b) * 2 + 1, (b * n + a) * 2, (b * n + a) * 2 + 1]) { const v = merged.get(key); if (v) v[4] = 1; }
   }
   S.vEdges = [...merged.values()];
   findFans();
@@ -664,8 +719,14 @@ const slots = i => S.repGroup[i] >= 0 ? 3 : 1;
 
 // Collapses or expands groups and lays the graph out again. `keep` is a task
 // whose position on screen is preserved; without it the view is fitted.
-function setCollapsed(groups, collapsed, keep = -1) {
-  const T = S.g.tasks, before = keep >= 0 ? { x: T[keep].x, y: T[keep].y } : null;
+async function setCollapsed(groups, collapsed, keep = -1) {
+  const g = S.g, T = g.tasks;
+  if (!collapsed) {
+    // A group can only be expanded once its tasks are loaded.
+    await Promise.all(groups.filter(x => x.server).map(x => loadGroup(S.groups[S.topOf[x.rep]])));
+    if (S.g !== g) return;
+  }
+  const before = keep >= 0 ? { x: T[keep].x, y: T[keep].y } : null;
   for (const grp of groups) grp.collapsed = collapsed;
   S.hoverGroup = -1; $('tip').hidden = true;
   rebuildVisible();
@@ -677,28 +738,24 @@ function setCollapsed(groups, collapsed, keep = -1) {
 }
 
 // The subtree group of task i (all its descendants), created on first use.
-function subtreeGroup(i) {
+async function subtreeGroup(i) {
   let grp = S.groups.find(x => x.kind === 'subtree' && x.anchor === i);
-  if (!grp && S.children[i].length) grp = makeGroup('subtree', i, S.g.tasks[i].loc, descendants(S.children[i]));
+  if (!grp && S.children[i].length) {
+    // The server summarises the members; their records need not be loaded.
+    const g = S.g, members = descendants(S.children[i]);
+    const sum = await (await fetch(`api/rank/${g.rank}/summary`, { method: 'POST', body: members.join(',') })).json();
+    if (S.g !== g) return undefined;
+    grp = S.groups.find(x => x.kind === 'subtree' && x.anchor === i) || makeGroup('subtree', i, g.tasks[i].loc, members, sum);
+  }
   return grp;
 }
 
 // Half width and half height of a group node for node radius r.
 const groupSize = (grp, r) => [r * (1.6 + 0.45 * Math.log10(grp.n)), r * 1.15];
 
-// Colour of a group node: the most frequent colour among its tasks.
-function groupColor(grp) {
-  if (!grp.col) {
-    const count = new Map();
-    let best = 0;
-    for (const i of grp.members) {
-      const c = color(S.g.tasks[i]), k = (count.get(c) || 0) + 1;
-      count.set(c, k);
-      if (k > best) { best = k; grp.col = c; }
-    }
-  }
-  return grp.col;
-}
+// Colour of a group node: that of the typical task the server computed for
+// it (most frequent thread, CPU, location ..., mean times).
+const groupColor = grp => color(grp.sum.typ);
 
 // Group nodes: a stack of cards, wider with more tasks, with the task count below.
 function drawGroups(sx, sy, r, fade) {
@@ -730,27 +787,14 @@ function drawGroups(sx, sy, r, fade) {
 const GROUP_KIND = { taskloop: 'taskloop', fan: 'tasks from one source line', subtree: 'subtree' };
 
 function groupTip(grp) {
-  const g = S.g, l = g.locs[grp.loc], st = grp.stats;
+  const g = S.g, l = g.locs[grp.loc], s = grp.sum;
   const where = grp.kind === 'subtree' ? `below task ${g.tasks[grp.anchor].id}` : esc(locShort(l)) + (funcName(l) && l.file ? ' in ' + esc(funcName(l)) : '');
-  return `<b>${grp.n} tasks</b> · collapsed ${GROUP_KIND[grp.kind]}<br>${where}<br>` +
-    `work ${fmt(grp.w)} (${pctText(grp.w, g.work)} % of T₁) · avg ${fmt(grp.w / grp.n)} · min ${fmt(grp.min)} · max ${fmt(grp.max)}<br>` +
-    (grp.t1 > grp.t0 ? `ran ${fmt(grp.t0)} → ${fmt(grp.t1)} on ${grp.threads.size} thread${grp.threads.size === 1 ? '' : 's'}<br>` : '') +
-    (st ? `parallelism ${(st.work / Math.max(st.critical, 1)).toFixed(1)} · peak ${st.max} at once<br>` : '') +
-    (grp.cr > 0 ? `on critical path: ${fmt(grp.cr)} (${pctText(grp.cr, g.critical)} % of T∞)<br>` : '') +
-    `<span style="opacity:.75">click to expand · Shift+click to select its tasks</span>`;
-}
-
-// Parallelism and peak of a group come from the server's region analysis,
-// fetched the first time the group is hovered.
-async function loadGroupStats(grp) {
-  if (grp.stats || grp.loading) return;
-  grp.loading = true;
-  const rank = S.g.rank;
-  try {
-    const r = await (await fetch(`api/rank/${rank}/region`, { method: 'POST', body: grp.members.join(',') })).json();
-    grp.stats = r;
-    if (S.g.rank === rank && S.hoverGroup === grp.id && !$('tip').hidden) $('tip').innerHTML = groupTip(grp);
-  } finally { grp.loading = false; }
+  return `<b>${s.n} tasks</b> · collapsed ${GROUP_KIND[grp.kind]}<br>${where}<br>` +
+    `work ${fmt(s.w)} (${pctText(s.w, g.work)} % of T₁) · avg ${fmt(s.w / s.n)} · min ${fmt(s.min)} · max ${fmt(s.max)}<br>` +
+    (s.t1 > s.t0 ? `ran ${fmt(s.t0)} → ${fmt(s.t1)} on ${s.threads} thread${s.threads === 1 ? '' : 's'}<br>` : '') +
+    `parallelism ${(s.w / Math.max(s.own_cr, 1)).toFixed(1)} · peak ${s.peak} at once<br>` +
+    (s.cr > 0 ? `on critical path: ${fmt(s.cr)} (${pctText(s.cr, g.critical)} % of T∞)<br>` : '') +
+    `<span style="opacity:.75">click to expand${grp.server && !grp.loaded && !S.groups[S.topOf[grp.rep]].loaded ? ' (loads its tasks)' : ''} · Shift+click to select its tasks</span>`;
 }
 
 // Fans: parents with at least FAN children. Instead of one line per child,
@@ -932,7 +976,6 @@ function showTip(i, mx, my) {
   if (i < -1) {
     const grp = S.groups[-i - 2];
     tip.innerHTML = groupTip(grp);
-    loadGroupStats(grp);
   } else {
     const t = S.g.tasks[i];
     tip.innerHTML = `<b>task ${t.id}</b> · ${KIND[t.k]} · ${fmt(t.w)}<br>${esc(locShort(S.g.locs[t.loc]))}`;
@@ -1015,13 +1058,23 @@ canvas.addEventListener('wheel', e => {
   draw('move');
 }, { passive: false });
 
-function select(i) { S.sel = i; renderTask(); draw(true); }   // only the ring changes
+// Selects a task for the details panel; its record is loaded first if
+// necessary. Only the ring changes in the picture.
+function select(i) {
+  if (i >= 0 && !S.g.tasks[i].loaded) {
+    const g = S.g;
+    return ensureLoaded([i]).then(() => { if (S.g === g) select(i); });
+  }
+  S.sel = i; renderTask(); draw(true);
+}
 
 $('rank').onchange = e => loadRank(e.target.value);
-$('color').onchange = e => { S.colorBy = e.target.value; assignSlots(); for (const grp of S.groups) grp.col = null; renderLegend(); renderOrigins(); renderTask(); draw(); };
+$('color').onchange = e => { S.colorBy = e.target.value; assignSlots(); renderLegend(); renderOrigins(); renderTask(); draw(); };
 for (const [id, key] of [['show-crit', 'showCrit'], ['show-create', 'showCreate'], ['show-dep', 'showDep'], ['fade-others', 'fadeOthers']])
   $(id).onchange = e => { S[key] = e.target.checked; renderLegend(); draw(); };
-for (const v of ['graph', 'timeline']) $('view-' + v).onclick = () => {
+for (const v of ['graph', 'timeline']) $('view-' + v).onclick = async () => {
+  // The timeline shows the segments of all tasks, so all groups are loaded.
+  if (v === 'timeline' && S.g) { const g = S.g; await ensureLoaded(); if (S.g !== g) return; }
   S.view = v;
   $('view-graph').setAttribute('aria-selected', v === 'graph'); $('view-timeline').setAttribute('aria-selected', v === 'timeline');
   $('hint').innerHTML = v === 'graph'
@@ -1030,11 +1083,11 @@ for (const v of ['graph', 'timeline']) $('view-' + v).onclick = () => {
   draw();
 };
 $('fit').onclick = fit;
-$('collapse-all').onclick = () => S.g && setCollapsed(S.groups.filter(x => x.kind !== 'subtree'), true);
+$('collapse-all').onclick = () => S.g && setCollapsed(S.groups.filter(x => x.server), true);
 $('expand-all').onclick = () => S.g && setCollapsed(S.groups, false);
 $('find').onchange = e => {
   const i = S.byId.get(Number(e.target.value));
-  if (i !== undefined) { select(i); centerOn(i); }
+  if (i !== undefined) { select(i); centerOn(i); }   // a task inside a collapsed group is shown at its group
 };
 window.addEventListener('keydown', e => {
   if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName) || e.ctrlKey || e.metaKey || e.altKey) return;
@@ -1092,7 +1145,7 @@ try {
   const saved = Number(localStorage.getItem('temanejo.asideWidth'));
   if (saved) document.documentElement.style.setProperty('--aside-w', saved + 'px');
 } catch { /* storage unavailable */ }
-window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { readCss(); for (const grp of S.groups) grp.col = null; draw(); });
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { readCss(); draw(); });
 
 // ------------------------------------------------------------------ legend
 
@@ -1176,7 +1229,7 @@ $('task').addEventListener('click', e => {
   if (link) { const i = Number(link.dataset.t); select(i); centerOn(i); }
   if (!btn || S.sel < 0) return;
   if (btn.dataset.a === 'center') centerOn(S.sel);
-  if (btn.dataset.a === 'collapse-subtree') { const grp = subtreeGroup(S.sel); if (grp) setCollapsed([grp], true, S.sel); }
+  if (btn.dataset.a === 'collapse-subtree') { const i = S.sel; subtreeGroup(i).then(grp => { if (grp) setCollapsed([grp], true, i); }); }
   if (btn.dataset.a === 'collapse-group') { const grp = S.groups[S.groupOf[S.sel]]; setCollapsed([grp], true, grp.anchor); }
   if (btn.dataset.a === 'subtree') {
     const sel = new Set(), stack = [S.sel];
@@ -1185,17 +1238,22 @@ $('task').addEventListener('click', e => {
   }
   if (btn.dataset.a === 'region') {
     // All tasks of the region, plus everything they spawn (nested regions included).
-    const pr = S.g.tasks[S.sel].pr, sel = new Set(), stack = [];
-    S.g.tasks.forEach((t, i) => { if (t.pr === pr) stack.push(i); });
-    while (stack.length) { const i = stack.pop(); if (!sel.has(i)) { sel.add(i); stack.push(...S.children[i]); } }
-    setRegion(sel);
+    // Which region a task belongs to is part of its record: load all first.
+    const g = S.g, pr = g.tasks[S.sel].pr;
+    ensureLoaded().then(() => {
+      if (S.g !== g) return;
+      const sel = new Set(), stack = [];
+      g.tasks.forEach((t, i) => { if (t.pr === pr) stack.push(i); });
+      while (stack.length) { const i = stack.pop(); if (!sel.has(i)) { sel.add(i); stack.push(...S.children[i]); } }
+      setRegion(sel);
+    });
   }
 });
 
 // ------------------------------------------------------------------ region analysis
 
 async function setRegion(sel) {
-  S.region = sel; S.regionInfo = null; S.regionCrit = new Map(); S.regionEdges = new Set();
+  S.region = sel; S.regionInfo = null; S.regionCrit = new Map(); S.regionPairs = [];
   rebuildVisible(false);
   renderLegend();
   const el = $('region');
@@ -1210,7 +1268,7 @@ async function setRegion(sel) {
   if (S.region !== sel) return; // superseded by a newer selection
   S.regionInfo = r;
   S.regionCrit = new Map(r.crit_tasks);
-  S.regionEdges = new Set(r.crit_edges.map(e => e[0] * S.g.tasks.length + e[1]));
+  S.regionPairs = r.crit_edges;
   rebuildVisible(false);
   renderRegion();
   draw();
@@ -1277,13 +1335,13 @@ async function applyHash() {
   const q = new URLSearchParams(location.hash.slice(1));
   if (q.has('rank') && String(S.g.rank) !== q.get('rank')) { $('rank').value = q.get('rank'); await loadRank(q.get('rank')); }
   if (q.has('color')) { $('color').value = q.get('color'); $('color').onchange({ target: $('color') }); }
-  if (q.get('view') === 'timeline') $('view-timeline').onclick();
+  if (q.get('expand') === 'all') await setCollapsed(S.groups, false);
+  if (q.get('view') === 'timeline') await $('view-timeline').onclick();
   if (q.has('perf')) togglePerf(true);
-  if (q.get('collapse') === 'all') $('collapse-all').onclick();
   if (q.get('select') === 'critical') setRegion(criticalTasks());
   const i = S.byId.get(Number(q.get('task')));
   if (i !== undefined) {
-    select(i); centerOn(i);
+    await select(i); centerOn(i);
     const btn = $('task').querySelector(`button[data-a="${q.get('select')}"]`);
     if (btn) btn.click();
   }
