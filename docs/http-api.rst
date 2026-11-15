@@ -13,6 +13,12 @@ The server has no authentication and binds to ``127.0.0.1`` by default.
 ``GET /``, ``/app.js``, ``/style.css``
    The GUI.
 
+``GET /api/info``
+   The loaded run: ``dir`` (absolute path of the trace directory), ``name``
+   (its last component), ``recorded_ms`` (when the tool started in the
+   earliest rank, milliseconds since the Unix epoch, 0 if unknown) and
+   ``ranks`` (number of loaded ranks).
+
 ``GET /api/ranks``
    One summary object per rank:
 

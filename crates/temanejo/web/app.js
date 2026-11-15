@@ -127,7 +127,18 @@ function locShort(l) {
 
 // ------------------------------------------------------------------ data
 
+// Shows which trace is loaded: directory name (full path as tooltip) and
+// recording time, also in the browser tab title.
+async function loadInfo() {
+  const info = await (await fetch('api/info')).json();
+  const when = info.recorded_ms ? new Date(info.recorded_ms).toLocaleString() : '';
+  $('case').innerHTML = `<span class="mono">${esc(info.name)}</span>` + (when ? ` <span class="muted">recorded ${esc(when)}</span>` : '');
+  $('case').title = `${info.dir}\n${info.ranks} rank${info.ranks === 1 ? '' : 's'}${when ? ', recorded ' + when : ''}`;
+  document.title = `${info.name} – Temanejo`;
+}
+
 async function loadRanks() {
+  loadInfo().catch(() => {});
   const ranks = await (await fetch('api/ranks')).json();
   $('rank').innerHTML = ranks.map(r => `<option value="${r.rank}">${r.rank} – ${esc(r.host)} (${r.tasks} tasks)</option>`).join('');
   if (ranks.length) await loadRank(ranks[0].rank);

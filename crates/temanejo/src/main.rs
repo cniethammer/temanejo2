@@ -21,6 +21,17 @@ struct Rank {
     model: Model,
     crit: PathResult,
     graph_json: String,
+    /// Wall-clock time (ns since the Unix epoch) when the tool started in this process.
+    epoch_ns: u64,
+}
+
+/// Describes the loaded run: trace directory and recording time.
+fn info_json(dir: &str, ranks: &[Rank]) -> String {
+    let abs = std::fs::canonicalize(dir).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| dir.to_string());
+    let name = std::path::Path::new(&abs).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| abs.clone());
+    // Milliseconds, so the value stays exact as a JavaScript number.
+    let recorded_ms = ranks.iter().map(|r| r.epoch_ns).filter(|&e| e > 0).min().unwrap_or(0) / 1_000_000;
+    format!("{{\"dir\":{},\"name\":{},\"recorded_ms\":{},\"ranks\":{}}}", esc(&abs), esc(&name), recorded_ms, ranks.len())
 }
 
 fn esc(s: &str) -> String {
@@ -235,7 +246,7 @@ fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) {
     let _ = stream.write_all(body);
 }
 
-fn handle(mut stream: TcpStream, ranks: &[Rank]) {
+fn handle(mut stream: TcpStream, info: &str, ranks: &[Rank]) {
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
@@ -271,6 +282,7 @@ fn handle(mut stream: TcpStream, ranks: &[Rank]) {
         ("GET", [""]) => respond(&mut stream, "200 OK", "text/html; charset=utf-8", include_bytes!("../web/index.html")),
         ("GET", ["app.js"]) => respond(&mut stream, "200 OK", "text/javascript; charset=utf-8", include_bytes!("../web/app.js")),
         ("GET", ["style.css"]) => respond(&mut stream, "200 OK", "text/css; charset=utf-8", include_bytes!("../web/style.css")),
+        ("GET", ["api", "info"]) => respond(&mut stream, "200 OK", JSON, info.as_bytes()),
         ("GET", ["api", "ranks"]) => {
             let list: Vec<String> = ranks.iter().map(summary_json).collect();
             respond(&mut stream, "200 OK", JSON, format!("[{}]", list.join(",")).as_bytes());
@@ -316,7 +328,7 @@ fn load(dir: &str) -> Vec<Rank> {
         let pos = layout::layout(&model);
         let locs = symbolize::symbolize(&trace.syms);
         let graph_json = graph_json(&model, &crit, &pos, &locs);
-        ranks.push(Rank { model, crit, graph_json });
+        ranks.push(Rank { model, crit, graph_json, epoch_ns: trace.epoch_ns });
     }
     ranks.sort_by_key(|r| r.model.rank);
     ranks
@@ -391,9 +403,9 @@ fn main() {
         }
     };
     println!("\ntemanejo GUI: http://{bind}:{port}/   (Ctrl-C to stop)");
-    let ranks = Arc::new(ranks);
+    let state = Arc::new((info_json(&dir, &ranks), ranks));
     for stream in listener.incoming().flatten() {
-        let ranks = Arc::clone(&ranks);
-        std::thread::spawn(move || handle(stream, &ranks));
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || handle(stream, &state.0, &state.1));
     }
 }

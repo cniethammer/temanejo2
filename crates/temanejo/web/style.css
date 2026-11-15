@@ -49,6 +49,7 @@ header {
   padding: 8px 14px; border-bottom: 1px solid var(--grid); background: var(--surface);
 }
 header h1 { font-size: 15px; margin: 0 6px 0 0; letter-spacing: .02em; }
+.case { max-width: 26em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: default; }
 header label { color: var(--ink2); display: flex; align-items: center; gap: 6px; }
 header .chk { gap: 4px; }
 .grow { flex: 1; }

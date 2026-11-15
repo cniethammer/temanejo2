@@ -26,6 +26,12 @@ Arrow keys
 Toolbar
 -------
 
+Trace name
+   Next to the title: the name of the trace directory and when the run was
+   recorded (the earliest start of the tool among the ranks, in the
+   browser's local time). Hovering it shows the full path and the number of
+   ranks. The directory name is also the title of the browser tab.
+
 MPI rank
    Switches between the task graphs of the processes. Each entry shows rank,
    host and number of tasks.
