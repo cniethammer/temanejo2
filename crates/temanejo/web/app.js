@@ -13,7 +13,18 @@
 'use strict';
 
 const $ = id => document.getElementById(id);
-const canvas = $('canvas'), ctx = canvas.getContext('2d');
+const canvas = $('canvas'), view = canvas.getContext('2d');
+// The graph or timeline is rendered into an off-screen base canvas; the
+// visible canvas shows a copy of it plus the overlay (hover and selection
+// marks, selection rectangle). Hovering and drawing a selection rectangle
+// only redraw the overlay. `ctx` points at the canvas being drawn on.
+// The base is rasterised in software (`willReadFrequently` selects a CPU
+// canvas in Chromium): GPU canvases are slow at stroking tens of thousands
+// of thin lines, while copying the finished picture to the screen is cheap.
+// `#gpubase` in the URL switches back to a GPU canvas for comparison.
+const base = document.createElement('canvas');
+const baseCtx = base.getContext('2d', { willReadFrequently: !location.hash.includes('gpubase') });
+let ctx = view;
 const DX = 26, DY = 64, R = 9;
 const KIND = ['initial', 'implicit', 'explicit'];
 const DEP_TYPE = { 1: 'in', 2: 'out', 3: 'inout', 4: 'mutexinoutset', 5: 'source', 6: 'sink', 7: 'inoutset', 34: 'out (all memory)', 35: 'inout (all memory)' };
@@ -95,11 +106,20 @@ const SEQUENTIAL = {
   wait: { value: t => Math.max(taskStart(t) - t.ct, 0), label: 'wait time (start − create)', log: true },
 };
 
+// Sequential ramp in 64 precomputed steps (rebuilt when the theme changes):
+// no colour string is built per task, and equal colours can be batched.
+function seqColor(f) {
+  const c = S.css, key = c.seqLo + c.seqHi;
+  if (!S.seqPalette || S.seqPalette.key !== key)
+    S.seqPalette = { key, cols: Array.from({ length: 64 }, (_, i) => mix(c.seqLo, c.seqHi, i / 63)) };
+  return S.seqPalette.cols[Math.round(f * 63)];
+}
+
 function color(t) {
   const c = S.css, seq = SEQUENTIAL[S.colorBy];
   if (seq) {
     const { lo, hi } = S.seqRange, x = seq.log ? Math.log(Math.max(seq.value(t), 1)) : seq.value(t);
-    return mix(c.seqLo, c.seqHi, hi > lo ? Math.min(1, Math.max(0, (x - lo) / (hi - lo))) : 1);
+    return seqColor(hi > lo ? Math.min(1, Math.max(0, (x - lo) / (hi - lo))) : 1);
   }
   const slot = S.catSlots.get(catValue(t));
   return slot === undefined ? c.muted : c.cat[slot % 8];
@@ -168,6 +188,7 @@ async function loadRank(rank) {
     else { S.succ[a].push(b); S.pred[b].push(a); }
   }
   S.byId = new Map(g.tasks.map((t, i) => [t.id, i]));
+  findFans();
   S.tl = { t0: 0, t1: Math.max(g.wall, 1) };
   assignSlots();
   setRegion(new Set());
@@ -292,8 +313,9 @@ $('origins').addEventListener('click', e => {
 
 function resize() {
   const r = canvas.getBoundingClientRect(), d = window.devicePixelRatio || 1;
-  canvas.width = Math.round(r.width * d); canvas.height = Math.round(r.height * d);
-  ctx.setTransform(d, 0, 0, d, 0, 0);
+  base.width = canvas.width = Math.round(r.width * d); base.height = canvas.height = Math.round(r.height * d);
+  view.setTransform(d, 0, 0, d, 0, 0); baseCtx.setTransform(d, 0, 0, d, 0, 0);
+  S.dpr = d;
   S.w = r.width; S.h = r.height;
   draw();
 }
@@ -318,10 +340,70 @@ function centerOn(i) {
   draw();
 }
 
+// Frame time display (key P or #perf): the time between consecutive frames
+// while the view keeps changing, which includes the browser's own drawing
+// work that JavaScript timing cannot see.
+const perf = { on: false, last: 0, full: [], over: [], script: 0 };
+function perfMeter(now, full) {
+  if (!perf.on) return;
+  const dt = now - perf.last;
+  perf.last = now;
+  if (dt > 1000) return;   // not a continuous interaction
+  const list = full ? perf.full : perf.over;
+  list.push(dt); if (list.length > 30) list.shift();
+  const avg = l => l.length ? (l.reduce((a, b) => a + b, 0) / l.length).toFixed(0) + ' ms' : '–';
+  // "script" is the JavaScript part of the last full render; the rest of a
+  // full redraw frame is the browser rasterising the drawing commands.
+  $('perf').textContent = `frame time: full redraw ${avg(perf.full)} (script ${perf.script.toFixed(0)} ms), move/overlay ${avg(perf.over)}`;
+}
+function togglePerf(on = !perf.on) {
+  perf.on = on; perf.full = []; perf.over = [];
+  $('perf').hidden = !on;
+  $('perf').textContent = 'frame time: pan, zoom or hover to measure';
+}
+
 let raf = 0;
-function draw() {
+// Schedules a redraw. `mode`:
+//   false   re-render the base (anything that changes the picture);
+//   true    overlay only (hover, clicked task, selection rectangle);
+//   'move'  the graph camera moved (pan, zoom): the rendered picture is
+//           shifted and scaled, as in map viewers, and re-rendered sharp once
+//           the movement pauses. A full render can take 100+ ms, a shifted
+//           copy a few ms. The timeline always re-renders (cheap, and its
+//           axis labels cannot be shifted).
+let sharpTimer = 0;
+function draw(mode = false) {
+  if (mode === 'move' && S.view === 'graph' && S.baseValid && S.baseCam) {
+    clearTimeout(sharpTimer);
+    sharpTimer = setTimeout(() => draw(), 150);
+  } else if (mode !== true) {
+    S.baseValid = false;
+    clearTimeout(sharpTimer);
+  }
   if (raf) return;
-  raf = requestAnimationFrame(() => { raf = 0; if (S.g) (S.view === 'graph' ? drawGraph : drawTimeline)(); });
+  raf = requestAnimationFrame(now => {
+    raf = 0;
+    if (!S.g) return;
+    perfMeter(now, !S.baseValid);
+    if (!S.baseValid) {
+      const t0 = performance.now();
+      ctx = baseCtx;
+      (S.view === 'graph' ? drawGraph : drawTimeline)();
+      ctx = view;
+      S.baseValid = true;
+      S.baseCam = S.view === 'graph' ? { ...S.cam } : null;   // camera the base was rendered with
+      perf.script = performance.now() - t0;
+    }
+    // Copy the base, shifted and scaled if the camera moved since it was rendered.
+    const b = S.baseCam, s = b ? S.cam.k / b.k : 1;
+    view.setTransform(1, 0, 0, 1, 0, 0);
+    view.clearRect(0, 0, canvas.width, canvas.height);
+    if (b) view.setTransform(s, 0, 0, s, (S.cam.x - b.x * s) * S.dpr, (S.cam.y - b.y * s) * S.dpr);
+    view.drawImage(base, 0, 0);
+    view.setTransform(S.dpr, 0, 0, S.dpr, 0, 0);
+    (S.view === 'graph' ? graphOverlay : timelineOverlay)();
+    drawBand();
+  });
 }
 
 function drawGraph() {
@@ -330,8 +412,12 @@ function drawGraph() {
   const sx = t => t.x * DX * k + cam.x, sy = t => t.y * DY * k + cam.y;
   const r = Math.max(R * k, 1.2);
 
-  // Edges, batched per style. An edge is skipped when both ends lie off the same side.
+  // Edges, batched per style in paths of at most 1024 lines (one huge path
+  // is slow to rasterise). An edge is skipped when both ends lie off the
+  // same side.
   const pass = (pred, style, width, alpha) => {
+    ctx.strokeStyle = style; ctx.lineWidth = width; ctx.globalAlpha = alpha;
+    let count = 0;
     ctx.beginPath();
     for (const e of g.edges) {
       if (!pred(e)) continue;
@@ -339,8 +425,9 @@ function drawGraph() {
       const ax = sx(a), ay = sy(a), bx = sx(b), by = sy(b);
       if ((ax < 0 && bx < 0) || (ax > S.w && bx > S.w) || (ay < 0 && by < 0) || (ay > S.h && by > S.h)) continue;
       ctx.moveTo(ax, ay + r); ctx.lineTo(bx, by - r);
+      if (++count === 1024) { ctx.stroke(); ctx.beginPath(); count = 0; }
     }
-    ctx.strokeStyle = style; ctx.lineWidth = width; ctx.globalAlpha = alpha; ctx.stroke(); ctx.globalAlpha = 1;
+    ctx.stroke(); ctx.globalAlpha = 1;
   };
   const far = k < 0.25;
   const isCrit = e => S.showCrit && e[3];
@@ -349,46 +436,54 @@ function drawGraph() {
   const fade = S.fadeOthers && S.region.size > 0;
   const inSel = e => !fade || (S.region.has(e[0]) && S.region.has(e[1]));
   const shown = e => e[2] === 0 ? S.showCreate : S.showDep;
-  if (fade) pass(e => shown(e) && !inSel(e), css.axis, 1, far ? 0.25 : 0.4);
-  if (S.showCreate) pass(e => e[2] === 0 && !isCrit(e) && inSel(e), css.edgeCreate, 1, far ? 0.5 : 0.9);
+  // Creation edges of large fans are drawn as a bus (see drawFans); only
+  // their critical path edges are drawn as direct lines.
+  const direct = e => e[2] !== 0 || !S.fanChild[e[1]];
+  const greyAlpha = far ? 0.25 : 0.4, createAlpha = far ? 0.5 : 0.9;
+  if (fade) pass(e => shown(e) && !inSel(e) && direct(e), css.axis, 1, greyAlpha);
+  if (S.showCreate) drawFans(sx, sy, r, fade, greyAlpha, createAlpha);
+  if (S.showCreate) pass(e => e[2] === 0 && !isCrit(e) && inSel(e) && direct(e), css.edgeCreate, 1, createAlpha);
   if (S.showDep) pass(e => e[2] === 1 && !isCrit(e) && inSel(e), css.edgeDep, 1, far ? 0.35 : 0.7);
-  if (S.regionEdges.size) pass(e => S.regionEdges.has(e[0] + ',' + e[1]) || S.regionEdges.has(e[1] + ',' + e[0]), css.ink, 2.5, 1);
+  const n = T.length;
+  if (S.regionEdges.size) pass(e => S.regionEdges.has(e[0] * n + e[1]) || S.regionEdges.has(e[1] * n + e[0]), css.ink, 2.5, 1);
   if (S.showCrit) pass(e => e[3] && shown(e) && inSel(e), css.critical, Math.max(2, 3 * Math.min(k, 1)), 1);
 
-  // Nodes. When greying out, unselected nodes are drawn first, in grey and
-  // without marks, so the selected ones lie on top in their true colours.
+  // Nodes, batched: one path per fill colour and one per kind of mark, so a
+  // frame needs a few dozen canvas calls instead of one or more per task.
+  // When greying out, the grey path is filled first, so the selected tasks
+  // lie on top in their true colours; marks are drawn above all nodes.
   const simple = r < 2.5;
-  const order = fade ? [...T.keys()].filter(i => !S.region.has(i)).concat([...S.region]) : T.keys();
-  for (const i of order) {
+  const fills = new Map();   // fill colour -> Path2D, filled in insertion order
+  const path = c => { let p = fills.get(c); if (!p) fills.set(c, p = new Path2D()); return p; };
+  if (fade) path(css.axis);
+  const regionRing = new Path2D(), regionCritRing = new Path2D(), critRing = new Path2D();
+  const critSquare = new Path2D(), regionBar = new Path2D();
+  for (let i = 0; i < T.length; i++) {
     const t = T[i], x = sx(t), y = sy(t);
     if (x < -r - 4 || x > S.w + r + 4 || y < -r - 4 || y > S.h + r + 4) continue;
-    if (fade && !S.region.has(i)) {
-      ctx.fillStyle = css.axis;
-      if (simple) ctx.fillRect(x - r, y - r, 2 * r, 2 * r);
-      else { ctx.beginPath(); shape(t, x, y, r); ctx.fill(); }
-      continue;
-    }
-    ctx.fillStyle = color(t);
-    if (simple) { ctx.fillRect(x - r, y - r, 2 * r, 2 * r); }
-    else {
-      ctx.beginPath(); shape(t, x, y, r); ctx.fill();
+    const inRegion = S.region.has(i);
+    if (fade && !inRegion) { node(path(css.axis), t, x, y, r, simple); continue; }
+    node(path(color(t)), t, x, y, r, simple);
+    const crit = S.showCrit && t.cr > 0;
+    if (simple) {
+      if (crit) critSquare.rect(x - r - 1, y - r - 1, 2 * r + 2, 2 * r + 2);
+      if (inRegion && !fade) regionBar.rect(x - r, y + r, 2 * r, 1.5);
+    } else {
       // Ink rings mark the selection; with greying out only the region's
       // critical path keeps its (thick) ring.
-      if (S.region.has(i) && (!fade || S.regionCrit.has(i))) {
-        ctx.lineWidth = S.regionCrit.has(i) ? 3.5 : 1.5; ctx.strokeStyle = css.ink;
-        ctx.beginPath(); shape(t, x, y, r + 2.5); ctx.stroke();
-      }
-      if (S.showCrit && t.cr > 0) {
-        ctx.lineWidth = 2; ctx.strokeStyle = css.critical;
-        ctx.beginPath(); shape(t, x, y, r + (S.region.has(i) ? 6 : 2.5)); ctx.stroke();
-      }
+      if (inRegion && (!fade || S.regionCrit.has(i))) shape(S.regionCrit.has(i) ? regionCritRing : regionRing, t, x, y, r + 2.5);
+      if (crit) shape(critRing, t, x, y, r + (inRegion ? 6 : 2.5));
     }
-    if (simple && S.showCrit && t.cr > 0) { ctx.fillStyle = css.critical; ctx.fillRect(x - r - 1, y - r - 1, 2 * r + 2, 2 * r + 2); }
   }
-  if (simple && S.region.size && !fade) {
-    ctx.fillStyle = css.ink; ctx.globalAlpha = 0.55;
-    for (const i of S.region) { const t = T[i]; ctx.fillRect(sx(t) - r, sy(t) + r, 2 * r, 1.5); }
-    ctx.globalAlpha = 1;
+  for (const [c, p] of fills) { ctx.fillStyle = c; ctx.fill(p); }
+  if (simple) {
+    ctx.fillStyle = css.critical; ctx.fill(critSquare);
+    ctx.fillStyle = css.ink; ctx.globalAlpha = 0.55; ctx.fill(regionBar); ctx.globalAlpha = 1;
+  } else {
+    ctx.strokeStyle = css.ink;
+    ctx.lineWidth = 1.5; ctx.stroke(regionRing);
+    ctx.lineWidth = 3.5; ctx.stroke(regionCritRing);
+    ctx.strokeStyle = css.critical; ctx.lineWidth = 2; ctx.stroke(critRing);
   }
   if (k >= 1.1) {
     ctx.fillStyle = css.ink2; ctx.font = `${Math.min(11 * k, 13)}px system-ui, sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
@@ -397,20 +492,79 @@ function drawGraph() {
       if (x > -30 && x < S.w + 30 && y > -30 && y < S.h + 30) ctx.fillText(t.id, x, y + r + 5);
     }
   }
-  for (const [i, w] of [[S.hover, 1.5], [S.sel, 3]]) {
-    if (i < 0) continue;
-    const t = T[i];
-    ctx.lineWidth = w; ctx.strokeStyle = css.ink;
-    ctx.beginPath(); ctx.arc(sx(t), sy(t), Math.max(r + 5, 7), 0, 6.2832); ctx.stroke();
-  }
-  drawBand();
 }
 
-// Explicit tasks are circles, implicit tasks squares, the initial task a diamond.
-function shape(t, x, y, r) {
-  if (t.k === 2) ctx.arc(x, y, r, 0, 6.2832);
-  else if (t.k === 1) ctx.roundRect(x - r, y - r, 2 * r, 2 * r, r * 0.25);
-  else { ctx.moveTo(x, y - r * 1.2); ctx.lineTo(x + r * 1.2, y); ctx.lineTo(x, y + r * 1.2); ctx.lineTo(x - r * 1.2, y); ctx.closePath(); }
+// Rings around the hovered and the selected task.
+function graphOverlay() {
+  const { cam } = S, k = cam.k, r = Math.max(R * k, 1.2);
+  for (const [i, w] of [[S.hover, 1.5], [S.sel, 3]]) {
+    if (i < 0) continue;
+    const t = S.g.tasks[i];
+    ctx.lineWidth = w; ctx.strokeStyle = S.css.ink;
+    ctx.beginPath(); ctx.arc(t.x * DX * k + cam.x, t.y * DY * k + cam.y, Math.max(r + 5, 7), 0, 6.2832); ctx.stroke();
+  }
+}
+
+// Fans: parents with at least FAN children. Instead of one line per child,
+// a fan is drawn as a trunk below the parent, a horizontal bus above each
+// row of children, and a short stub down to every child, which needs a
+// fraction of the pixels of thousands of long crossing lines.
+const FAN = 8;
+function findFans() {
+  S.fans = [];
+  S.fanChild = new Uint8Array(S.g.tasks.length);
+  S.children.forEach((ch, p) => {
+    if (ch.length < FAN) return;
+    S.fans.push(p);
+    for (const c of ch) S.fanChild[c] = 1;
+  });
+}
+function drawFans(sx, sy, r, fade, greyAlpha, alpha) {
+  const { css, cam } = S, T = S.g.tasks, gap = 0.3 * DY * cam.k;
+  const styled = new Path2D(), grey = new Path2D();
+  for (const p of S.fans) {
+    const pt = T[p], px = sx(pt), py = sy(pt), pSel = !fade || S.region.has(p);
+    // Children by row (layout y), with their horizontal extent.
+    const rows = new Map();
+    for (const c of S.children[p]) {
+      const t = T[c];
+      let row = rows.get(t.y);
+      if (!row) rows.set(t.y, row = { y: sy(t), x0: Infinity, x1: -Infinity, kids: [] });
+      const x = sx(t);
+      row.x0 = Math.min(row.x0, x); row.x1 = Math.max(row.x1, x); row.kids.push([c, x]);
+    }
+    let deepest = py + r;
+    for (const row of rows.values()) {
+      const busY = Math.max(row.y - r - gap, (py + r + row.y - r) / 2);
+      if (row.y + r < 0 || busY > S.h || Math.max(px, row.x1) < 0 || Math.min(px, row.x0) > S.w) continue;
+      deepest = Math.max(deepest, busY);
+      const bus = pSel ? styled : grey;
+      bus.moveTo(Math.min(px, row.x0), busY); bus.lineTo(Math.max(px, row.x1), busY);
+      for (const [c, x] of row.kids) {
+        if (x < -2 || x > S.w + 2) continue;
+        const stub = pSel && (!fade || S.region.has(c)) ? styled : grey;
+        stub.moveTo(x, busY); stub.lineTo(x, row.y - r);
+      }
+    }
+    if (deepest > py + r) (pSel ? styled : grey).moveTo(px, py + r), (pSel ? styled : grey).lineTo(px, deepest);
+  }
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = css.axis; ctx.globalAlpha = greyAlpha; ctx.stroke(grey);
+  ctx.strokeStyle = css.edgeCreate; ctx.globalAlpha = alpha; ctx.stroke(styled);
+  ctx.globalAlpha = 1;
+}
+
+// Explicit tasks are circles, implicit tasks squares, the initial task a
+// diamond. Adds the outline as a closed subpath to `p` (a Path2D or ctx).
+function shape(p, t, x, y, r) {
+  if (t.k === 2) { p.moveTo(x + r, y); p.arc(x, y, r, 0, 6.2832); }
+  else if (t.k === 1) p.roundRect(x - r, y - r, 2 * r, 2 * r, r * 0.25);
+  else { p.moveTo(x, y - r * 1.2); p.lineTo(x + r * 1.2, y); p.lineTo(x, y + r * 1.2); p.lineTo(x - r * 1.2, y); p.closePath(); }
+}
+// A node: a small square when zoomed out, its shape otherwise.
+function node(p, t, x, y, r, simple) {
+  if (simple) p.rect(x - r, y - r, 2 * r, 2 * r);
+  else shape(p, t, x, y, r);
 }
 
 function drawBand() {
@@ -449,23 +603,47 @@ function drawTimeline() {
   g.threads.forEach((t, i) => ctx.fillText(`thread ${t.id}`, 10, TL.top + i * TL.row + TL.row / 2));
 
   ctx.save(); ctx.beginPath(); ctx.rect(TL.left, 0, S.w - TL.left, S.h); ctx.clip();
+  // Batched like the graph: one path per fill colour and per kind of mark.
+  const fills = new Map(), path = c => { let p = fills.get(c); if (!p) fills.set(c, p = new Path2D()); return p; };
+  const fade = S.fadeOthers && S.region.size > 0;
+  if (fade) path(css.axis);
+  const critStrip = new Path2D(), regionBar = new Path2D();
   g.tasks.forEach((t, i) => {
-    const inRegion = S.region.has(i), grey = S.fadeOthers && S.region.size > 0 && !inRegion;
+    const inRegion = S.region.has(i), grey = fade && !inRegion;
     for (const s of t.segs) {
       if (s[5] < S.tl.t0 || s[4] > S.tl.t1) continue;
       const row = rowOf.get(s[0]); if (row === undefined) continue;
       const x = tlX(s[4]), w = Math.max(tlX(s[5]) - x, 0.6), y = TL.top + row * TL.row + (TL.row - TL.bar) / 2;
-      ctx.fillStyle = grey ? css.axis : color(t);
       // A 1px surface gap separates adjacent segments once they are wide enough.
-      ctx.fillRect(x, y, w > 3 ? w - 1 : w, TL.bar);
+      const wg = w > 3 ? w - 1 : w;
+      path(grey ? css.axis : color(t)).rect(x, y, wg, TL.bar);
       if (grey) continue;
-      if (S.showCrit && t.cr > 0) { ctx.fillStyle = css.critical; ctx.fillRect(x, y + TL.bar + 1, w > 3 ? w - 1 : w, 3); }
-      if (inRegion && !S.fadeOthers) { ctx.fillStyle = css.ink; ctx.fillRect(x, y - 4, w > 3 ? w - 1 : w, 2); }
-      if (i === S.sel || i === S.hover) { ctx.strokeStyle = css.ink; ctx.lineWidth = i === S.sel ? 2 : 1; ctx.strokeRect(x - 1, y - 1, w + 1, TL.bar + 2); }
+      if (S.showCrit && t.cr > 0) critStrip.rect(x, y + TL.bar + 1, wg, 3);
+      if (inRegion && !S.fadeOthers) regionBar.rect(x, y - 4, wg, 2);
     }
   });
+  for (const [c, p] of fills) { ctx.fillStyle = c; ctx.fill(p); }
+  ctx.fillStyle = css.critical; ctx.fill(critStrip);
+  ctx.fillStyle = css.ink; ctx.fill(regionBar);
   ctx.restore();
-  drawBand();
+}
+
+// Outlines of the hovered and the selected task's segments.
+function timelineOverlay() {
+  const rowOf = new Map(S.g.threads.map((t, i) => [t.id, i]));
+  ctx.save(); ctx.beginPath(); ctx.rect(TL.left, 0, S.w - TL.left, S.h); ctx.clip();
+  ctx.strokeStyle = S.css.ink;
+  for (const [i, lw] of [[S.hover, 1], [S.sel, 2]]) {
+    if (i < 0) continue;
+    ctx.lineWidth = lw;
+    for (const s of S.g.tasks[i].segs) {
+      if (s[5] < S.tl.t0 || s[4] > S.tl.t1) continue;
+      const row = rowOf.get(s[0]); if (row === undefined) continue;
+      const x = tlX(s[4]), w = Math.max(tlX(s[5]) - x, 0.6), y = TL.top + row * TL.row + (TL.row - TL.bar) / 2;
+      ctx.strokeRect(x - 1, y - 1, w + 1, TL.bar + 2);
+    }
+  }
+  ctx.restore();
 }
 
 // ------------------------------------------------------------------ picking
@@ -515,7 +693,7 @@ canvas.addEventListener('pointermove', e => {
   const [x, y] = pos(e), d = S.drag;
   if (!d) {
     const h = pick(x, y);
-    if (h !== S.hover) { S.hover = h; draw(); }
+    if (h !== S.hover) { S.hover = h; draw(true); }
     return showTip(h, x, y);
   }
   d.x = x; d.y = y;
@@ -528,7 +706,7 @@ canvas.addEventListener('pointermove', e => {
     }
   }
   $('tip').hidden = true;
-  draw();
+  draw(d.band ? true : 'move');   // a selection rectangle only changes the overlay
 });
 canvas.addEventListener('pointerup', e => {
   const d = S.drag; S.drag = null;
@@ -551,7 +729,7 @@ canvas.addEventListener('pointerup', e => {
   }
   draw();
 });
-canvas.addEventListener('pointerleave', () => { if (S.hover >= 0) { S.hover = -1; draw(); } $('tip').hidden = true; });
+canvas.addEventListener('pointerleave', () => { if (S.hover >= 0) { S.hover = -1; draw(true); } $('tip').hidden = true; });
 canvas.addEventListener('wheel', e => {
   e.preventDefault();
   if (!S.g) return;
@@ -563,10 +741,10 @@ canvas.addEventListener('wheel', e => {
     const t = tlT(x), span = Math.max((S.tl.t1 - S.tl.t0) / f, 1000), frac = (t - S.tl.t0) / (S.tl.t1 - S.tl.t0);
     S.tl = { t0: t - span * frac, t1: t + span * (1 - frac) };
   }
-  draw();
+  draw('move');
 }, { passive: false });
 
-function select(i) { S.sel = i; renderTask(); draw(); }
+function select(i) { S.sel = i; renderTask(); draw(true); }   // only the ring changes
 
 $('rank').onchange = e => loadRank(e.target.value);
 $('color').onchange = e => { S.colorBy = e.target.value; assignSlots(); renderLegend(); renderOrigins(); renderTask(); draw(); };
@@ -588,6 +766,7 @@ $('find').onchange = e => {
 window.addEventListener('keydown', e => {
   if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName) || e.ctrlKey || e.metaKey || e.altKey) return;
   if (e.key === 'f') fit();
+  if (e.key === 'p') togglePerf();
   if (e.key === 'Escape') {
     // Cancel a selection rectangle being drawn; otherwise clear the region
     // selection and the clicked task.
@@ -755,7 +934,7 @@ async function setRegion(sel) {
   if (S.region !== sel) return; // superseded by a newer selection
   S.regionInfo = r;
   S.regionCrit = new Map(r.crit_tasks);
-  S.regionEdges = new Set(r.crit_edges.map(e => e[0] + ',' + e[1]));
+  S.regionEdges = new Set(r.crit_edges.map(e => e[0] * S.g.tasks.length + e[1]));
   renderRegion();
   draw();
 }
@@ -822,6 +1001,7 @@ async function applyHash() {
   if (q.has('rank') && String(S.g.rank) !== q.get('rank')) { $('rank').value = q.get('rank'); await loadRank(q.get('rank')); }
   if (q.has('color')) { $('color').value = q.get('color'); $('color').onchange({ target: $('color') }); }
   if (q.get('view') === 'timeline') $('view-timeline').onclick();
+  if (q.has('perf')) togglePerf(true);
   if (q.get('select') === 'critical') setRegion(criticalTasks());
   const i = S.byId.get(Number(q.get('task')));
   if (i !== undefined) {
