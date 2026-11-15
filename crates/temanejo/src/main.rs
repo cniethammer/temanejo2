@@ -5,6 +5,8 @@ mod analysis;
 mod layout;
 mod model;
 mod symbolize;
+#[cfg(test)]
+mod tests;
 
 use analysis::PathResult;
 use model::{Model, NONE};
@@ -145,6 +147,27 @@ fn graph_json(m: &Model, crit: &PathResult, pos: &[(f32, f32)], locs: &[Loc]) ->
         o.push_str("],\"deps\":[");
         for (j, d) in t.deps.iter().enumerate() {
             let _ = write!(o, "{}[\"{:#x}\",{}]", if j > 0 { "," } else { "" }, d.0, d.1);
+        }
+        o.push_str("]}");
+    }
+    // Task origins; "k" is a bit set: 1 parallel region (implicit tasks),
+    // 2 task construct, 4 taskloop.
+    o.push_str("],\"origins\":[");
+    for (i, g) in analysis::origins(m, crit).iter().enumerate() {
+        let kinds = g.has_implicit as u8 | (g.has_explicit as u8) << 1 | (g.has_taskloop as u8) << 2;
+        let _ = write!(
+            o,
+            "{}{{\"initial\":{},\"loc\":{},\"k\":{},\"n\":{},\"w\":{},\"cr\":{},\"tasks\":[",
+            if i > 0 { "," } else { "" },
+            g.initial as u8,
+            if g.initial { -1 } else { loc(g.codeptr) },
+            kinds,
+            g.tasks.len(),
+            g.work,
+            g.critical
+        );
+        for (j, t) in g.tasks.iter().enumerate() {
+            let _ = write!(o, "{}{}", if j > 0 { "," } else { "" }, t);
         }
         o.push_str("]}");
     }

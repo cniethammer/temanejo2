@@ -121,6 +121,17 @@ the graph offers independent of the number of threads used. For a selected
 region the same computation runs on the parts of the selected tasks only.
 See `crates/temanejo/src/model.rs` and `analysis.rs`.
 
+## Tests
+
+```sh
+cargo test --workspace
+```
+
+The analysis (task counts, work, critical path, region parallelism, task
+origins) is tested on small synthetic traces with hand-computed expected
+values, independent of a particular OpenMP runtime; see
+`crates/temanejo/src/tests.rs`.
+
 ## Documentation
 
 Sphinx sources are in `docs/`: user guide, analysis method, the trace file
@@ -148,7 +159,8 @@ docs/              Sphinx documentation and man page
 ## Status and known limitations
 
 Tested with clang/libomp 23.1 and Open MPI 5.0.11 on one node: 2 ranks × 4
-threads, 12 000 and 15 000 tasks per rank. There are no automated tests yet.
+threads, 12 000 and 15 000 tasks per rank. Unit tests cover the analysis on
+synthetic traces (see Tests); the OMPT tool itself is only tested manually.
 
 - Post mortem only; no live view and no execution control (breakpoints,
   stepping) as in the original Temanejo.

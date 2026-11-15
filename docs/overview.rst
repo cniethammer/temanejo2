@@ -73,6 +73,16 @@ Building
    cargo build --release            # target/release/libtmj_ompt.so, target/release/temanejo
    make -C examples                 # example program (needs clang and mpicc)
    make -C docs html man            # docs/_build/html, docs/_build/man/temanejo.1
+   cargo test --workspace           # unit tests
+
+The tests need neither MPI nor an OpenMP runtime: the analysis is tested on
+small synthetic traces written by hand after the OMPT callback semantics
+(``crates/temanejo/src/tests.rs``), with work, critical path and origin
+shares computed by hand. They also check invariants that hold for every
+trace: critical times per task never exceed work, they add up to T\ :sub:`∞`,
+and the task origins partition the tasks so their work and critical times
+add up to T\ :sub:`1` and T\ :sub:`∞`. The trace file format has
+round-trip tests in ``crates/tmj-trace``.
 
 Source layout
 -------------
@@ -81,7 +91,8 @@ Source layout
 ``crates/tmj-trace``       trace file format (reader and writer)
 ``crates/tmj-ompt``        OMPT tool
 ``crates/temanejo/src``    server: ``model.rs`` graph reconstruction,
-                           ``analysis.rs`` critical path and parallelism,
+                           ``analysis.rs`` critical path, parallelism and
+                           task origins, ``tests.rs``,
                            ``layout.rs``, ``symbolize.rs``, ``main.rs``
                            (command line, HTTP, JSON)
 ``crates/temanejo/web``    GUI

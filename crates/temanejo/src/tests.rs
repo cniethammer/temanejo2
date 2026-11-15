@@ -1,0 +1,445 @@
+//! Tests of graph reconstruction and analysis on small synthetic traces.
+//!
+//! The traces are written by hand following the OMPT callback semantics of
+//! the OpenMP specification (no runtime-specific behaviour), with timings
+//! chosen so that work, critical path and origin shares can be computed by
+//! hand. Every scenario documents its expected values next to the trace.
+
+use crate::analysis::{self, PathResult};
+use crate::model::{EdgeKind, Model, TaskKind};
+use std::collections::BTreeMap;
+use tmj_trace::{kind, Event, Trace, ENDPOINT_BEGIN, ENDPOINT_END};
+
+// OMPT constants (omp-tools.h)
+const FLAG_INITIAL: u32 = 0x1;
+const FLAG_IMPLICIT: u32 = 0x2;
+const FLAG_EXPLICIT: u32 = 0x4;
+const STATUS_COMPLETE: u64 = 1;
+const STATUS_SWITCH: u64 = 7;
+const SYNC_TASKWAIT: u64 = 5;
+const SYNC_BARRIER_IMPLICIT_PARALLEL: u64 = 9;
+const THREAD_INITIAL: u64 = 1;
+const THREAD_WORKER: u64 = 2;
+
+/// Writes events per thread, like the tool does, and concatenates the
+/// per-thread streams into a trace (so the trace is not globally sorted).
+#[derive(Default)]
+struct TraceBuilder {
+    threads: BTreeMap<u32, Vec<Event>>,
+}
+
+impl TraceBuilder {
+    #[allow(clippy::too_many_arguments)]
+    fn ev(&mut self, thread: u32, ts: u64, kind: u8, endpoint: u8, flags: u32, a: u64, b: u64, c: u64, d: u64) -> &mut Self {
+        let events = self.threads.entry(thread).or_default();
+        assert!(events.last().is_none_or(|e| e.ts <= ts), "events of a thread must be in time order");
+        events.push(Event { kind, endpoint, cpu: thread as u16, numa: 0, thread, flags, ts, a, b, c, d });
+        self
+    }
+
+    fn thread_begin(&mut self, th: u32, ts: u64, initial: bool) -> &mut Self {
+        let ty = if initial { THREAD_INITIAL } else { THREAD_WORKER };
+        self.ev(th, ts, kind::THREAD_BEGIN, 0, 0, ty, 1000 + th as u64, 0, 0)
+    }
+
+    /// Begin and end of the initial task, reported as implicit task of the
+    /// implicit parallel region `par` (OpenMP 5.x).
+    fn initial_begin(&mut self, th: u32, ts: u64, task: u64, par: u64) -> &mut Self {
+        self.ev(th, ts, kind::IMPLICIT_TASK, ENDPOINT_BEGIN, FLAG_INITIAL, task, par, 0, 1)
+    }
+
+    fn initial_end(&mut self, th: u32, ts: u64, task: u64, par: u64) -> &mut Self {
+        self.ev(th, ts, kind::IMPLICIT_TASK, ENDPOINT_END, FLAG_INITIAL, task, par, 0, 1)
+    }
+
+    fn parallel_begin(&mut self, th: u32, ts: u64, par: u64, encountering: u64, n: u64, codeptr: u64) -> &mut Self {
+        self.ev(th, ts, kind::PARALLEL_BEGIN, 0, 0x1, par, encountering, n, codeptr)
+    }
+
+    fn parallel_end(&mut self, th: u32, ts: u64, par: u64, encountering: u64) -> &mut Self {
+        self.ev(th, ts, kind::PARALLEL_END, 0, 0x1, par, encountering, 0, 0)
+    }
+
+    fn implicit_begin(&mut self, th: u32, ts: u64, task: u64, par: u64, index: u64, n: u64) -> &mut Self {
+        self.ev(th, ts, kind::IMPLICIT_TASK, ENDPOINT_BEGIN, FLAG_IMPLICIT, task, par, index, n)
+    }
+
+    fn implicit_end(&mut self, th: u32, ts: u64, task: u64, par: u64) -> &mut Self {
+        self.ev(th, ts, kind::IMPLICIT_TASK, ENDPOINT_END, FLAG_IMPLICIT, task, par, 0, 0)
+    }
+
+    fn create(&mut self, th: u32, ts: u64, task: u64, parent: u64, codeptr: u64) -> &mut Self {
+        self.ev(th, ts, kind::TASK_CREATE, 0, FLAG_EXPLICIT, task, parent, 0, codeptr)
+    }
+
+    fn schedule(&mut self, th: u32, ts: u64, prior: u64, status: u64, next: u64) -> &mut Self {
+        self.ev(th, ts, kind::TASK_SCHEDULE, 0, 0, prior, status, next, 0)
+    }
+
+    fn dependence(&mut self, th: u32, ts: u64, pred: u64, succ: u64) -> &mut Self {
+        self.ev(th, ts, kind::TASK_DEPENDENCE, 0, 0, pred, succ, 0, 0)
+    }
+
+    /// Begin of a synchronisation region and of waiting in it.
+    fn sync_begin(&mut self, th: u32, ts: u64, sync: u64, task: u64, par: u64) -> &mut Self {
+        self.ev(th, ts, kind::SYNC_REGION, ENDPOINT_BEGIN, 0, sync, task, par, 0xdead);
+        self.ev(th, ts, kind::SYNC_WAIT, ENDPOINT_BEGIN, 0, sync, task, par, 0xdead)
+    }
+
+    /// End of waiting and of the synchronisation region.
+    fn sync_end(&mut self, th: u32, ts: u64, sync: u64, task: u64, par: u64) -> &mut Self {
+        self.ev(th, ts, kind::SYNC_WAIT, ENDPOINT_END, 0, sync, task, par, 0xdead);
+        self.ev(th, ts, kind::SYNC_REGION, ENDPOINT_END, 0, sync, task, par, 0xdead)
+    }
+
+    fn build(&mut self) -> Trace {
+        let events = self.threads.values().flatten().copied().collect();
+        Trace { rank: 0, pid: 1, epoch_ns: 0, host: "test".into(), events, syms: vec![] }
+    }
+}
+
+fn analyse(trace: &Trace) -> (Model, PathResult) {
+    let m = Model::build(trace);
+    let crit = analysis::critical_path(&m, None);
+    (m, crit)
+}
+
+/// Index of the task with OMPT-side id `id`.
+fn task(m: &Model, id: u64) -> usize {
+    m.tasks.iter().position(|t| t.id == id).unwrap_or_else(|| panic!("task {id} not in model"))
+}
+
+fn work(m: &Model, id: u64) -> u64 {
+    m.tasks[task(m, id)].work
+}
+
+fn crit_time(m: &Model, crit: &PathResult, id: u64) -> u64 {
+    crit.task_time[task(m, id)]
+}
+
+/// Checks the invariants that must hold for every trace: per-task critical
+/// time never exceeds work, the critical path is at most T_1, and origins
+/// partition the tasks so their work and critical times sum to T_1 and T_inf.
+fn check_invariants(m: &Model, crit: &PathResult) {
+    for (i, t) in m.tasks.iter().enumerate() {
+        assert!(crit.task_time[i] <= t.work, "task {}: critical time {} > work {}", t.id, crit.task_time[i], t.work);
+    }
+    assert_eq!(crit.task_time.iter().sum::<u64>(), crit.length, "critical times must add up to T_inf");
+    assert!(crit.length <= m.total_work(), "T_inf must not exceed T_1");
+
+    let origins = analysis::origins(m, crit);
+    let mut seen = vec![false; m.tasks.len()];
+    for o in &origins {
+        for &t in &o.tasks {
+            assert!(!seen[t as usize], "task {} in two origins", m.tasks[t as usize].id);
+            seen[t as usize] = true;
+        }
+    }
+    assert!(seen.iter().all(|&s| s), "every task must belong to an origin");
+    assert_eq!(origins.iter().map(|o| o.tasks.len()).sum::<usize>(), m.tasks.len());
+    assert_eq!(origins.iter().map(|o| o.work).sum::<u64>(), m.total_work(), "origin work must add up to T_1");
+    assert_eq!(origins.iter().map(|o| o.critical).sum::<u64>(), crit.length, "origin critical times must add up to T_inf");
+}
+
+// ------------------------------------------------------------------ scenarios
+
+/// Only the initial task, working from 0 to 100.
+#[test]
+fn serial_program() {
+    let mut b = TraceBuilder::default();
+    b.thread_begin(0, 0, true).initial_begin(0, 0, 1, 1).initial_end(0, 100, 1, 1);
+    let (m, crit) = analyse(&b.build());
+
+    assert_eq!(m.tasks.len(), 1);
+    assert!(m.tasks[0].kind == TaskKind::Initial);
+    assert_eq!(m.total_work(), 100);
+    assert_eq!(crit.length, 100);
+    assert_eq!(crit_time(&m, &crit, 1), 100);
+    check_invariants(&m, &crit);
+}
+
+/// One thread. The initial task I creates A (codeptr 0xA) and B (0xB),
+/// waits in a taskwait while A and B run, then continues.
+///
+/// ```text
+/// I: work 0-10, create A, work 10-12, create B, work 12-20, taskwait 20-102,
+///    work 102-132
+/// A: 21-51 (30)    B: 51-101 (50)
+/// ```
+/// Parts of I: P1 = 10, P2 = 2, P3 = 8, P4 = 30.
+/// Paths: P1+P2+B+P4 = 92 (longest), P1+A+P4 = 70, P1+P2+P3+P4 = 50.
+fn taskwait_trace(codeptr_a: u64, codeptr_b: u64) -> Trace {
+    let mut b = TraceBuilder::default();
+    b.thread_begin(0, 0, true)
+        .initial_begin(0, 0, 1, 1)
+        .create(0, 10, 2, 1, codeptr_a)
+        .create(0, 12, 3, 1, codeptr_b)
+        .sync_begin(0, 20, SYNC_TASKWAIT, 1, 1)
+        .schedule(0, 21, 1, STATUS_SWITCH, 2)
+        .schedule(0, 51, 2, STATUS_COMPLETE, 3)
+        .schedule(0, 101, 3, STATUS_COMPLETE, 1)
+        .sync_end(0, 102, SYNC_TASKWAIT, 1, 1)
+        .initial_end(0, 132, 1, 1);
+    b.build()
+}
+
+#[test]
+fn taskwait_counts_and_work() {
+    let (m, crit) = analyse(&taskwait_trace(0xA, 0xB));
+    assert_eq!(m.tasks.len(), 3);
+    assert_eq!(m.tasks.iter().filter(|t| t.kind == TaskKind::Explicit).count(), 2);
+    assert_eq!(work(&m, 1), 10 + 2 + 8 + 30);
+    assert_eq!(work(&m, 2), 30);
+    assert_eq!(work(&m, 3), 50);
+    assert_eq!(m.total_work(), 130);
+    let creates = m.edges.iter().filter(|e| e.kind == EdgeKind::Create).count();
+    assert_eq!(creates, 2);
+    check_invariants(&m, &crit);
+}
+
+#[test]
+fn taskwait_critical_path() {
+    let (m, crit) = analyse(&taskwait_trace(0xA, 0xB));
+    assert_eq!(crit.length, 92);
+    assert_eq!(crit_time(&m, &crit, 1), 10 + 2 + 30, "I before B and after the taskwait");
+    assert_eq!(crit_time(&m, &crit, 2), 0, "A is shorter than B");
+    assert_eq!(crit_time(&m, &crit, 3), 50);
+    let (i, b) = (task(&m, 1) as u32, task(&m, 3) as u32);
+    assert!(crit.transitions.contains(&(i, b)) && crit.transitions.contains(&(b, i)));
+}
+
+#[test]
+fn origins_separate_locations() {
+    let (m, crit) = analyse(&taskwait_trace(0xA, 0xB));
+    let origins = analysis::origins(&m, &crit);
+    assert_eq!(origins.len(), 3);
+    let by = |initial: bool, codeptr: u64| origins.iter().find(|o| o.initial == initial && o.codeptr == codeptr).unwrap();
+    let (init, a, b) = (by(true, 0), by(false, 0xA), by(false, 0xB));
+    assert_eq!((init.tasks.len(), init.work, init.critical), (1, 50, 42));
+    assert_eq!((a.tasks.len(), a.work, a.critical), (1, 30, 0));
+    assert_eq!((b.tasks.len(), b.work, b.critical), (1, 50, 50));
+    assert!(a.has_explicit && !a.has_implicit && !a.has_taskloop);
+    // Sorted by work, largest first.
+    assert!(origins.windows(2).all(|w| w[0].work >= w[1].work));
+    check_invariants(&m, &crit);
+}
+
+#[test]
+fn origins_merge_same_location() {
+    // A and B created at the same code location form one origin.
+    let (m, crit) = analyse(&taskwait_trace(0xC, 0xC));
+    let origins = analysis::origins(&m, &crit);
+    assert_eq!(origins.len(), 2);
+    let c = origins.iter().find(|o| o.codeptr == 0xC).unwrap();
+    assert_eq!((c.tasks.len(), c.work, c.critical), (2, 80, 50));
+    check_invariants(&m, &crit);
+}
+
+/// One thread. I creates A, B (B depends on A) and C, then waits.
+///
+/// ```text
+/// I: work 0-5, create A, 5-6 create B (+ dependence A -> B), 6-7 create C,
+///    7-8, taskwait 8-44, work 44-50
+/// A: 8-18 (10)   C: 18-23 (5)   B: 23-43 (20)
+/// ```
+/// Parts of I: P1 = 5, P2 = 1, P3 = 1, P4 = 1, P5 = 6.
+/// Longest path: P1 + A + B + P5 = 41.
+fn dependence_trace() -> Trace {
+    let mut b = TraceBuilder::default();
+    b.thread_begin(0, 0, true)
+        .initial_begin(0, 0, 1, 1)
+        .create(0, 5, 2, 1, 0xA)
+        .create(0, 6, 3, 1, 0xB)
+        .dependence(0, 6, 2, 3)
+        .create(0, 7, 4, 1, 0xC)
+        .sync_begin(0, 8, SYNC_TASKWAIT, 1, 1)
+        .schedule(0, 8, 1, STATUS_SWITCH, 2)
+        .schedule(0, 18, 2, STATUS_COMPLETE, 4)
+        .schedule(0, 23, 4, STATUS_COMPLETE, 3)
+        .schedule(0, 43, 3, STATUS_COMPLETE, 1)
+        .sync_end(0, 44, SYNC_TASKWAIT, 1, 1)
+        .initial_end(0, 50, 1, 1);
+    b.build()
+}
+
+#[test]
+fn dependence_critical_path() {
+    let (m, crit) = analyse(&dependence_trace());
+    assert_eq!(m.tasks.len(), 4);
+    assert_eq!(m.total_work(), 14 + 10 + 20 + 5);
+    let deps: Vec<_> = m.edges.iter().filter(|e| e.kind == EdgeKind::Depend).collect();
+    assert_eq!(deps.len(), 1);
+    assert_eq!((deps[0].from as usize, deps[0].to as usize), (task(&m, 2), task(&m, 3)));
+
+    assert_eq!(crit.length, 41);
+    assert_eq!(crit_time(&m, &crit, 1), 5 + 6);
+    assert_eq!(crit_time(&m, &crit, 2), 10);
+    assert_eq!(crit_time(&m, &crit, 3), 20);
+    assert_eq!(crit_time(&m, &crit, 4), 0);
+    check_invariants(&m, &crit);
+}
+
+#[test]
+fn without_dependence_the_path_is_shorter() {
+    // Same trace without the A -> B dependence: P1 + P2 + B + P5 = 32.
+    let mut trace = dependence_trace();
+    trace.events.retain(|e| e.kind != kind::TASK_DEPENDENCE);
+    let (m, crit) = analyse(&trace);
+    assert_eq!(crit.length, 32);
+    assert_eq!(crit_time(&m, &crit, 2), 0);
+    check_invariants(&m, &crit);
+}
+
+/// Two threads. I forks a team of two (implicit tasks 10 on thread 0 and 11
+/// on thread 1). Task 10 creates explicit task 20, which thread 1 executes
+/// while waiting in the region's final barrier. After the join I continues.
+///
+/// ```text
+/// thread 0: I 0-10 | fork | 10: 10-15 create 20, 15-16, barrier 16-58 | join | I 59-70
+/// thread 1:          11: 10-13, barrier 13-58, executes 20: 17-57 (40)
+/// ```
+/// Work: I = 10 + 11, task 10 = 6, task 11 = 3, task 20 = 40, T_1 = 70.
+/// Longest path: I before fork (10) + task 10 up to the creation (5) + 20 (40)
+/// + barrier + region end + I after the join (11) = 66.
+fn parallel_trace() -> Trace {
+    let mut b = TraceBuilder::default();
+    b.thread_begin(0, 0, true)
+        .initial_begin(0, 0, 1, 1)
+        .parallel_begin(0, 10, 2, 1, 2, 0x100)
+        .implicit_begin(0, 10, 10, 2, 0, 2)
+        .create(0, 15, 20, 10, 0x200)
+        .sync_begin(0, 16, SYNC_BARRIER_IMPLICIT_PARALLEL, 10, 2)
+        .sync_end(0, 58, SYNC_BARRIER_IMPLICIT_PARALLEL, 10, 2)
+        .implicit_end(0, 59, 10, 2)
+        .parallel_end(0, 59, 2, 1)
+        .initial_end(0, 70, 1, 1);
+    b.thread_begin(1, 9, false)
+        .implicit_begin(1, 10, 11, 2, 1, 2)
+        .sync_begin(1, 13, SYNC_BARRIER_IMPLICIT_PARALLEL, 11, 2)
+        .schedule(1, 17, 11, STATUS_SWITCH, 20)
+        .schedule(1, 57, 20, STATUS_COMPLETE, 11)
+        .sync_end(1, 58, SYNC_BARRIER_IMPLICIT_PARALLEL, 11, 2)
+        .implicit_end(1, 59, 11, 2);
+    b.build()
+}
+
+#[test]
+fn parallel_region_counts() {
+    let (m, crit) = analyse(&parallel_trace());
+    assert_eq!(m.tasks.len(), 4);
+    let count = |k: TaskKind| m.tasks.iter().filter(|t| t.kind == k).count();
+    assert_eq!((count(TaskKind::Initial), count(TaskKind::Implicit), count(TaskKind::Explicit)), (1, 2, 1));
+    assert_eq!(m.threads.len(), 2);
+    let region = m.parallels.iter().find(|p| p.id == 2).expect("parallel region 2");
+    assert_eq!((region.requested, region.actual), (2, 2));
+    assert_eq!(region.parent_task as usize, task(&m, 1));
+    // Implicit tasks are children of the encountering task.
+    for id in [10, 11] {
+        assert_eq!(m.tasks[task(&m, id)].parent as usize, task(&m, 1));
+    }
+    check_invariants(&m, &crit);
+}
+
+#[test]
+fn parallel_region_work_and_stealing() {
+    let (m, _) = analyse(&parallel_trace());
+    assert_eq!(work(&m, 1), 10 + 11);
+    assert_eq!(work(&m, 10), 6);
+    assert_eq!(work(&m, 11), 3);
+    assert_eq!(work(&m, 20), 40);
+    assert_eq!(m.total_work(), 70);
+    // Task 20 was created on thread 0 and executed on thread 1.
+    let t20 = &m.tasks[task(&m, 20)];
+    assert_eq!(t20.create_thread, 0);
+    assert_eq!(t20.segs.len(), 1);
+    assert_eq!((t20.segs[0].thread, t20.segs[0].start, t20.segs[0].end), (1, 17, 57));
+}
+
+#[test]
+fn parallel_region_critical_path() {
+    let (m, crit) = analyse(&parallel_trace());
+    assert_eq!(crit.length, 66);
+    assert_eq!(crit_time(&m, &crit, 1), 21);
+    assert_eq!(crit_time(&m, &crit, 10), 5);
+    assert_eq!(crit_time(&m, &crit, 11), 0);
+    assert_eq!(crit_time(&m, &crit, 20), 40);
+
+    let origins = analysis::origins(&m, &crit);
+    let region = origins.iter().find(|o| o.codeptr == 0x100).unwrap();
+    assert!(region.has_implicit && !region.has_explicit);
+    assert_eq!((region.tasks.len(), region.work, region.critical), (2, 9, 5));
+    check_invariants(&m, &crit);
+}
+
+#[test]
+fn trace_order_does_not_matter() {
+    // The model must not depend on the order in which per-thread streams are
+    // stored in the file.
+    let mut trace = parallel_trace();
+    let (m1, c1) = analyse(&trace);
+    // Thread 1's stream first; the order within a thread is kept, as in a file.
+    trace.events.sort_by_key(|e| e.thread == 0);
+    let (m2, c2) = analyse(&trace);
+    assert_eq!(m1.total_work(), m2.total_work());
+    assert_eq!(c1.length, c2.length);
+    assert_eq!(m1.tasks.len(), m2.tasks.len());
+}
+
+// ------------------------------------------------------------------ regions
+
+fn select(m: &Model, ids: &[u64]) -> Vec<bool> {
+    let mut sel = vec![false; m.tasks.len()];
+    for &id in ids {
+        sel[task(m, id)] = true;
+    }
+    sel
+}
+
+#[test]
+fn region_with_dependence_chain() {
+    // A -> B is a chain: T_1 = T_inf = 30, no parallelism.
+    let m = Model::build(&dependence_trace());
+    let r = analysis::analyze_region(&m, &select(&m, &[2, 3]));
+    assert_eq!(r.n_tasks, 2);
+    assert_eq!(r.work, 30);
+    assert_eq!(r.critical, 30);
+    assert_eq!(r.max_concurrency, 1);
+    assert_eq!((r.t_begin, r.t_end), (8, 43));
+}
+
+#[test]
+fn region_of_independent_tasks() {
+    // A and C are independent: T_1 = 15, T_inf = max(10, 5) = 10.
+    let m = Model::build(&dependence_trace());
+    let r = analysis::analyze_region(&m, &select(&m, &[2, 4]));
+    assert_eq!((r.work, r.critical), (15, 10));
+    assert_eq!(r.path.task_time[task(&m, 2)], 10);
+    assert_eq!(r.path.task_time[task(&m, 4)], 0);
+}
+
+#[test]
+fn region_concurrency_on_two_threads() {
+    // Implicit tasks 10 (10-16) and 11 (10-13) run at the same time; 20 runs
+    // alone (17-57).
+    let m = Model::build(&parallel_trace());
+    let r = analysis::analyze_region(&m, &select(&m, &[10, 11, 20]));
+    assert_eq!(r.n_tasks, 3);
+    assert_eq!(r.work, 49);
+    assert_eq!(r.max_concurrency, 2);
+    assert_eq!((r.t_begin, r.t_end), (10, 57));
+    assert_eq!(r.per_thread, vec![(0, 6), (1, 3 + 40)]);
+    // Without the initial task the longest path is task 10 up to the
+    // creation of 20 (5), then 20 (40).
+    assert_eq!(r.critical, 45);
+}
+
+#[test]
+fn downsample_preserves_area() {
+    // Step function: 2 tasks from 0 to 50, 1 task from 50 to 100.
+    let profile = [(0, 2), (50, 1), (100, 0)];
+    let samples = analysis::downsample(&profile, 0, 100, 10);
+    assert_eq!(samples.len(), 10);
+    let area: f64 = samples.iter().map(|s| s.1 * 10.0).sum();
+    assert!((area - 150.0).abs() < 1e-9, "area {area}");
+    assert!((samples[0].1 - 2.0).abs() < 1e-9 && (samples[9].1 - 1.0).abs() < 1e-9);
+}

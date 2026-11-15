@@ -71,6 +71,17 @@ The server has no authentication and binds to ``127.0.0.1`` by default.
       ``deps`` ``depend`` items: ``[address (hex string), type]``
       ======== ===========================================================
 
+   ``origins``
+      Task origins, as in the GUI's task origins table, sorted by work:
+      ``{initial, loc, k, n, w, cr, tasks}``. ``initial`` is 1 for the group
+      of the initial task (``loc`` is then -1); otherwise ``loc`` is the
+      source location of the creating construct. ``k`` is a bit set of the
+      kinds in the group: 1 implicit tasks of a parallel region, 2 tasks of
+      a ``task`` construct, 4 tasks of a ``taskloop``. ``n`` is the number
+      of tasks, ``w`` their total work, ``cr`` their work on the critical
+      path, ``tasks`` their indices. The groups partition the tasks, so the
+      sums of ``w`` and ``cr`` are ``work`` and ``critical``.
+
    ``edges``
       ``[from, to, kind, critical]``: task indices; kind 0 creation, 1
       dependence; critical 1 if the critical path passes from one task to

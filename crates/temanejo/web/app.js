@@ -151,24 +151,20 @@ function renderSummary() {
 
 // ------------------------------------------------------------------ task origins
 
-// Groups tasks by the source location of the construct that created them:
-// the task construct for explicit tasks, the parallel construct for implicit
-// tasks. The initial task (serial code) gets a row of its own.
+// Task origins as computed by the server (analysis::origins): tasks grouped
+// by the source location of the construct that created them, the initial
+// task in a group of its own. Adds the display fields.
 function origins() {
-  const m = new Map();
-  S.g.tasks.forEach((t, i) => {
-    const key = t.k === 0 ? 'initial' : t.loc;
-    let o = m.get(key);
-    if (!o) m.set(key, o = { key, loc: t.k === 0 ? -1 : t.loc, kinds: new Set(), n: 0, w: 0, cr: 0, tasks: [] });
-    o.kinds.add(t.k === 2 && t.tl ? 3 : t.k); o.n++; o.w += t.w; o.cr += t.cr; o.tasks.push(i);
+  return S.g.origins.map(g => {
+    const l = S.g.locs[g.loc];
+    const kinds = [[1, 'parallel region'], [2, 'task'], [4, 'taskloop']].filter(([bit]) => g.k & bit).map(k => k[1]);
+    return {
+      key: g.initial ? 'initial' : g.loc, loc: g.loc, n: g.n, w: g.w, cr: g.cr, tasks: g.tasks,
+      name: g.initial ? 'initial task' : l ? locShort(l) : 'unknown location',
+      func: g.initial ? 'serial code outside parallel regions' : l ? (l.func || l.module) : '',
+      kind: g.initial ? 'initial' : kinds.join(' + '),
+    };
   });
-  for (const o of m.values()) {
-    const l = S.g.locs[o.loc];
-    o.name = o.key === 'initial' ? 'initial task' : l ? locShort(l) : 'unknown location';
-    o.func = o.key === 'initial' ? 'serial code outside parallel regions' : l ? (l.func || l.module) : '';
-    o.kind = o.key === 'initial' ? 'initial' : [...o.kinds].sort().map(k => ['', 'parallel region', 'task', 'taskloop'][k]).join(' + ');
-  }
-  return [...m.values()];
 }
 
 function renderOrigins() {

@@ -212,3 +212,76 @@ impl Trace {
         Ok(Trace { rank, pid, epoch_ns, host, events, syms })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Trace {
+        let e = |i: u64| Event {
+            kind: (i % 12) as u8 + 1,
+            endpoint: (i % 3) as u8,
+            cpu: 1000 + i as u16,
+            numa: 7,
+            thread: 42 + i as u32,
+            flags: 0x8000_0004,
+            ts: u64::MAX - i,
+            a: i,
+            b: i << 32,
+            c: 0x0123_4567_89ab_cdef,
+            d: 0xffff_0000_0000_0001 + i,
+        };
+        Trace {
+            rank: 3,
+            pid: 4711,
+            epoch_ns: 1_700_000_000_000_000_000,
+            host: "node-ä1".into(),
+            events: (0..5).map(e).collect(),
+            syms: vec![
+                Sym { addr: 0x401000, load_bias: 0, module: "/bin/app".into(), symbol: String::new() },
+                Sym { addr: 0x7f00_0000_1234, load_bias: 0x7f00_0000_0000, module: "/lib/libomp.so".into(), symbol: "__kmpc_fork_call".into() },
+            ],
+        }
+    }
+
+    #[test]
+    fn event_record_is_56_bytes_little_endian() {
+        let mut buf = [0u8; EVENT_SIZE];
+        let e = Event { kind: 5, endpoint: 2, cpu: 0x0102, numa: 0x0304, thread: 0x0506_0708, flags: 9, ts: 0x1122_3344_5566_7788, a: 1, b: 2, c: 3, d: 4 };
+        e.encode(&mut buf);
+        assert_eq!(&buf[..8], &[5, 2, 0x02, 0x01, 0x04, 0x03, 0, 0]);
+        assert_eq!(&buf[8..12], &[0x08, 0x07, 0x06, 0x05]);
+        assert_eq!(&buf[16..24], &0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(&buf[48..56], &4u64.to_le_bytes());
+    }
+
+    #[test]
+    fn write_read_roundtrip() {
+        let t = sample();
+        let mut bytes = Vec::new();
+        t.write(&mut bytes).unwrap();
+        assert_eq!(&bytes[..8], MAGIC);
+        let r = Trace::read(&mut bytes.as_slice()).unwrap();
+        assert_eq!((r.rank, r.pid, r.epoch_ns, r.host.as_str()), (3, 4711, t.epoch_ns, "node-ä1"));
+        assert_eq!(r.events.len(), t.events.len());
+        for (a, b) in r.events.iter().zip(&t.events) {
+            assert_eq!(
+                (a.kind, a.endpoint, a.cpu, a.numa, a.thread, a.flags, a.ts, a.a, a.b, a.c, a.d),
+                (b.kind, b.endpoint, b.cpu, b.numa, b.thread, b.flags, b.ts, b.a, b.b, b.c, b.d)
+            );
+        }
+        assert_eq!(r.syms.len(), 2);
+        assert_eq!((r.syms[1].addr, r.syms[1].load_bias), (t.syms[1].addr, t.syms[1].load_bias));
+        assert_eq!((r.syms[1].module.as_str(), r.syms[1].symbol.as_str()), ("/lib/libomp.so", "__kmpc_fork_call"));
+    }
+
+    #[test]
+    fn rejects_bad_magic_and_truncation() {
+        let mut bytes = Vec::new();
+        sample().write(&mut bytes).unwrap();
+        let mut bad = bytes.clone();
+        bad[7] = b'9';
+        assert!(Trace::read(&mut bad.as_slice()).is_err());
+        assert!(Trace::read(&mut &bytes[..bytes.len() - 3]).is_err());
+    }
+}

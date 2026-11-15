@@ -1,6 +1,6 @@
 //! Critical path and degree-of-parallelism analysis on the part graph.
 
-use crate::model::{Model, NONE};
+use crate::model::{Model, TaskKind, NONE};
 use std::collections::HashSet;
 
 pub struct PathResult {
@@ -174,4 +174,48 @@ pub fn downsample(profile: &[(u64, u32)], t_begin: u64, t_end: u64, buckets: usi
         }
     }
     acc.iter().enumerate().map(|(i, &v)| (t_begin + (span * i as f64 / buckets as f64) as u64, v)).collect()
+}
+
+/// Tasks grouped by the code location that created them.
+#[derive(Debug, Default)]
+pub struct Origin {
+    /// The group of the initial task (serial code); `codeptr` is then 0.
+    pub initial: bool,
+    /// Code address of the creating construct (`task`, `taskloop` or
+    /// `parallel`), 0 if unknown.
+    pub codeptr: u64,
+    /// Task indices, in creation order.
+    pub tasks: Vec<u32>,
+    /// Total exclusive work of the tasks (ns).
+    pub work: u64,
+    /// Part of that work on the critical path (ns).
+    pub critical: u64,
+    pub has_implicit: bool,
+    pub has_explicit: bool,
+    pub has_taskloop: bool,
+}
+
+/// Groups all tasks by origin: the initial task forms its own group, every
+/// other task is grouped by the code address of the construct that created
+/// it. Every task is in exactly one group, so work and critical times of the
+/// groups add up to T_1 and T_inf. Sorted by work, largest first.
+pub fn origins(m: &Model, crit: &PathResult) -> Vec<Origin> {
+    let mut groups: std::collections::HashMap<(bool, u64), Origin> = Default::default();
+    for (i, t) in m.tasks.iter().enumerate() {
+        let initial = t.kind == TaskKind::Initial;
+        let codeptr = if initial { 0 } else { t.codeptr };
+        let o = groups.entry((initial, codeptr)).or_insert_with(|| Origin { initial, codeptr, ..Default::default() });
+        o.tasks.push(i as u32);
+        o.work += t.work;
+        o.critical += crit.task_time[i];
+        match t.kind {
+            TaskKind::Implicit => o.has_implicit = true,
+            TaskKind::Explicit if t.taskloop => o.has_taskloop = true,
+            TaskKind::Explicit => o.has_explicit = true,
+            TaskKind::Initial => {}
+        }
+    }
+    let mut v: Vec<Origin> = groups.into_values().collect();
+    v.sort_by(|a, b| b.work.cmp(&a.work).then(a.initial.cmp(&b.initial)).then(a.codeptr.cmp(&b.codeptr)));
+    v
 }
