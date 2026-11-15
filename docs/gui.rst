@@ -23,10 +23,24 @@ Graph / Timeline
 
 Colour by
    Thread, CPU (hardware thread), NUMA node, source location, parallel
-   region, task kind, or work time (sequential, log scale). The first eight
-   categories get distinct colours; further ones reuse them, and the task
-   details always name the exact value. Thread, CPU and NUMA node refer to the
-   task's first execution segment.
+   region or task kind (categorical colours), or one of these sequential
+   scales (light = small or early, dark = large or late):
+
+   * *Work time*: exclusive work time, log scale.
+   * *Create time*: when the task was created, linear from the first to the
+     last creation.
+   * *Start time*: when the task started, linear. A task's start time is the
+     begin of its first execution segment, or its creation time if it never
+     ran.
+   * *Wait time*: start time − create time, how long the task waited before
+     a thread picked it up, log scale. Implicit tasks and undeferred tasks
+     start right away. Long waits next to idle threads point to dependences
+     or scheduling holding tasks back.
+
+   Of the categorical colours, the first eight categories get distinct
+   colours; further ones reuse them, and the task details always name the
+   exact value. Thread, CPU and NUMA node refer to the task's first
+   execution segment.
 
 Critical path, Creation edges, Dependence edges
    Show or hide these overlays.
@@ -128,7 +142,8 @@ The state can be preset through the URL fragment, e.g.::
 ``view``
    ``graph`` or ``timeline``
 ``color``
-   ``thread``, ``cpu``, ``numa``, ``loc``, ``region``, ``kind`` or ``work``
+   ``thread``, ``cpu``, ``numa``, ``loc``, ``region``, ``kind``, ``work``,
+   ``create``, ``start`` or ``wait``
 ``task``
    task id to select and centre
 ``select``

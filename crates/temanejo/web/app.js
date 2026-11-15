@@ -82,12 +82,23 @@ function catLabel(v) {
     case 'kind': return KIND[v];
   }
 }
+// Start of a task: begin of its first execution segment, creation if it never ran.
+const taskStart = t => t.segs.length ? t.segs[0][4] : t.ct;
+
+// Sequential colour modes: value per task, legend label, and whether the
+// scale is logarithmic (for quantities spanning orders of magnitude).
+const SEQUENTIAL = {
+  work: { value: t => t.w, label: 'work time', log: true },
+  create: { value: t => t.ct, label: 'create time', log: false },
+  start: { value: taskStart, label: 'start time', log: false },
+  wait: { value: t => Math.max(taskStart(t) - t.ct, 0), label: 'wait time (start − create)', log: true },
+};
+
 function color(t) {
-  const c = S.css;
-  if (S.colorBy === 'work') {
-    const { lo, hi } = S.workRange;
-    const f = hi > lo ? (Math.log(Math.max(t.w, 1)) - lo) / (hi - lo) : 1;
-    return mix(c.seqLo, c.seqHi, Math.min(1, Math.max(0, f)));
+  const c = S.css, seq = SEQUENTIAL[S.colorBy];
+  if (seq) {
+    const { lo, hi } = S.seqRange, x = seq.log ? Math.log(Math.max(seq.value(t), 1)) : seq.value(t);
+    return mix(c.seqLo, c.seqHi, hi > lo ? Math.min(1, Math.max(0, (x - lo) / (hi - lo))) : 1);
   }
   const slot = S.catSlots.get(catValue(t));
   return slot === undefined ? c.muted : c.cat[slot % 8];
@@ -96,8 +107,15 @@ function color(t) {
 function assignSlots() {
   const vals = [...new Set(S.g.tasks.map(catValue))].sort((a, b) => a - b);
   S.catSlots = new Map(vals.map((v, i) => [v, i]));
-  const ws = S.g.tasks.map(t => Math.max(t.w, 1));
-  S.workRange = { lo: Math.log(Math.min(...ws)), hi: Math.log(Math.max(...ws)), min: Math.min(...ws), max: Math.max(...ws) };
+  const seq = SEQUENTIAL[S.colorBy];
+  if (seq) {
+    let min = Infinity, max = -Infinity;
+    for (const t of S.g.tasks) {
+      const v = seq.log ? Math.max(seq.value(t), 1) : seq.value(t);
+      min = Math.min(min, v); max = Math.max(max, v);
+    }
+    S.seqRange = { min, max, lo: seq.log ? Math.log(min) : min, hi: seq.log ? Math.log(max) : max };
+  }
 }
 
 function locShort(l) {
@@ -532,8 +550,10 @@ window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () 
 function renderLegend() {
   const g = S.g; if (!g) return;
   let html = '';
-  if (S.colorBy === 'work') {
-    html = `<span>work time ${fmt(S.workRange.min)}<span class="ramp"></span>${fmt(S.workRange.max)} (log scale)</span>`;
+  const seq = SEQUENTIAL[S.colorBy];
+  if (seq) {
+    const { min, max } = S.seqRange;
+    html = `<span>${seq.label} ${fmt(min)}<span class="ramp"></span>${fmt(max)}${seq.log ? ' (log scale)' : ''}</span>`;
   } else {
     const vals = [...S.catSlots.keys()];
     html = vals.slice(0, 8).map(v => `<span><span class="sw" style="background:${S.css.cat[S.catSlots.get(v) % 8]}"></span>${esc(catLabel(v))}</span>`).join('');
