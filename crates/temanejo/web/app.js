@@ -300,8 +300,10 @@ function renderSummary() {
   const n = criticalTasks().size;
   $('summary-actions').innerHTML =
     `<button id="sel-crit" title="Select all tasks with work on the critical path for the region analysis">Select critical path</button>` +
+    `<button id="exp-crit" title="Expand every group that contains a task on the critical path, through all nesting levels, so the whole path is visible">Expand critical path</button>` +
     `<span class="muted">${n} task${n === 1 ? '' : 's'} on the path</span>`;
   $('sel-crit').onclick = () => setRegion(criticalTasks());
+  $('exp-crit').onclick = expandCriticalPath;
   renderRunInfo();
 }
 
@@ -322,6 +324,19 @@ function renderRunInfo() {
   el.innerHTML = `<summary>Run information</summary><table class="kv">` +
     other.map(([k, v]) => row(INFO_LABEL[k] || k, v)).join('') +
     (env.length ? `<tr><th colspan="2">Environment variables</th></tr>` + env.map(([k, v]) => row(k.slice(4), v)).join('') : '') + `</table>`;
+}
+
+// Expands every server group containing a task on the critical path,
+// through all nesting levels, so that each of these tasks is visible.
+// Groups made in the browser that hide one of them are expanded too.
+function expandCriticalPath() {
+  const open = new Set();
+  for (const i of criticalTasks()) {
+    for (let g = S.groupOf[i]; g >= 0 && !open.has(S.groups[g]); g = S.groups[g].parent) open.add(S.groups[g]);
+    for (const grp of S.groups) if (!grp.server && grp.collapsed && grp.members.includes(i)) open.add(grp);
+  }
+  const closed = [...open].filter(grp => grp.collapsed);
+  return closed.length ? setCollapsed(closed, false) : Promise.resolve();
 }
 
 // Indices of all tasks with work on the critical path of the whole graph.
@@ -1428,6 +1443,7 @@ async function applyHash() {
   if (q.has('rank') && String(S.g.rank) !== q.get('rank')) { $('rank').value = q.get('rank'); await loadRank(q.get('rank')); }
   if (q.has('color')) { $('color').value = q.get('color'); $('color').onchange({ target: $('color') }); }
   if (q.get('expand') === 'all') { await ensureLoaded(); await setCollapsed(S.groups, false); }
+  if (q.get('expand') === 'critical') await expandCriticalPath();
   if (q.get('view') === 'timeline') await $('view-timeline').onclick();
   if (q.has('perf')) togglePerf(true);
   if (q.get('select') === 'critical') setRegion(criticalTasks());

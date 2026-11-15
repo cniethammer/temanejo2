@@ -279,6 +279,12 @@ T\ :sub:`∞` then equals that of the graph; its work T\ :sub:`1` is larger,
 because only part of some tasks' work lies on the path, and its measured
 concurrency shows whether the critical tasks ever ran at the same time.
 
+*Expand critical path* next to it expands every group that contains a task
+on the critical path, through all nesting levels, so that the whole path is
+visible in the graph while everything else stays collapsed. Together with
+*Select critical path* and *Grey out unselected* the path then stands out
+from the tasks around it.
+
 *Select subtree* selects the task and all tasks created from it, transitively.
 *Select parallel region* selects all tasks of the task's parallel region and
 everything they create, including nested regions.
@@ -320,7 +326,8 @@ The state can be preset through the URL fragment, e.g.::
 ``task``
    task id to select and centre
 ``expand``
-   ``all``: expand all groups (loads all tasks)
+   ``all``: expand all groups (loads all tasks); ``critical``: expand the
+   groups containing the critical path
 ``perf``
    show the frame time display (no value needed)
 ``gpubase``
