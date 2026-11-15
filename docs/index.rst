@@ -20,7 +20,8 @@ and open the GUI at http://127.0.0.1:8700/:
 
    cargo build --release
    make -C examples
-   OMP_NUM_THREADS=4 scripts/tmj-run -o traces mpirun -np 2 examples/mpi_omp_tasks
+   OMP_NUM_THREADS=4 OMP_PLACES=cores OMP_PROC_BIND=spread,close \
+     scripts/tmj-run -o traces mpirun -np 2 --map-by slot:PE=4 examples/mpi_omp_tasks
    target/release/temanejo traces
 
 :doc:`usage` explains each step.

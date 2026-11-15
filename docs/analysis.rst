@@ -29,7 +29,9 @@ recorded, so the GUI can show
   a change of CPU within or between segments.
 
 Time spent inside MPI calls is not distinguished: it counts as work of the
-task that made the call.
+task that made the call (see :ref:`mpi-time`). The same holds for time in
+which the operating system switched the thread out, which matters when
+threads share cores (see :ref:`binding`).
 
 The part graph
 --------------

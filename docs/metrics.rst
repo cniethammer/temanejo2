@@ -253,7 +253,13 @@ Accuracy and caveats
   few microseconds the overhead can be a noticeable part of the measured
   work.
 * Time blocked in MPI calls counts as work of the calling task, and
-  therefore can be on the critical path.
+  therefore can be on the critical path. Serial MPI calls such as
+  ``MPI_Finalize`` belong to the initial task and can dominate T\ :sub:`∞`;
+  see :ref:`mpi-time`.
+* Time in which the operating system switched a thread out also counts as
+  work of the task it was executing. If more threads run than cores are
+  available, e.g. with Open MPI's default binding of one core per process,
+  work times and T\ :sub:`∞` are inflated; see :ref:`binding`.
 * T\ :sub:`∞` uses the measured durations of this run. With another thread
   count, placement or input the durations, and so the critical path, can
   change.

@@ -47,7 +47,8 @@ The only C in the repository is the example program.
 cargo build --release
 make -C examples                       # builds mpi_omp_tasks (and omp_tasks without MPI)
 
-OMP_NUM_THREADS=4 scripts/tmj-run -o traces mpirun -np 2 examples/mpi_omp_tasks
+OMP_NUM_THREADS=4 OMP_PLACES=cores OMP_PROC_BIND=spread,close \
+  scripts/tmj-run -o traces mpirun -np 2 --map-by slot:PE=4 examples/mpi_omp_tasks
 target/release/temanejo traces         # prints a summary, then serves http://127.0.0.1:8700/
 ```
 
@@ -171,7 +172,12 @@ synthetic traces (see Tests); the OMPT tool itself is only tested manually.
   `PMI_RANK`. Without any of them every process writes `rank-0.tmj`.
 - Clocks of different ranks are not aligned; each rank's time starts at its
   first OMPT event. MPI calls are not recorded, so time blocked in MPI counts
-  as work of the task that made the call.
+  as work of the task that made the call; serial calls such as
+  `MPI_Finalize` end up on the critical path as work of the initial task.
+- Bind each MPI process to as many cores as it has threads (as in the quick
+  start). With Open MPI's default of one core per process, threads share a
+  core and the time they are switched out counts as task work. See
+  "Binding MPI processes and OpenMP threads" in the documentation.
 - Barrier joins assume every thread of a team passes the same sequence of
   barriers (no `cancel`). `detach`, target tasks and `taskwait depend(...)`
   pseudo tasks are recorded but not treated specially.

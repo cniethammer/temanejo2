@@ -122,7 +122,8 @@ Build and trace the example program shipped in the source tree, two MPI
 ranks with four OpenMP threads each, then view it::
 
    make -C examples
-   OMP_NUM_THREADS=4 scripts/tmj-run -o traces mpirun -np 2 examples/mpi_omp_tasks
+   OMP_NUM_THREADS=4 OMP_PLACES=cores OMP_PROC_BIND=spread,close \
+     scripts/tmj-run -o traces mpirun -np 2 --map-by slot:PE=4 examples/mpi_omp_tasks
    temanejo traces
 
 Record a run of any application without the wrapper script::
@@ -153,6 +154,16 @@ get source locations.
 
 Each rank's timeline starts at its own first event; clocks of different
 ranks are not aligned.
+
+Bind every MPI process to as many cores as it has OpenMP threads, e.g.
+``mpirun --map-by slot:PE=4`` with ``OMP_PLACES=cores`` and
+``OMP_PROC_BIND=spread,close``. Open MPI's default binds each process to a
+single core; threads sharing a core are switched out in the middle of
+tasks, and that time is counted as task work.
+
+Time inside MPI calls counts as work of the calling task. Serial MPI calls
+such as ``MPI_Finalize`` belong to the initial task and can dominate the
+critical path.
 
 See also
 --------
