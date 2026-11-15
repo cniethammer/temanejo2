@@ -36,6 +36,11 @@ function fmt(ns) {
   if (ns >= 1e3) return (ns / 1e3).toFixed(1) + ' µs';
   return Math.round(ns) + ' ns';
 }
+// Percentage with one decimal; tiny non-zero shares are not shown as 0.0.
+function pctText(part, whole) {
+  const p = 100 * part / Math.max(whole, 1);
+  return p > 0 && p < 0.1 ? '<0.1' : p.toFixed(1);
+}
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 function readCss() {
@@ -172,7 +177,7 @@ function renderOrigins() {
   const head = (k, label, title) =>
     `<th data-k="${k}" title="${title}" class="sortable">${label}${k === key ? (dir < 0 ? ' ▾' : ' ▴') : ''}</th>`;
   $('origins').innerHTML = `<div class="scroll"><table class="origins">
-    <thead><tr>${head('name', 'Location', 'Source location of the task or parallel construct')}${head('n', 'Tasks', 'Number of tasks created there')}${head('w', 'Work', 'Total exclusive work time of these tasks')}${head('cr', 'Crit.', 'Part of that work on the critical path')}</tr></thead>
+    <thead><tr>${head('name', 'Location', 'Source location of the task or parallel construct')}${head('n', 'Tasks', 'Number of tasks created there')}${head('w', 'Work', 'Total exclusive work time of these tasks')}${head('cr', 'Crit.', 'Part of that work on the critical path, and its share of the critical path length T∞')}</tr></thead>
     ${rows.map(o => {
       const dot = showDot ? `<span class="dot" style="background:${S.css.cat[(S.catSlots.get(o.loc) ?? 0) % 8]}"></span>` : '';
       const pct = 100 * o.w / total;
@@ -180,11 +185,11 @@ function renderOrigins() {
       return `<tbody data-o="${esc(String(o.key))}" title="${esc(o.func)} · avg. ${fmt(o.w / o.n)} per task · click to select these tasks">
         <tr class="name"><td colspan="4">${dot}<span class="mono">${esc(o.name)}</span></td></tr>
         <tr><td><span class="muted">${esc(o.kind)}</span><div class="bar" style="width:${pct.toFixed(1)}%"></div></td>
-        <td>${o.n}</td><td>${fmt(o.w)}<br><span class="muted">${pct < 0.1 && pct > 0 ? '<0.1' : pct.toFixed(1)} %</span></td>
-        <td>${o.cr ? fmt(o.cr) : '–'}</td></tr></tbody>`;
+        <td>${o.n}</td><td>${fmt(o.w)}<br><span class="muted">${pctText(o.w, total)} %</span></td>
+        <td>${o.cr ? `${fmt(o.cr)}<br><span class="muted">${pctText(o.cr, g.critical)} %</span>` : '–'}</td></tr></tbody>`;
     }).join('')}
     <tbody><tr class="total"><td>all tasks</td><td>${g.tasks.length}</td><td>${fmt(g.work)}</td><td>${fmt(g.critical)}</td></tr></tbody>
-  </table></div><p class="muted">Work is exclusive task time (T₁ share below it). Click a row to analyse its tasks as a region.</p>`;
+  </table></div><p class="muted">Work is exclusive task time. Percentages: share of T₁ under Work, share of the critical path T∞ under Crit. Click a row to analyse its tasks as a region.</p>`;
 }
 
 $('origins').addEventListener('click', e => {
@@ -481,7 +486,46 @@ $('find').onchange = e => {
   if (i !== undefined) { select(i); centerOn(i); }
 };
 window.addEventListener('keydown', e => { if (e.key === 'f' && e.target.tagName !== 'INPUT') fit(); });
-window.addEventListener('resize', resize);
+window.addEventListener('resize', () => { setAsideWidth(asideWidth()); resize(); });
+
+// ------------------------------------------------------------------ side panel width
+
+const splitter = $('splitter'), ASIDE_DEFAULT = 360, ASIDE_MIN = 260;
+const asideWidth = () => document.querySelector('aside').getBoundingClientRect().width;
+function setAsideWidth(w, save = false) {
+  w = Math.round(Math.min(Math.max(w, ASIDE_MIN), Math.max(ASIDE_MIN, window.innerWidth * 0.7)));
+  document.documentElement.style.setProperty('--aside-w', w + 'px');
+  splitter.setAttribute('aria-valuenow', w);
+  if (save) try { localStorage.setItem('temanejo.asideWidth', w); } catch { /* storage unavailable */ }
+  resize();
+}
+splitter.addEventListener('pointerdown', e => {
+  splitter.setPointerCapture(e.pointerId);
+  splitter.classList.add('active'); document.body.classList.add('resizing');
+});
+splitter.addEventListener('pointermove', e => {
+  if (splitter.hasPointerCapture(e.pointerId)) setAsideWidth(window.innerWidth - e.clientX);
+});
+splitter.addEventListener('pointerup', e => {
+  splitter.releasePointerCapture(e.pointerId);
+  splitter.classList.remove('active'); document.body.classList.remove('resizing');
+  setAsideWidth(asideWidth(), true);
+});
+splitter.addEventListener('dblclick', () => {
+  try { localStorage.removeItem('temanejo.asideWidth'); } catch { /* storage unavailable */ }
+  setAsideWidth(ASIDE_DEFAULT);
+});
+splitter.addEventListener('keydown', e => {
+  const step = e.shiftKey ? 80 : 20;
+  if (e.key === 'ArrowLeft') setAsideWidth(asideWidth() + step, true);
+  else if (e.key === 'ArrowRight') setAsideWidth(asideWidth() - step, true);
+  else return;
+  e.preventDefault();
+});
+try {
+  const saved = Number(localStorage.getItem('temanejo.asideWidth'));
+  if (saved) document.documentElement.style.setProperty('--aside-w', saved + 'px');
+} catch { /* storage unavailable */ }
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { readCss(); draw(); });
 
 // ------------------------------------------------------------------ legend

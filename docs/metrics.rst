@@ -95,8 +95,8 @@ Work
    Σ\ :sub:`t∈G` *w(t)*, and its share of T\ :sub:`1` in percent.
 
 Crit.
-   Σ\ :sub:`t∈G` of each task's work on the critical path. The column sums
-   to T\ :sub:`∞`.
+   Σ\ :sub:`t∈G` of each task's work on the critical path, and its share of
+   T\ :sub:`∞` in percent. The column sums to T\ :sub:`∞` (100 %).
 
 Average per task (tooltip)
    Work / number of tasks.
@@ -104,12 +104,13 @@ Average per task (tooltip)
 Every task belongs to exactly one group, so the rows add up to the totals of
 the process.
 
-The location shown is only as good as the address the runtime reports. LLVM
-``libomp`` 23 reports an address inside the runtime for tasks created by
-``taskloop`` (shown as ``__kmpc_taskloop (libomp.so)``) and for the implicit
-tasks of nested parallel regions (``__kmp_invoke_microtask (libomp.so)``).
-All tasks with such an address are grouped into one row, even if they come
-from different constructs.
+The location shown is only as good as the address the runtime reports.
+LLVM ``libomp`` 23 reports an address inside the runtime for tasks created by
+``taskloop`` (shown as ``__kmpc_taskloop (libomp.so)``, together with
+internal helper tasks of the runtime) and for the implicit tasks of nested
+parallel regions (``__kmp_invoke_microtask (libomp.so)``). All tasks with
+such an address are grouped into one row, even if they come from different
+constructs. Details are in :doc:`runtime-notes`.
 
 Per-process metrics
 -------------------

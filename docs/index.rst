@@ -40,5 +40,6 @@ and open the GUI at http://127.0.0.1:8700/:
    :caption: Reference
 
    trace-format
+   runtime-notes
    http-api
    man/temanejo

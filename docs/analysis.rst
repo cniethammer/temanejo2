@@ -156,7 +156,7 @@ Limitations
   barriers, which does not hold after cancellation.
 * For tasks created by ``taskloop`` and the implicit tasks of nested
   parallel regions, ``libomp`` reports a code address inside the runtime,
-  so their source location is not known (see :doc:`metrics`).
+  so their source location is not known (see :doc:`runtime-notes`).
 * ``detach`` clauses, target tasks and the pseudo tasks of
   ``taskwait depend(...)`` are recorded but not treated specially.
 * Clocks of different ranks are not aligned, and MPI communication is not

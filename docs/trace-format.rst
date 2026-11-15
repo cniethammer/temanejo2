@@ -260,7 +260,8 @@ Notes:
 Runtime-specific behaviour
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-These observations about LLVM ``libomp`` 23 matter when interpreting traces:
+These observations about LLVM ``libomp`` 23.1.4 matter when interpreting
+traces (see also :doc:`runtime-notes`):
 
 * The initial task is announced through ``task_create`` with the initial
   flag and again through ``implicit_task``; both carry the same id.
