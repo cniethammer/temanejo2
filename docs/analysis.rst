@@ -156,10 +156,12 @@ Limitations
 
 * Barrier joins assume that all threads of a team pass the same sequence of
   barriers, which does not hold after cancellation.
-* For the implicit tasks of nested parallel regions ``libomp`` reports a
-  code address inside the runtime, so their source location is not known.
-  Tasks created by ``taskloop`` are attributed to the construct by the tool,
-  including internal helper tasks of the runtime (see :doc:`runtime-notes`).
+* A construct whose runtime call the compiler turned into a tail call is
+  reported with a code address inside the runtime, so its source location
+  is not known unless the program is built with
+  ``-fno-optimize-sibling-calls``. Tasks created by ``taskloop`` are
+  attributed to the construct by the tool, including internal helper tasks
+  of the runtime (see :doc:`runtime-notes`).
 * ``detach`` clauses, target tasks and the pseudo tasks of
   ``taskwait depend(...)`` are recorded but not treated specially.
 * Clocks of different ranks are not aligned, and MPI communication is not

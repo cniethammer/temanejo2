@@ -106,24 +106,45 @@ origins table and a *taskloop* badge in the task details.
   are still marked as *taskloop*. The same happens with runtimes that report
   ``taskloop`` constructs without the ``work`` callback.
 
-Nested parallel regions: ``__kmp_invoke_microtask``
----------------------------------------------------
+Constructs compiled as tail calls: ``__kmp_invoke_microtask``
+-------------------------------------------------------------
 
-**What you see.** The implicit tasks of a parallel region that is nested
-inside another parallel region have the location
-``__kmp_invoke_microtask (libomp.so)``.
+**What you see.** The implicit tasks of a parallel region have the location
+``__kmp_invoke_microtask (libomp.so)`` instead of a source line. In the
+example program this happened to the inner of two nested regions:
 
-In the example program the outer region at line 68 is attributed correctly
-(``phase_nested``, line 68). The two instances of the inner region at line 70
-both report a ``parallel_begin`` return address inside
-``__kmp_invoke_microtask``, the runtime function that calls the outlined body
-of the outer region, rather than an address in the outlined function where
-the inner ``parallel`` construct is.
+.. code-block:: c
 
-**Consequences.** The task origins table shows one row
-``__kmp_invoke_microtask (libomp.so)`` for the implicit tasks of all nested
-regions. The parallel region of such a task in the task details shows the
-same location. Structure, timing and critical path are not affected.
+   #pragma omp parallel num_threads(2)      // line 68, reported correctly
+     {
+   #pragma omp parallel num_threads(2)      // line 70, reported inside libomp
+       { ... }
+     }
+
+**Cause.** This is an effect of compiler optimisation, not of libomp. OMPT
+identifies a construct by the return address of the runtime call it makes.
+The inner ``parallel`` is the last statement of the outer region's body, so
+clang at ``-O1`` and above compiles its call into the runtime as a *tail
+call* (``jmp __kmpc_fork_call``): the body's stack frame is released before
+the call, and the return address is that of the body's caller,
+``__kmp_invoke_microtask`` in the runtime. The same happens to any construct
+whose runtime call is the last action of a function or of an outlined region
+body.
+
+Because the frame no longer exists, the tool cannot recover the call site
+by unwinding the stack either: that finds the construct enclosing the body
+(here line 68) on the thread that forked the outer region, and the thread
+start routine of the C library on the others. This was tried and dropped.
+
+**Remedy.** Compile the application with ``-fno-optimize-sibling-calls``
+(clang and GCC). With it the example reports both instances of the inner
+region at line 70. The example's Makefile uses the flag. The cost is one
+call and return instead of a jump at such places.
+
+**Consequences without the flag.** The task origins table shows one row
+``__kmp_invoke_microtask (libomp.so)`` for the implicit tasks of all
+regions affected, and the task details point to this section. Structure,
+timing and critical path are not affected.
 
 Event details
 -------------

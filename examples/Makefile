@@ -2,7 +2,10 @@
 # Open MPI's wrapper is told to use clang through OMPI_CC.
 CC      = clang
 MPICC   = mpicc
-CFLAGS  = -fopenmp -g -O1
+# -fno-optimize-sibling-calls keeps the call site of constructs that end a
+# function or region body, so the tool can report their source line
+# (see docs/runtime-notes.rst).
+CFLAGS  = -fopenmp -g -O1 -fno-optimize-sibling-calls
 
 all: mpi_omp_tasks omp_tasks
 

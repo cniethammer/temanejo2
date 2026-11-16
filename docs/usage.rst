@@ -56,6 +56,10 @@ Preparing the application
   ``OMPI_CC=clang`` (``OMPI_CXX=clang++`` for C++).
 * Add ``-g`` so the server can map task creation sites to file and line.
   Optimisation can stay enabled.
+* Add ``-fno-optimize-sibling-calls`` to get the source line also for
+  constructs that end a function or the body of a parallel region; without
+  it they are reported with an address inside the OpenMP runtime (see
+  :doc:`runtime-notes`).
 * No code changes and no linking against the tool are needed.
 
 Attaching the tool

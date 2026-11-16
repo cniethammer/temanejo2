@@ -1429,7 +1429,11 @@ function renderTask() {
   if (cpus.length > 1) badges.push(`<span class="badge">moved between CPUs</span>`);
 
   let src = '<span class="muted">unknown</span>';
-  if (l) src = (l.file ? `<span class="mono">${esc(l.file)}:${l.line}</span>` : `<span class="mono">${esc(l.module)}</span> <span class="muted">(no debug info)</span>`) +
+  // An address inside the OpenMP runtime: the construct's call was most
+  // likely compiled as a tail call, which loses the call site.
+  const inRuntime = l && !l.file && (S.g.info || []).some(([k, v]) => k === 'omp.runtime_library' && v === l.module);
+  if (l) src = (l.file ? `<span class="mono">${esc(l.file)}:${l.line}</span>`
+    : `<span class="mono">${esc(l.module)}</span> <span class="muted">(${inRuntime ? 'inside the OpenMP runtime: the construct was probably compiled as a tail call; build with -fno-optimize-sibling-calls to get its source line' : 'no debug info'})</span>`) +
     ` <span class="muted mono">${esc(l.addr)}</span>`;
   const fn = funcName(l), outlined = fn && l.func !== fn;
   const func = !l ? '–' : fn
