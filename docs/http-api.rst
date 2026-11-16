@@ -100,14 +100,41 @@ The server has no authentication and binds to ``127.0.0.1`` by default.
    ``peak``, the largest number of them executing at the same time. Computed
    on request with a pass over the graph.
 
-``GET /api/rank/<rank>/gaps``
-   The run's time classified around the critical path (see
-   :doc:`metrics`, "Critical path gaps"): ``start`` and ``kind`` list
-   consecutive intervals by their begin and class (0 on the critical path,
-   1 gap with all threads busy, 2 gap with a critical task waiting, 3 gap
-   with threads idle); an interval ends where the next begins, the last
-   one at ``end``. ``total`` is the time per class. Computed on the first
-   request and kept.
+``POST /api/rank/<rank>/timeline``
+   What the timeline shows for a time range. Request body:
+   ``t0=<ns>&t1=<ns>&cols=<pixel columns>&mode=<colour mode>``, the mode
+   being one of the GUI's colour modes (``thread``, ``cpu``, ``numa``,
+   ``loc``, ``region``, ``kind``, ``work``, ``create``, ``start``,
+   ``wait``). The response echoes ``t0``, ``t1`` and ``cols`` and has one of
+   two forms:
+
+   ``kind: "segs"``
+      At most 4,000 segments touch the range. ``items`` lists them as
+      ``[thread, start, end, task, value, flags]``.
+   ``kind: "bins"``
+      More segments (``segments`` gives their number). ``rows`` has per
+      thread ``{thread, bins}``, with ``[column, busy, task, value, flags]``
+      for every column in which the thread executed anything: ``busy`` is
+      the fraction of the column's time, ``task`` the task taking most of
+      it.
+
+   ``value`` is the task's value in the colour mode (a category value as in
+   ``cats`` of the graph, or a time in ns). ``flags``: 1 the task is on the
+   critical path, 2 it is in the region analysed last (see ``/region``); for
+   a bin, the flags of all tasks in the column combined.
+
+   ``gaps`` is the critical path strip for the same range (see
+   :doc:`metrics`, "Critical path gaps"): ``total``, the time per class over
+   the whole run (class 0 on the critical path, 1 gap with all threads busy,
+   2 gap with a critical task waiting, 3 gap with threads idle), and either
+   ``iv``, the intervals in the range as ``[begin, end, class]`` if there
+   are at most 4,000, or ``cls``, the class taking most of each pixel
+   column (-1 outside the run).
+
+``POST /api/rank/<rank>/timeline-select``
+   The tasks with an execution segment overlapping a time range. Request
+   body: ``t0=<ns>&t1=<ns>``. Response: ``tasks``, their indices in
+   ascending order.
 
 ``POST /api/rank/<rank>/view``
    The dependence edges between the nodes that are visible when certain
@@ -191,6 +218,9 @@ The server has no authentication and binds to ``127.0.0.1`` by default.
       the other.
 
 ``POST /api/rank/<rank>/region``
+   (The server remembers the task set of the last request per rank, to
+   flag its tasks in ``/timeline`` answers; an empty body clears it.)
+
    Region analysis. Request body: task indices separated by commas, e.g.
    ``0,5,6,7``. Response:
 

@@ -31,7 +31,157 @@ struct Rank {
     /// False if the trace has no end marker: the run did not finish cleanly.
     complete: bool,
     /// Classification of the run's time around the critical path, computed on first request.
-    gaps_json: std::sync::OnceLock<String>,
+    gaps: std::sync::OnceLock<analysis::CriticalGaps>,
+    /// Execution segments per thread for timeline requests, built on first use.
+    timeline: std::sync::OnceLock<Vec<ThreadSegments>>,
+    /// The tasks of the region the GUI analysed last (empty: none); the
+    /// timeline marks them without the browser sending the list again.
+    selection: std::sync::RwLock<Vec<bool>>,
+}
+
+/// The execution segments of one thread, ordered by time (segments of a
+/// thread do not overlap).
+struct ThreadSegments {
+    thread: u32,
+    start: Vec<u64>,
+    end: Vec<u64>,
+    task: Vec<u32>,
+}
+
+fn thread_segments(m: &Model) -> Vec<ThreadSegments> {
+    let mut by_thread: std::collections::BTreeMap<u32, Vec<(u64, u64, u32)>> = Default::default();
+    for (i, t) in m.tasks.iter().enumerate() {
+        for s in t.segs.iter().filter(|s| s.end > s.start) {
+            by_thread.entry(s.thread).or_default().push((s.start, s.end, i as u32));
+        }
+    }
+    by_thread
+        .into_iter()
+        .map(|(thread, mut segs)| {
+            segs.sort_unstable();
+            ThreadSegments { thread, start: segs.iter().map(|s| s.0).collect(), end: segs.iter().map(|s| s.1).collect(), task: segs.iter().map(|s| s.2).collect() }
+        })
+        .collect()
+}
+
+/// Largest number of segments a timeline answer lists individually.
+const TIMELINE_MAX_SEGMENTS: usize = 4000;
+
+/// A value of `key=value&...` request parameters.
+fn param<'a>(params: &'a str, key: &str) -> Option<&'a str> {
+    params.split('&').find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+}
+
+/// What the timeline shows between `t0` and `t1` at a width of `cols` pixel
+/// columns, coloured by `mode` (the GUI's colour modes).
+///
+/// If the range holds few segments, they are listed (`"segs"`): `[thread,
+/// start, end, task, value, flags]`. Otherwise each thread's time is binned
+/// per pixel column (`"bins"`): `[column, busy fraction, task, value,
+/// flags]` for the columns in which the thread executed anything, `task`
+/// being the one taking most of the column. `value` is the task's value in
+/// the colour mode; flags: 1 on the critical path, 2 in the selected region
+/// (for bins: any task of the column). Both forms carry `gaps`, the critical
+/// path strip for the same window (`gap_strip_json`).
+fn timeline_json(r: &Rank, params: &str) -> String {
+    let m = &r.model;
+    let num = |key: &str| param(params, key).and_then(|v| v.parse::<f64>().ok());
+    let t0 = num("t0").unwrap_or(0.0).max(0.0);
+    let t1 = num("t1").unwrap_or(m.wall as f64).max(t0 + 1.0);
+    let cols = (num("cols").unwrap_or(1000.0) as usize).clamp(1, 8192);
+    let mode = param(params, "mode").unwrap_or("thread");
+    let rows = r.timeline.get_or_init(|| thread_segments(m));
+    let selection = r.selection.read().unwrap();
+    let value = |i: u32| -> i64 {
+        let t = &m.tasks[i as usize];
+        let seg = t.segs.first();
+        match mode {
+            "cpu" => seg.map_or(-1, |s| s.cpu as i64),
+            "numa" => seg.map_or(-1, |s| s.numa as i64),
+            "loc" => r.loc_of.get(&t.codeptr).map_or(-1, |&l| l as i64),
+            "region" => idx(t.parallel),
+            "kind" => t.kind as i64,
+            "work" => t.work as i64,
+            "create" => t.create_ts as i64,
+            "start" => analysis::task_start(t) as i64,
+            "wait" => analysis::task_start(t).saturating_sub(t.create_ts) as i64,
+            _ => analysis::task_thread(t),
+        }
+    };
+    let flags = |i: u32| (r.crit.task_time[i as usize] > 0) as u8 | (selection.get(i as usize).copied().unwrap_or(false) as u8) << 1;
+    // Index range of the segments of each thread that touch the window.
+    let (lo_t, hi_t) = (t0 as u64, t1.ceil() as u64);
+    let ranges: Vec<(usize, usize)> = rows.iter().map(|row| (row.end.partition_point(|&e| e <= lo_t), row.start.partition_point(|&s| s < hi_t))).collect();
+    let total: usize = ranges.iter().map(|&(a, b)| b.saturating_sub(a)).sum();
+    let mut o = String::new();
+    if total <= TIMELINE_MAX_SEGMENTS {
+        let _ = write!(o, "{{\"kind\":\"segs\",\"t0\":{t0},\"t1\":{t1},\"cols\":{cols},\"gaps\":{},\"items\":[", gap_strip_json(r, t0, t1, cols));
+        let mut first = true;
+        for (row, &(a, b)) in rows.iter().zip(&ranges) {
+            for j in a..b.max(a) {
+                let i = row.task[j];
+                let _ = write!(o, "{}[{},{},{},{},{},{}]", if first { "" } else { "," }, row.thread, row.start[j], row.end[j], i, value(i), flags(i));
+                first = false;
+            }
+        }
+        o.push_str("]}");
+        return o;
+    }
+    let per = (t1 - t0) / cols as f64;
+    let _ = write!(o, "{{\"kind\":\"bins\",\"t0\":{t0},\"t1\":{t1},\"cols\":{cols},\"segments\":{total},\"gaps\":{},\"rows\":[", gap_strip_json(r, t0, t1, cols));
+    let mut busy = vec![0f64; cols];
+    let mut best = vec![(0f64, 0u32); cols];
+    let mut flag = vec![0u8; cols];
+    for (k, (row, &(a, b))) in rows.iter().zip(&ranges).enumerate() {
+        busy.iter_mut().for_each(|v| *v = 0.0);
+        best.iter_mut().for_each(|v| *v = (0.0, 0));
+        flag.iter_mut().for_each(|v| *v = 0);
+        for j in a..b.max(a) {
+            let (fa, fb) = (((row.start[j] as f64).max(t0) - t0) / per, ((row.end[j] as f64).min(t1) - t0) / per);
+            let f = flags(row.task[j]);
+            for c in (fa as usize)..(fb.ceil() as usize).min(cols) {
+                let part = fb.min(c as f64 + 1.0) - fa.max(c as f64);
+                if part <= 0.0 {
+                    continue;
+                }
+                busy[c] += part;
+                flag[c] |= f;
+                if part > best[c].0 {
+                    best[c] = (part, row.task[j]);
+                }
+            }
+        }
+        let _ = write!(o, "{}{{\"thread\":{},\"bins\":[", if k > 0 { "," } else { "" }, row.thread);
+        let mut first = true;
+        for c in (0..cols).filter(|&c| busy[c] > 0.0) {
+            let _ = write!(o, "{}[{},{:.3},{},{},{}]", if first { "" } else { "," }, c, busy[c].min(1.0), best[c].1, value(best[c].1), flag[c]);
+            first = false;
+        }
+        o.push_str("]}");
+    }
+    o.push_str("]}");
+    o
+}
+
+/// The tasks with an execution segment overlapping the time range of the
+/// request (`t0`, `t1`), ascending.
+fn timeline_select_json(r: &Rank, params: &str) -> String {
+    let num = |key: &str| param(params, key).and_then(|v| v.parse::<f64>().ok());
+    let (t0, t1) = (num("t0").unwrap_or(0.0).max(0.0) as u64, num("t1").unwrap_or(0.0).max(0.0).ceil() as u64);
+    let rows = r.timeline.get_or_init(|| thread_segments(&r.model));
+    let mut tasks: Vec<u32> = Vec::new();
+    for row in rows {
+        let (a, b) = (row.end.partition_point(|&e| e < t0), row.start.partition_point(|&s| s <= t1));
+        if b > a {
+            tasks.extend_from_slice(&row.task[a..b]);
+        }
+    }
+    tasks.sort_unstable();
+    tasks.dedup();
+    let mut o = String::from("{\"tasks\":");
+    list(&mut o, tasks.iter());
+    o.push('}');
+    o
 }
 
 /// The groups of a rank for one maximum group size.
@@ -443,19 +593,33 @@ fn view_json(r: &Rank, grouping: &analysis::Grouping, body: &str) -> String {
     o
 }
 
-/// The run's time classified around the critical path (`analysis::critical_gaps`):
-/// consecutive intervals given by `start` (begin of each) and `kind` (0 on
-/// the path, 1 all threads busy, 2 critical task waiting, 3 idle); an
-/// interval ends where the next begins, the last at `end`. `total` is the
-/// time per kind.
-fn gaps_json(r: &Rank) -> String {
-    let gaps = analysis::critical_gaps(&r.model, &r.crit);
-    let mut o = String::from("{\"start\":");
-    list(&mut o, gaps.intervals.iter().map(|i| i.0));
-    o.push_str(",\"kind\":");
-    list(&mut o, gaps.intervals.iter().map(|i| i.2 as u8));
-    let _ = write!(o, ",\"end\":{},\"total\":", gaps.intervals.last().map_or(0, |i| i.1));
+/// The critical path strip for a time window: the run's time classified
+/// around the critical path (`analysis::critical_gaps`; class 0 on the path,
+/// 1 all threads busy, 2 critical task waiting, 3 idle). `total` is the time
+/// per class over the whole run. If the window holds few intervals they are
+/// listed in `iv` as `[begin, end, class]`; otherwise `cls` gives for each of
+/// the `cols` pixel columns the class taking most of it (-1: outside the run).
+fn gap_strip_json(r: &Rank, t0: f64, t1: f64, cols: usize) -> String {
+    let gaps = r.gaps.get_or_init(|| analysis::critical_gaps(&r.model, &r.crit));
+    let iv = &gaps.intervals;
+    let (a, b) = (iv.partition_point(|i| (i.1 as f64) <= t0), iv.partition_point(|i| (i.0 as f64) < t1));
+    let mut o = String::from("{\"total\":");
     list(&mut o, gaps.totals.iter());
+    if b.saturating_sub(a) <= TIMELINE_MAX_SEGMENTS {
+        o.push_str(",\"iv\":");
+        list(&mut o, iv[a..b.max(a)].iter().map(|&(x, y, k)| format!("[{x},{y},{}]", k as u8)));
+    } else {
+        let per = (t1 - t0) / cols as f64;
+        let mut time = vec![[0f64; 4]; cols];
+        for &(x, y, k) in &iv[a..b] {
+            let (fa, fb) = (((x as f64).max(t0) - t0) / per, ((y as f64).min(t1) - t0) / per);
+            for c in (fa as usize)..(fb.ceil() as usize).min(cols) {
+                time[c][k as usize] += (fb.min(c as f64 + 1.0) - fa.max(c as f64)).max(0.0);
+            }
+        }
+        o.push_str(",\"cls\":");
+        list(&mut o, time.iter().map(|t| (0..4).filter(|&k| t[k] > 0.0).max_by(|&x, &y| t[x].total_cmp(&t[y])).map_or(-1, |k| k as i32)));
+    }
     o.push('}');
     o
 }
@@ -597,7 +761,6 @@ fn handle(mut stream: TcpStream, info: &str, ranks: &[Rank]) {
                     }
                     respond(&mut stream, "200 OK", JSON, rank.view.read().unwrap().graph_json.as_bytes());
                 }
-                ("GET", Some(rank), "gaps") => respond(&mut stream, "200 OK", JSON, rank.gaps_json.get_or_init(|| gaps_json(rank)).as_bytes()),
                 ("POST", Some(rank), "view") => {
                     let json = view_json(rank, &rank.view.read().unwrap().grouping, &String::from_utf8_lossy(&body));
                     respond(&mut stream, "200 OK", JSON, json.as_bytes());
@@ -611,8 +774,24 @@ fn handle(mut stream: TcpStream, info: &str, ranks: &[Rank]) {
                     let json = group_summary_json(&analysis::summarize(&rank.model, &rank.crit, &members), &rank.loc_of);
                     respond(&mut stream, "200 OK", JSON, json.as_bytes());
                 }
+                ("POST", Some(rank), "timeline") => {
+                    let json = timeline_json(rank, &String::from_utf8_lossy(&body));
+                    respond(&mut stream, "200 OK", JSON, json.as_bytes());
+                }
+                ("POST", Some(rank), "timeline-select") => {
+                    let json = timeline_select_json(rank, &String::from_utf8_lossy(&body));
+                    respond(&mut stream, "200 OK", JSON, json.as_bytes());
+                }
                 ("POST", Some(rank), "region") => {
-                    let json = region_json(&rank.model, &String::from_utf8_lossy(&body));
+                    // Remember the region, so the timeline can mark its tasks.
+                    let body = String::from_utf8_lossy(&body);
+                    let mut selected = vec![false; rank.model.tasks.len()];
+                    let members = parse_indices(&body, selected.len());
+                    for &i in &members {
+                        selected[i as usize] = true;
+                    }
+                    *rank.selection.write().unwrap() = if members.is_empty() { Vec::new() } else { selected };
+                    let json = region_json(&rank.model, &body);
                     respond(&mut stream, "200 OK", JSON, json.as_bytes());
                 }
                 _ => respond(&mut stream, "404 Not Found", "text/plain", b"not found"),
@@ -660,7 +839,7 @@ fn load(dir: &str, max_group: usize) -> Vec<Rank> {
         let locs = symbolize::symbolize(&trace.syms);
         let loc_of: HashMap<u64, usize> = locs.iter().enumerate().map(|(i, l)| (l.addr, i)).collect();
         let empty = Grouped { grouping: analysis::Grouping { max_group: 0, groups: Vec::new(), task_group: Vec::new() }, graph_json: String::new() };
-        let rank = Rank { model, crit, locs, loc_of, view: std::sync::RwLock::new(empty), epoch_ns: trace.epoch_ns, complete: trace.complete, gaps_json: Default::default() };
+        let rank = Rank { model, crit, locs, loc_of, view: std::sync::RwLock::new(empty), epoch_ns: trace.epoch_ns, complete: trace.complete, gaps: Default::default(), timeline: Default::default(), selection: Default::default() };
         let grouped = rank.regroup(max_group);
         *rank.view.write().unwrap() = grouped;
         ranks.push(rank);

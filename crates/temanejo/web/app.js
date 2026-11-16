@@ -127,6 +127,18 @@ function seqColor(f) {
   return S.seqPalette.cols[Math.round(f * 63)];
 }
 
+// Colour for a task's value in the current colour mode, as the server
+// reports it for timeline items (see timeline_json in main.rs).
+function colorOfValue(v) {
+  const seq = SEQUENTIAL[S.colorBy];
+  if (seq) {
+    const { lo, hi } = S.seqRange, x = seq.log ? Math.log(Math.max(v, 1)) : v;
+    return seqColor(hi > lo ? Math.min(1, Math.max(0, (x - lo) / (hi - lo))) : 1);
+  }
+  const slot = S.catSlots.get(v);
+  return slot === undefined ? S.css.muted : S.css.cat[slot % 8];
+}
+
 function color(t) {
   const c = S.css, seq = SEQUENTIAL[S.colorBy];
   if (seq) {
@@ -189,6 +201,7 @@ async function loadRank(rank, maxGroup) {
   const g = await (await fetch(`api/rank/${rank}/graph` + (maxGroup ? `?max_group=${maxGroup}` : ''))).json();
   S.g = g;
   S.sel = -1; S.hover = -1;
+  S.tlData = null; S.selSerial = 0;
   const n = g.n;
   $('max-group').value = g.max_group;
   // Every task gets an entry; those inside groups are stubs until loaded.
@@ -222,8 +235,6 @@ async function loadRank(rank, maxGroup) {
   renderTask();
   renderLegend();
   fit();
-  // The timeline needs all tasks (see the view switch).
-  if (S.view === 'timeline') ensureLoaded().then(() => { if (S.g === g) draw(); });
 }
 
 // All tasks of a group: its direct tasks and those of its child groups.
@@ -970,87 +981,112 @@ function drawBand() {
 // ------------------------------------------------------------------ timeline
 
 const TL = { left: 86, top: 30, row: 30, bar: 20 };
+// The timeline is drawn from what the server sends for the visible time
+// range (S.tlData): the real segments when few are in view, else per thread
+// and pixel column the busy fraction and the task taking most of the column.
+// A range half a view wider on each side is requested, so panning has data
+// while the next answer is on its way.
+const tlCols = () => Math.max(1, Math.ceil(S.w - TL.left - 12));
+function timelineStale() {
+  const d = S.tlData, g = S.g;
+  if (!d || d.rank !== g.rank || d.mode !== S.colorBy || d.sel !== S.selSerial) return true;
+  if (S.tl.t0 < d.a && d.a > 0 || S.tl.t1 > d.b && d.b < g.wall) return true;
+  // Exact segments and intervals stay valid at any zoom; binned data does not.
+  if (d.kind !== 'bins' && !d.gaps.cls) return false;
+  const ratio = (S.tl.t1 - S.tl.t0) / tlCols() / d.per;   // visible time per pixel vs. per bin
+  return ratio < 0.6 || ratio > 1.6;
+}
+function requestTimeline() {
+  if (S.tlBusy) { S.tlAgain = true; return; }
+  const g = S.g, span = S.tl.t1 - S.tl.t0, cols = tlCols();
+  const a = Math.max(0, S.tl.t0 - span / 2), b = Math.min(Math.max(g.wall, 1), S.tl.t1 + span / 2);
+  const want = { rank: g.rank, mode: S.colorBy, sel: S.selSerial, a, b };
+  S.tlBusy = true;
+  fetch(`api/rank/${g.rank}/timeline`, { method: 'POST', body: `t0=${a}&t1=${b}&cols=${Math.round(cols * (b - a) / span)}&mode=${S.colorBy}` })
+    .then(r => r.json())
+    .then(d => { if (S.g === g) { S.tlData = Object.assign(d, want, { per: (d.t1 - d.t0) / d.cols }); renderLegend(); } })
+    .finally(() => {
+      S.tlBusy = false;
+      if (S.tlAgain) { S.tlAgain = false; if (S.view === 'timeline' && timelineStale()) requestTimeline(); }
+      if (S.view === 'timeline') draw();
+    });
+}
+// Calls f(row, x, width, busy fraction, task, value, flags) for every item
+// of the timeline data that is in view; flags: 1 critical, 2 selected.
+function eachTimelineItem(f) {
+  const d = S.tlData;
+  if (!d) return;
+  const rowOf = new Map(S.g.threads.map((t, i) => [t.id, i]));
+  if (d.kind === 'segs') {
+    for (const [th, a, b, task, v, fl] of d.items) {
+      if (b < S.tl.t0 || a > S.tl.t1) continue;
+      const row = rowOf.get(th); if (row === undefined) continue;
+      const x = tlX(a);
+      f(row, x, Math.max(tlX(b) - x, 0.6), 1, task, v, fl, true);
+    }
+    return;
+  }
+  for (const r of d.rows) {
+    const row = rowOf.get(r.thread); if (row === undefined) continue;
+    for (const [c, busy, task, v, fl] of r.bins) {
+      const a = d.t0 + c * d.per;
+      if (a + d.per < S.tl.t0 || a > S.tl.t1) continue;
+      const x = tlX(a);
+      f(row, x, tlX(a + d.per) - x, busy, task, v, fl, false);
+    }
+  }
+}
+
 // Critical path strip above the thread rows (with the "Critical path" overlay).
 const STRIP = { top: 24, height: 16 };
 const GAP_LABEL = ['critical path running', 'gap: all threads busy with other work', 'gap: critical task ready, a thread idle', 'gap: threads idle, no critical task ready'];
 const GAP_SHORT = ['on critical path', 'gap, threads busy', 'gap, critical task waiting', 'gap, idle'];
 
-// The classification of the run's time around the critical path, from the
-// server (analysis::critical_gaps), fetched once per rank. Kept as typed
-// arrays: interval j runs from st[j] to st[j + 1] and has class kd[j]. For
-// wide views, the time per class is summed up over GAP_BINS equal bins of
-// the run once; `cum` holds the running totals per class over the bins.
-const GAP_BINS = 1 << 16;
-function loadGaps() {
-  const g = S.g;
-  if (g.gaps || g.gapsLoading) return;
-  g.gapsLoading = fetch(`api/rank/${g.rank}/gaps`).then(r => r.json()).then(raw => {
-    if (S.g !== g) return;
-    const n = raw.kind.length, st = new Float64Array(n + 1), kd = Uint8Array.from(raw.kind);
-    st.set(raw.start); st[n] = raw.end;
-    const span = Math.max(raw.end, 1), width = span / GAP_BINS, bins = new Float64Array(GAP_BINS * 4);
-    for (let j = 0; j < n; j++) {
-      const fa = st[j] / width, fb = st[j + 1] / width;
-      for (let c = Math.floor(fa); c < Math.min(Math.ceil(fb), GAP_BINS); c++) bins[c * 4 + kd[j]] += (Math.min(fb, c + 1) - Math.max(fa, c)) * width;
-    }
-    const cum = new Float64Array((GAP_BINS + 1) * 4);
-    for (let c = 0; c < GAP_BINS; c++) for (let k = 0; k < 4; k++) cum[(c + 1) * 4 + k] = cum[c * 4 + k] + bins[c * 4 + k];
-    g.gaps = { st, kd, n, width, bins, cum, total: raw.total };
-    renderLegend();
-    draw();
-  });
-}
 const stripShown = () => S.showCrit && S.view === 'timeline';
 
+// The strip is part of the timeline data (S.tlData.gaps, see gap_strip_json
+// in main.rs): the exact intervals when few are in the window, else the
+// dominant class per pixel column of the requested window.
 function drawGapStrip() {
-  const gaps = S.g.gaps;
   ctx.fillStyle = S.css.ink2; ctx.textAlign = 'left';
   ctx.fillText('critical path', 10, STRIP.top + STRIP.height / 2);
-  if (!gaps) { loadGaps(); return; }
-  // Per pixel column the class that takes most of its time: classes change
-  // far faster than one pixel between fine-grained tasks, and drawing all
-  // intervals would let whichever class is drawn last dominate.
-  const x0 = TL.left, cols = Math.max(1, Math.ceil(S.w - TL.left - 12)), per = (S.tl.t1 - S.tl.t0) / cols;
-  const time = new Float64Array(cols * 4), { st, kd, n, width, bins, cum } = gaps;
-  if (per >= 4 * width) {
-    // Wide view: running totals over the bins, interpolated inside a bin.
-    const at = (x, k) => { const b = Math.min(Math.max(x, 0), GAP_BINS), i = Math.min(Math.floor(b), GAP_BINS - 1); return cum[i * 4 + k] + (b - i) * bins[i * 4 + k]; };
-    for (let c = 0; c < cols; c++) {
-      const a = (S.tl.t0 + c * per) / width, b = (S.tl.t0 + (c + 1) * per) / width;
-      for (let k = 0; k < 4; k++) time[c * 4 + k] = at(b, k) - at(a, k);
+  const d = S.tlData;
+  if (!d || !d.gaps) return;
+  const paths = [new Path2D(), new Path2D(), new Path2D(), new Path2D()], per = (d.t1 - d.t0) / d.cols;
+  if (d.gaps.iv) {
+    for (const [a, b, kind] of d.gaps.iv) {
+      if (b < S.tl.t0 || a > S.tl.t1) continue;
+      const x = tlX(a);
+      paths[kind].rect(x, STRIP.top, Math.max(tlX(b) - x, 0.6), STRIP.height);
     }
   } else {
-    // Narrow view: the intervals inside it.
-    let lo = 0, hi = n;
-    while (lo < hi) { const mid = (lo + hi) >> 1; if (st[mid + 1] < S.tl.t0) lo = mid + 1; else hi = mid; }
-    for (let j = lo; j < n && st[j] < S.tl.t1; j++) {
-      const fa = (Math.max(st[j], S.tl.t0) - S.tl.t0) / per, fb = (Math.min(st[j + 1], S.tl.t1) - S.tl.t0) / per;
-      for (let c = Math.max(0, Math.floor(fa)); c < Math.min(Math.ceil(fb), cols); c++) time[c * 4 + kd[j]] += Math.min(fb, c + 1) - Math.max(fa, c);
+    // Runs of equal class become one rectangle.
+    const cls = d.gaps.cls;
+    for (let c = 0, start = 0; c <= cls.length; c++) {
+      if (c < cls.length && cls[c] === cls[start]) continue;
+      if (cls[start] >= 0) { const x = tlX(d.t0 + start * per); paths[cls[start]].rect(x, STRIP.top, tlX(d.t0 + c * per) - x, STRIP.height); }
+      start = c;
     }
   }
-  const paths = [new Path2D(), new Path2D(), new Path2D(), new Path2D()];
-  let runStart = 0, runKind = -1;
-  for (let c = 0; c <= cols; c++) {
-    let kind = -1, best = 0;
-    if (c < cols) for (let k = 0; k < 4; k++) if (time[c * 4 + k] > best) { best = time[c * 4 + k]; kind = k; }
-    if (kind !== runKind) {
-      if (runKind >= 0) paths[runKind].rect(x0 + runStart, STRIP.top, c - runStart, STRIP.height);
-      runStart = c; runKind = kind;
-    }
-  }
-  for (let k = 0; k < 4; k++) { ctx.fillStyle = S.css.gap[k]; ctx.fill(paths[k]); }
+  ctx.save(); ctx.beginPath(); ctx.rect(TL.left, 0, S.w - TL.left, S.h); ctx.clip();
+  // Idle first, so the problem classes stay visible where exact intervals overlap a pixel.
+  for (const kind of [3, 1, 2, 0]) { ctx.fillStyle = S.css.gap[kind]; ctx.fill(paths[kind]); }
+  ctx.restore();
 }
 
-// The gap interval under the mouse as [begin, end, class], or null.
+// What the strip shows under the mouse: [begin, end, class, exact], or null.
 function pickGap(mx, my) {
-  const gaps = S.g.gaps;
-  if (!stripShown() || !gaps || mx < TL.left || my < STRIP.top - 2 || my > STRIP.top + STRIP.height + 2) return null;
-  const t = tlT(mx), { st, kd, n } = gaps;
-  if (t < st[0] || t > st[n]) return null;
-  let lo = 0, hi = n - 1;
-  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (st[mid] <= t) lo = mid; else hi = mid - 1; }
-  return [st[lo], st[lo + 1], kd[lo]];
+  const d = S.tlData;
+  if (!stripShown() || !d || !d.gaps || mx < TL.left || my < STRIP.top - 2 || my > STRIP.top + STRIP.height + 2) return null;
+  const t = tlT(mx);
+  if (d.gaps.iv) {
+    const iv = d.gaps.iv.find(i => i[0] <= t && t <= i[1]);
+    return iv ? [iv[0], iv[1], iv[2], true] : null;
+  }
+  const per = (d.t1 - d.t0) / d.cols, c = Math.floor((t - d.t0) / per);
+  return c >= 0 && c < d.gaps.cls.length && d.gaps.cls[c] >= 0 ? [d.t0 + c * per, d.t0 + (c + 1) * per, d.gaps.cls[c], false] : null;
 }
+
 const tlX = t => TL.left + (t - S.tl.t0) / (S.tl.t1 - S.tl.t0) * (S.w - TL.left - 12);
 const tlT = x => S.tl.t0 + (x - TL.left) / (S.w - TL.left - 12) * (S.tl.t1 - S.tl.t0);
 
@@ -1075,47 +1111,40 @@ function drawTimeline() {
   g.threads.forEach((t, i) => ctx.fillText(`thread ${t.id}`, 10, TL.top + i * TL.row + TL.row / 2));
   if (stripShown()) drawGapStrip();
 
+  if (timelineStale()) requestTimeline();
   ctx.save(); ctx.beginPath(); ctx.rect(TL.left, 0, S.w - TL.left, S.h); ctx.clip();
   // Batched like the graph: one path per fill colour and per kind of mark.
   const fills = new Map(), path = c => { let p = fills.get(c); if (!p) fills.set(c, p = new Path2D()); return p; };
   const fade = S.fadeOthers && S.region.size > 0;
   if (fade) path(css.axis);
   const critStrip = new Path2D(), regionBar = new Path2D();
-  g.tasks.forEach((t, i) => {
-    const inRegion = S.region.has(i), grey = fade && !inRegion;
-    for (const s of t.segs) {
-      if (s[5] < S.tl.t0 || s[4] > S.tl.t1) continue;
-      const row = rowOf.get(s[0]); if (row === undefined) continue;
-      const x = tlX(s[4]), w = Math.max(tlX(s[5]) - x, 0.6), y = TL.top + row * TL.row + (TL.row - TL.bar) / 2;
-      // A 1px surface gap separates adjacent segments once they are wide enough.
-      const wg = w > 3 ? w - 1 : w;
-      path(grey ? css.axis : color(t)).rect(x, y, wg, TL.bar);
-      if (grey) continue;
-      if (S.showCrit && t.cr > 0) critStrip.rect(x, y + TL.bar + 1, wg, 3);
-      if (inRegion && !S.fadeOthers) regionBar.rect(x, y - 4, wg, 2);
-    }
+  eachTimelineItem((row, x, w, busy, task, v, fl, exact) => {
+    const y = TL.top + row * TL.row + (TL.row - TL.bar) / 2;
+    // A real segment gets a 1px gap to its neighbour once it is wide enough;
+    // a pixel column is as tall as the thread was busy in it.
+    const wg = exact && w > 3 ? w - 1 : w, h = Math.max(busy * TL.bar, 1.5);
+    const grey = fade && !(fl & 2);
+    path(grey ? css.axis : colorOfValue(v)).rect(x, y + TL.bar - h, wg, h);
+    if (grey) return;
+    if (S.showCrit && (fl & 1)) critStrip.rect(x, y + TL.bar + 1, wg, 3);
+    if ((fl & 2) && !S.fadeOthers) regionBar.rect(x, y - 4, wg, 2);
   });
   for (const [c, p] of fills) { ctx.fillStyle = c; ctx.fill(p); }
   ctx.fillStyle = css.critical; ctx.fill(critStrip);
   ctx.fillStyle = css.ink; ctx.fill(regionBar);
   ctx.restore();
+  if (!S.tlData) { ctx.fillStyle = css.muted; ctx.textAlign = 'left'; ctx.fillText('Loading…', TL.left + 8, TL.top + TL.row / 2); }
 }
 
-// Outlines of the hovered and the selected task's segments.
+// Outlines of the hovered and the selected task's segments in view.
 function timelineOverlay() {
-  const rowOf = new Map(S.g.threads.map((t, i) => [t.id, i]));
   ctx.save(); ctx.beginPath(); ctx.rect(TL.left, 0, S.w - TL.left, S.h); ctx.clip();
   ctx.strokeStyle = S.css.ink;
-  for (const [i, lw] of [[S.hover, 1], [S.sel, 2]]) {
-    if (i < 0) continue;
-    ctx.lineWidth = lw;
-    for (const s of S.g.tasks[i].segs) {
-      if (s[5] < S.tl.t0 || s[4] > S.tl.t1) continue;
-      const row = rowOf.get(s[0]); if (row === undefined) continue;
-      const x = tlX(s[4]), w = Math.max(tlX(s[5]) - x, 0.6), y = TL.top + row * TL.row + (TL.row - TL.bar) / 2;
-      ctx.strokeRect(x - 1, y - 1, w + 1, TL.bar + 2);
-    }
-  }
+  eachTimelineItem((row, x, w, busy, task, v, fl, exact) => {
+    if (!exact || (task !== S.hover && task !== S.sel)) return;
+    ctx.lineWidth = task === S.sel ? 2 : 1;
+    ctx.strokeRect(x - 1, TL.top + row * TL.row + (TL.row - TL.bar) / 2 - 1, w + 1, TL.bar + 2);
+  });
   ctx.restore();
 }
 
@@ -1142,10 +1171,10 @@ function pick(mx, my) {
   }
   const row = Math.floor((my - TL.top) / TL.row), th = S.g.threads[row];
   if (!th || mx < TL.left) return -1;
-  const t = tlT(mx), slack = (S.tl.t1 - S.tl.t0) / S.w;
-  for (let i = 0; i < T.length; i++)
-    for (const s of T[i].segs) if (s[0] === th.id && s[4] - slack <= t && t <= s[5] + slack) return i;
-  return -1;
+  // The segment under the mouse, or the task taking most of that pixel column.
+  let found = -1;
+  eachTimelineItem((r, x, w, busy, task) => { if (r === row && mx >= x - 1 && mx <= x + w + 1) found = task; });
+  return found;
 }
 
 function showTip(i, mx, my) {
@@ -1157,7 +1186,9 @@ function showTip(i, mx, my) {
     loadGroupStats(grp);
   } else {
     const t = S.g.tasks[i];
-    tip.innerHTML = `<b>task ${t.id}</b> · ${KIND[t.k]} · ${fmt(t.w)}<br>${esc(locShort(S.g.locs[t.loc]))}`;
+    // A task that is not loaded is known by its id only; a click loads it.
+    tip.innerHTML = t.loaded ? `<b>task ${t.id}</b> · ${KIND[t.k]} · ${fmt(t.w)}<br>${esc(locShort(S.g.locs[t.loc]))}`
+      : `<b>task ${t.id}</b><br><span style="opacity:.75">click for details</span>`;
   }
   tip.hidden = false;
   tip.style.left = Math.min(mx + 14, S.w - tip.offsetWidth - 6) + 'px';
@@ -1183,8 +1214,10 @@ canvas.addEventListener('pointermove', e => {
     if (gap) {
       if (S.hover >= 0) { S.hover = -1; draw(true); }
       const tip = $('tip'), total = Math.max(S.g.wall, 1);
-      tip.innerHTML = `<b>${GAP_LABEL[gap[2]]}</b><br>${fmt(gap[0])} → ${fmt(gap[1])} (${fmt(gap[1] - gap[0])})<br>` +
-        `<span style="opacity:.75">${GAP_SHORT[gap[2]]} in total: ${fmt(S.g.gaps.total[gap[2]])} (${pctText(S.g.gaps.total[gap[2]], total)} % of the run)</span>`;
+      const totals = S.tlData.gaps.total;
+      tip.innerHTML = `<b>${GAP_LABEL[gap[2]]}</b><br>` +
+        (gap[3] ? `${fmt(gap[0])} → ${fmt(gap[1])} (${fmt(gap[1] - gap[0])})` : `most of ${fmt(gap[0])} → ${fmt(gap[1])}; zoom in for exact intervals`) + `<br>` +
+        `<span style="opacity:.75">${GAP_SHORT[gap[2]]} in total: ${fmt(totals[gap[2]])} (${pctText(totals[gap[2]], total)} % of the run)</span>`;
       tip.hidden = false;
       tip.style.left = Math.min(x + 14, S.w - tip.offsetWidth - 6) + 'px';
       tip.style.top = Math.max(y + 16, 4) + 'px';
@@ -1226,8 +1259,11 @@ canvas.addEventListener('pointerup', e => {
         if (x >= x0 && x <= x1 && y >= y0 && y <= y1) sel.add(i);
       });
     } else {
-      const [t0, t1] = [tlT(Math.min(d.x0, d.x)), tlT(Math.max(d.x0, d.x))];
-      T.forEach((t, i) => { if (t.segs.some(s => s[5] >= t0 && s[4] <= t1)) sel.add(i); });
+      // Which tasks ran in the time range is resolved by the server.
+      const [t0, t1] = [tlT(Math.min(d.x0, d.x)), tlT(Math.max(d.x0, d.x))], g = S.g;
+      fetch(`api/rank/${g.rank}/timeline-select`, { method: 'POST', body: `t0=${Math.max(t0, 0)}&t1=${Math.max(t1, 0)}` })
+        .then(r => r.json()).then(r => { if (S.g === g) setRegion(new Set(r.tasks)); });
+      return draw();
     }
     setRegion(sel);
   }
@@ -1263,8 +1299,6 @@ $('color').onchange = e => { S.colorBy = e.target.value; assignSlots(); renderLe
 for (const [id, key] of [['show-crit', 'showCrit'], ['show-create', 'showCreate'], ['show-dep', 'showDep'], ['fade-others', 'fadeOthers']])
   $(id).onchange = e => { S[key] = e.target.checked; renderLegend(); draw(); };
 for (const v of ['graph', 'timeline']) $('view-' + v).onclick = async () => {
-  // The timeline shows the segments of all tasks, so all groups are loaded.
-  if (v === 'timeline' && S.g) { const g = S.g; await ensureLoaded(); if (S.g !== g) return; }
   S.view = v;
   $('view-graph').setAttribute('aria-selected', v === 'graph'); $('view-timeline').setAttribute('aria-selected', v === 'timeline');
   $('hint').innerHTML = v === 'graph'
@@ -1365,10 +1399,11 @@ function renderLegend() {
     if (vals.length > 8) html += `<span class="muted">+${vals.length - 8} more reuse these colours – see the task details</span>`;
   }
   if (S.showCrit) html += `<span><span class="sw ring"></span>critical path</span>`;
-  if (stripShown() && g.gaps) {
+  const gapTotals = S.tlData && S.tlData.gaps && S.tlData.gaps.total;
+  if (stripShown() && gapTotals) {
     const total = Math.max(g.wall, 1);
     html += `<span class="muted">strip:</span>` + [0, 1, 2, 3].map(k =>
-      `<span title="${GAP_LABEL[k]}"><span class="sw" style="border-radius:2px;background:${S.css.gap[k]}"></span>${GAP_SHORT[k]} ${pctText(g.gaps.total[k], total)} %</span>`).join('');
+      `<span title="${GAP_LABEL[k]}"><span class="sw" style="border-radius:2px;background:${S.css.gap[k]}"></span>${GAP_SHORT[k]} ${pctText(gapTotals[k], total)} %</span>`).join('');
   }
   if (S.fadeOthers && S.region.size) html += `<span><span class="sw" style="background:${S.css.axis}"></span>not selected</span>`;
   html += `<span class="muted">○ explicit · □ implicit · ◇ initial${S.groups.some(x => x.drawn) ? ' · ▭ collapsed group (×tasks)' : ''}</span>`;
@@ -1467,13 +1502,19 @@ async function setRegion(sel) {
   const el = $('region');
   if (!sel.size) {
     el.innerHTML = '<p class="muted">Shift+drag over the graph (or a time range in the timeline) to analyse the degree of parallelism of a region.</p>';
-    return draw();
+    draw();
+    // The server keeps the region to mark it in the timeline; clear it there.
+    const g = S.g;
+    await fetch(`api/rank/${g.rank}/region`, { method: 'POST', body: '' });
+    if (S.g === g && S.region === sel) { S.selSerial = (S.selSerial || 0) + 1; if (S.view === 'timeline') draw(); }
+    return;
   }
   el.innerHTML = '<p class="muted">Analysing…</p>';
   draw();
   const rank = S.g.rank;
   const r = await (await fetch(`api/rank/${rank}/region`, { method: 'POST', body: [...sel].join(',') })).json();
   if (S.region !== sel) return; // superseded by a newer selection
+  S.selSerial = (S.selSerial || 0) + 1;   // the server now marks this region in the timeline
   S.regionInfo = r;
   S.regionCrit = new Map(r.crit_tasks);
   S.regionPairs = r.crit_edges;

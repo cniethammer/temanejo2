@@ -185,10 +185,10 @@ tasks a group shows are fetched from the server when it is expanded for the
 first time, or when one of them is needed, e.g. after entering its id in the
 *Task id* field; the dependence edges between the visible nodes are fetched
 with every collapse and expansion. Parallelism and peak in a group's tooltip
-are computed by the server when the group is first hovered. Three actions
+are computed by the server when the group is first hovered. Two actions
 need all tasks and load them in one piece: *Expand all* (which asks for
-confirmation above 50,000 tasks), the timeline view, and *Select parallel
-region*.
+confirmation above 50,000 tasks) and *Select parallel region*. The timeline
+does not load task records; see `Timeline view`_.
 
 Notes:
 
@@ -197,14 +197,33 @@ Notes:
   first is then placed above the others, and some edges point upwards.
 * Repeated executions of the same ``taskloop`` or loop by the same task
   form one group.
-* The timeline view always shows all tasks.
+* The timeline view always shows all tasks, whatever is collapsed in the
+  graph.
 
 Timeline view
 -------------
 
-One row per OpenMP thread, with the execution segments of all tasks over
-time. A red strip below a segment marks a critical-path task. Drag to pan,
-the wheel zooms the time axis.
+One row per OpenMP thread, with the execution of all tasks over time. A red
+strip below marks critical-path tasks. Drag to pan, the wheel zooms the time
+axis.
+
+The browser asks the server only for the visible time range, at the
+resolution of the window, so the timeline works the same for small and very
+large traces:
+
+* **Zoomed out**, each pixel column of a thread is one bar. Its height is
+  the fraction of that time the thread was executing tasks, its colour that
+  of the task taking most of the column, and the red strip appears if any
+  task in the column is on the critical path. Hovering or clicking refers to
+  that task.
+* **Zoomed in**, once at most 4,000 segments are in view, the real
+  execution segments are drawn, separated by a small gap, and each can be
+  hovered and clicked.
+
+Clicking shows the task's details, loading its record if necessary; the
+tooltip of a task that is not loaded yet shows only its id. Shift+drag
+selects the tasks that executed in a time range; with *Grey out unselected*
+everything else is grey, also when zoomed out.
 
 **Critical path strip.** With the *Critical path* overlay on, a strip above
 the threads shows for every moment of the run what happens with respect to
@@ -232,12 +251,14 @@ the critical path:
      - gap: threads are idle and no critical task is ready
      - runtime overhead between tasks, or time spent outside tasks
 
-Each pixel column shows the class that takes most of its time, so short
-intervals between fine-grained tasks only become visible when zoomed in.
-Hovering the strip shows the interval under the mouse; the legend gives the
-share of each class in the whole run. The definitions are in
-:doc:`metrics`, "Critical path gaps". The classification is computed by
-the server when the strip is first shown.
+Like the thread rows, the strip is fetched for the visible range: zoomed
+out, each pixel column shows the class that takes most of its time, so
+short intervals between fine-grained tasks only become visible when zoomed
+in; then the exact intervals are drawn. Hovering the strip shows the
+interval or column under the mouse; the legend gives the share of each
+class in the whole run. The definitions are in :doc:`metrics`, "Critical
+path gaps". The classification is computed by the server when the timeline
+is first shown.
 
 Run information
 ---------------
