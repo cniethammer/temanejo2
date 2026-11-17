@@ -10,14 +10,9 @@ use crate::model::Model;
 
 pub fn layout(m: &Model) -> Vec<(f32, f32)> {
     let n = m.tasks.len();
-    let mut preds: Vec<Vec<u32>> = vec![vec![]; n];
-    let mut succs: Vec<Vec<u32>> = vec![vec![]; n];
-    let mut indeg = vec![0u32; n];
-    for e in &m.edges {
-        preds[e.to as usize].push(e.from);
-        succs[e.from as usize].push(e.to);
-        indeg[e.to as usize] += 1;
-    }
+    let preds = Adjacency::new(n, || m.edges().map(|e| (e.to, e.from)));
+    let succs = Adjacency::new(n, || m.edges().map(|e| (e.from, e.to)));
+    let mut indeg: Vec<u32> = (0..n).map(|i| preds.of(i).len() as u32).collect();
 
     let mut layer = vec![0u32; n];
     let mut queue: Vec<u32> = (0..n as u32).filter(|&i| indeg[i as usize] == 0).collect();
@@ -25,7 +20,7 @@ pub fn layout(m: &Model) -> Vec<(f32, f32)> {
     while head < queue.len() {
         let u = queue[head] as usize;
         head += 1;
-        for &v in &succs[u] {
+        for &v in succs.of(u) {
             let v = v as usize;
             layer[v] = layer[v].max(layer[u] + 1);
             indeg[v] -= 1;
@@ -48,7 +43,7 @@ pub fn layout(m: &Model) -> Vec<(f32, f32)> {
         let mut keyed: Vec<(f32, u32)> = nodes
             .iter()
             .map(|&v| {
-                let p = &preds[v as usize];
+                let p = preds.of(v as usize);
                 let key = if p.is_empty() {
                     0.0
                 } else {
@@ -72,4 +67,34 @@ pub fn layout(m: &Model) -> Vec<(f32, f32)> {
         }
     }
     pos
+}
+
+/// Lists of neighbours of every node in one array, each list in the order
+/// of the pairs (`Vec<Vec<_>>` would cost 24 bytes per node more).
+struct Adjacency {
+    start: Vec<u32>,
+    list: Vec<u32>,
+}
+
+impl Adjacency {
+    fn new<I: Iterator<Item = (u32, u32)>>(n: usize, pairs: impl Fn() -> I) -> Adjacency {
+        let mut start = vec![0u32; n + 1];
+        for (a, _) in pairs() {
+            start[a as usize + 1] += 1;
+        }
+        for i in 0..n {
+            start[i + 1] += start[i];
+        }
+        let mut fill = start.clone();
+        let mut list = vec![0u32; start[n] as usize];
+        for (a, b) in pairs() {
+            list[fill[a as usize] as usize] = b;
+            fill[a as usize] += 1;
+        }
+        Adjacency { start, list }
+    }
+
+    fn of(&self, i: usize) -> &[u32] {
+        &self.list[self.start[i] as usize..self.start[i + 1] as usize]
+    }
 }

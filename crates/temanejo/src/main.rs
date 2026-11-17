@@ -23,8 +23,11 @@ struct Rank {
     /// Source locations and the index of each code address in them.
     locs: Vec<Loc>,
     loc_of: HashMap<u64, usize>,
-    /// The task groups for the current maximum group size and the collapsed
-    /// graph built from them; replaced when a client asks for another size.
+    /// Task origins and the peak concurrency of the whole run.
+    origins: Vec<analysis::Origin>,
+    peak: u32,
+    /// The task groups for the current maximum group size; replaced when a
+    /// client asks for another size.
     view: std::sync::RwLock<Grouped>,
     /// Wall-clock time (ns since the Unix epoch) when the tool started in this process.
     epoch_ns: u64,
@@ -39,27 +42,28 @@ struct Rank {
     selection: std::sync::RwLock<Vec<bool>>,
 }
 
-/// The execution segments of one thread, ordered by time (segments of a
-/// thread do not overlap).
+/// The execution segments of one thread (indices for `Model::seg`), ordered
+/// by time (segments of a thread do not overlap, so their ends are ordered too).
 struct ThreadSegments {
     thread: u32,
-    start: Vec<u64>,
-    end: Vec<u64>,
-    task: Vec<u32>,
+    segs: Vec<u32>,
 }
 
 fn thread_segments(m: &Model) -> Vec<ThreadSegments> {
-    let mut by_thread: std::collections::BTreeMap<u32, Vec<(u64, u64, u32)>> = Default::default();
-    for (i, t) in m.tasks.iter().enumerate() {
-        for s in t.segs.iter().filter(|s| s.end > s.start) {
-            by_thread.entry(s.thread).or_default().push((s.start, s.end, i as u32));
+    let mut by_thread: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+    for k in 0..m.seg_count() as u32 {
+        let s = m.seg(k);
+        if s.end > s.start {
+            by_thread.entry(s.thread).or_default().push(k);
         }
     }
     by_thread
         .into_iter()
         .map(|(thread, mut segs)| {
-            segs.sort_unstable();
-            ThreadSegments { thread, start: segs.iter().map(|s| s.0).collect(), end: segs.iter().map(|s| s.1).collect(), task: segs.iter().map(|s| s.2).collect() }
+            // Segment indices ascend with the task, as in (start, end, task) order.
+            segs.sort_unstable_by_key(|&k| (m.seg(k).start, m.seg(k).end, k));
+            segs.shrink_to_fit();
+            ThreadSegments { thread, segs }
         })
         .collect()
 }
@@ -94,7 +98,7 @@ fn timeline_json(r: &Rank, params: &str) -> String {
     let selection = r.selection.read().unwrap();
     let value = |i: u32| -> i64 {
         let t = &m.tasks[i as usize];
-        let seg = t.segs.first();
+        let seg = m.segs(i as usize).first();
         match mode {
             "cpu" => seg.map_or(-1, |s| s.cpu as i64),
             "numa" => seg.map_or(-1, |s| s.numa as i64),
@@ -103,24 +107,25 @@ fn timeline_json(r: &Rank, params: &str) -> String {
             "kind" => t.kind as i64,
             "work" => t.work as i64,
             "create" => t.create_ts as i64,
-            "start" => analysis::task_start(t) as i64,
-            "wait" => analysis::task_start(t).saturating_sub(t.create_ts) as i64,
-            _ => analysis::task_thread(t),
+            "start" => analysis::task_start(m, i as usize) as i64,
+            "wait" => analysis::task_start(m, i as usize).saturating_sub(t.create_ts) as i64,
+            _ => analysis::task_thread(m, i as usize),
         }
     };
-    let flags = |i: u32| (r.crit.task_time[i as usize] > 0) as u8 | (selection.get(i as usize).copied().unwrap_or(false) as u8) << 1;
+    let flags = |i: u32| (r.crit.time(i) > 0) as u8 | (selection.get(i as usize).copied().unwrap_or(false) as u8) << 1;
     // Index range of the segments of each thread that touch the window.
     let (lo_t, hi_t) = (t0 as u64, t1.ceil() as u64);
-    let ranges: Vec<(usize, usize)> = rows.iter().map(|row| (row.end.partition_point(|&e| e <= lo_t), row.start.partition_point(|&s| s < hi_t))).collect();
+    let ranges: Vec<(usize, usize)> =
+        rows.iter().map(|row| (row.segs.partition_point(|&k| m.seg(k).end <= lo_t), row.segs.partition_point(|&k| m.seg(k).start < hi_t))).collect();
     let total: usize = ranges.iter().map(|&(a, b)| b.saturating_sub(a)).sum();
     let mut o = String::new();
     if total <= TIMELINE_MAX_SEGMENTS {
         let _ = write!(o, "{{\"kind\":\"segs\",\"t0\":{t0},\"t1\":{t1},\"cols\":{cols},\"gaps\":{},\"items\":[", gap_strip_json(r, t0, t1, cols));
         let mut first = true;
         for (row, &(a, b)) in rows.iter().zip(&ranges) {
-            for j in a..b.max(a) {
-                let i = row.task[j];
-                let _ = write!(o, "{}[{},{},{},{},{},{}]", if first { "" } else { "," }, row.thread, row.start[j], row.end[j], i, value(i), flags(i));
+            for &k in &row.segs[a..b.max(a)] {
+                let (s, i) = (m.seg(k), m.seg_task(k));
+                let _ = write!(o, "{}[{},{},{},{},{},{}]", if first { "" } else { "," }, row.thread, s.start, s.end, i, value(i), flags(i));
                 first = false;
             }
         }
@@ -136,9 +141,10 @@ fn timeline_json(r: &Rank, params: &str) -> String {
         busy.iter_mut().for_each(|v| *v = 0.0);
         best.iter_mut().for_each(|v| *v = (0.0, 0));
         flag.iter_mut().for_each(|v| *v = 0);
-        for j in a..b.max(a) {
-            let (fa, fb) = (((row.start[j] as f64).max(t0) - t0) / per, ((row.end[j] as f64).min(t1) - t0) / per);
-            let f = flags(row.task[j]);
+        for &k in &row.segs[a..b.max(a)] {
+            let (s, task) = (m.seg(k), m.seg_task(k));
+            let (fa, fb) = (((s.start as f64).max(t0) - t0) / per, ((s.end as f64).min(t1) - t0) / per);
+            let f = flags(task);
             for c in (fa as usize)..(fb.ceil() as usize).min(cols) {
                 let part = fb.min(c as f64 + 1.0) - fa.max(c as f64);
                 if part <= 0.0 {
@@ -147,7 +153,7 @@ fn timeline_json(r: &Rank, params: &str) -> String {
                 busy[c] += part;
                 flag[c] |= f;
                 if part > best[c].0 {
-                    best[c] = (part, row.task[j]);
+                    best[c] = (part, task);
                 }
             }
         }
@@ -168,12 +174,13 @@ fn timeline_json(r: &Rank, params: &str) -> String {
 fn timeline_select_json(r: &Rank, params: &str) -> String {
     let num = |key: &str| param(params, key).and_then(|v| v.parse::<f64>().ok());
     let (t0, t1) = (num("t0").unwrap_or(0.0).max(0.0) as u64, num("t1").unwrap_or(0.0).max(0.0).ceil() as u64);
-    let rows = r.timeline.get_or_init(|| thread_segments(&r.model));
+    let m = &r.model;
+    let rows = r.timeline.get_or_init(|| thread_segments(m));
     let mut tasks: Vec<u32> = Vec::new();
     for row in rows {
-        let (a, b) = (row.end.partition_point(|&e| e < t0), row.start.partition_point(|&s| s <= t1));
+        let (a, b) = (row.segs.partition_point(|&k| m.seg(k).end < t0), row.segs.partition_point(|&k| m.seg(k).start <= t1));
         if b > a {
-            tasks.extend_from_slice(&row.task[a..b]);
+            tasks.extend(row.segs[a..b].iter().map(|&k| m.seg_task(k)));
         }
     }
     tasks.sort_unstable();
@@ -184,18 +191,17 @@ fn timeline_select_json(r: &Rank, params: &str) -> String {
     o
 }
 
-/// The groups of a rank for one maximum group size.
+/// The groups of a rank for one maximum group size, with their summaries.
 struct Grouped {
     grouping: analysis::Grouping,
-    /// What the GUI loads first: the graph with all groups collapsed.
-    graph_json: String,
+    summaries: Vec<analysis::Summary>,
 }
 
 impl Rank {
     fn regroup(&self, max_group: usize) -> Grouped {
         let grouping = analysis::group_tasks(&self.model, max_group);
-        let graph_json = graph_json(&self.model, &self.crit, &self.locs, &self.loc_of, &grouping);
-        Grouped { grouping, graph_json }
+        let summaries = analysis::summarize_groups(&self.model, &self.crit, &grouping);
+        Grouped { grouping, summaries }
     }
 }
 
@@ -253,12 +259,12 @@ type DepLists = HashMap<u32, (Vec<u32>, Vec<u32>)>;
 
 fn dep_lists(m: &Model, wanted: &[bool]) -> DepLists {
     let mut lists = DepLists::new();
-    for e in m.edges.iter().filter(|e| e.kind == model::EdgeKind::Depend) {
-        if wanted[e.to as usize] {
-            lists.entry(e.to).or_default().0.push(e.from);
+    for (from, to) in m.depends() {
+        if wanted[to as usize] {
+            lists.entry(to).or_default().0.push(from);
         }
-        if wanted[e.from as usize] {
-            lists.entry(e.from).or_default().1.push(e.to);
+        if wanted[from as usize] {
+            lists.entry(from).or_default().1.push(to);
         }
     }
     lists
@@ -284,7 +290,7 @@ fn task_json(o: &mut String, m: &Model, crit: &PathResult, loc_of: &HashMap<u64,
         t.end,
         t.work,
         t.taskloop as u8,
-        crit.task_time[i]
+        crit.time(i as u32)
     );
     if let Some((x, y)) = pos {
         let _ = write!(o, "\"x\":{x},\"y\":{y},");
@@ -300,22 +306,22 @@ fn task_json(o: &mut String, m: &Model, crit: &PathResult, loc_of: &HashMap<u64,
         o.push(',');
     }
     o.push_str("\"segs\":[");
-    for (j, s) in t.segs.iter().enumerate() {
+    for (j, s) in m.segs(i).iter().enumerate() {
         let _ = write!(o, "{}[{},{},{},{},{},{}]", if j > 0 { "," } else { "" }, s.thread, s.cpu, s.cpu_end, s.numa, s.start, s.end);
     }
     o.push_str("],\"deps\":[");
-    for (j, d) in t.deps.iter().enumerate() {
-        let _ = write!(o, "{}[\"{:#x}\",{}]", if j > 0 { "," } else { "" }, d.0, d.1);
+    for (j, d) in m.deps(i).iter().enumerate() {
+        let _ = write!(o, "{}[\"{:#x}\",{}]", if j > 0 { "," } else { "" }, d.addr, d.kind);
     }
     o.push_str("]}");
 }
 
 /// Rank header, threads, source locations and parallel regions (without the
 /// closing brace), shared by the full and the collapsed graph.
-fn header_json(m: &Model, crit: &PathResult, locs: &[Loc], loc_of: &HashMap<u64, usize>) -> String {
-    let loc = |addr: u64| loc_of.get(&addr).map_or(-1, |&i| i as i64);
-    let peak = analysis::analyze_region(m, &vec![true; m.tasks.len()]).max_concurrency;
-    let mut o = String::with_capacity(m.tasks.len() * 200);
+fn header_json(r: &Rank) -> String {
+    let (m, crit, locs, peak) = (&r.model, &r.crit, &r.locs, r.peak);
+    let loc = |addr: u64| r.loc_of.get(&addr).map_or(-1, |&i| i as i64);
+    let mut o = String::new();
     let _ = write!(
         o,
         "{{\"rank\":{},\"host\":{},\"pid\":{},\"wall\":{},\"work\":{},\"critical\":{},\"peak\":{},",
@@ -367,14 +373,14 @@ fn header_json(m: &Model, crit: &PathResult, locs: &[Loc], loc_of: &HashMap<u64,
 
 /// Task origins; "k" is a bit set: 1 parallel region (implicit tasks),
 /// 2 task construct, 4 taskloop.
-fn origins_json(m: &Model, crit: &PathResult, loc_of: &HashMap<u64, usize>) -> String {
-    let loc = |addr: u64| loc_of.get(&addr).map_or(-1, |&i| i as i64);
-    let mut o = String::from("[");
-    for (i, g) in analysis::origins(m, crit).iter().enumerate() {
+fn origins_json(o: &mut Json, r: &Rank) {
+    let loc = |addr: u64| r.loc_of.get(&addr).map_or(-1, |&i| i as i64);
+    o.push('[');
+    for (i, g) in r.origins.iter().enumerate() {
         let kinds = g.has_implicit as u8 | (g.has_explicit as u8) << 1 | (g.has_taskloop as u8) << 2;
         let _ = write!(
             o,
-            "{}{{\"initial\":{},\"loc\":{},\"k\":{},\"n\":{},\"w\":{},\"cr\":{},\"own_cr\":{},\"peak\":{},\"tasks\":[",
+            "{}{{\"initial\":{},\"loc\":{},\"k\":{},\"n\":{},\"w\":{},\"cr\":{},\"own_cr\":{},\"peak\":{},\"tasks\":",
             if i > 0 { "," } else { "" },
             g.initial as u8,
             if g.initial { -1 } else { loc(g.codeptr) },
@@ -385,33 +391,104 @@ fn origins_json(m: &Model, crit: &PathResult, loc_of: &HashMap<u64, usize>) -> S
             g.own_critical,
             g.peak
         );
-        for (j, t) in g.tasks.iter().enumerate() {
-            let _ = write!(o, "{}{}", if j > 0 { "," } else { "" }, t);
-        }
-        o.push_str("]}");
+        int_list(o, g.tasks.iter().map(|&t| t as i64));
+        o.push('}');
     }
     o.push(']');
-    o
 }
 
 /// The complete graph of a rank in one document, with a server-side layout.
-fn full_json(m: &Model, crit: &PathResult, locs: &[Loc], loc_of: &HashMap<u64, usize>) -> String {
+fn full_json(o: &mut Json, r: &Rank) {
+    let (m, crit, loc_of) = (&r.model, &r.crit, &r.loc_of);
     let pos = layout::layout(m);
-    let mut o = header_json(m, crit, locs, loc_of);
+    o.push_str(&header_json(r));
     o.push_str(",\"tasks\":[");
     for i in 0..m.tasks.len() {
         if i > 0 {
             o.push(',');
         }
-        task_json(&mut o, m, crit, loc_of, i, Some(pos[i]), None);
+        o.spill();
+        task_json(o, m, crit, loc_of, i, Some(pos[i]), None);
     }
-    let _ = write!(o, "],\"origins\":{},\"edges\":[", origins_json(m, crit, loc_of));
-    for (i, e) in m.edges.iter().enumerate() {
+    o.push_str("],\"origins\":");
+    origins_json(o, r);
+    o.push_str(",\"edges\":[");
+    for (i, e) in m.edges().enumerate() {
         let on_path = crit.transitions.contains(&(e.from, e.to)) || crit.transitions.contains(&(e.to, e.from));
+        o.spill();
         let _ = write!(o, "{}[{},{},{},{}]", if i > 0 { "," } else { "" }, e.from, e.to, e.kind as u8, on_path as u8);
     }
     o.push_str("]}");
-    o
+}
+
+/// A JSON document being written. With a sink it is sent in pieces while it
+/// is written (`spill`), so documents with an entry per task (tens of MB for
+/// a large trace) are never held in memory as a whole.
+struct Json<'a> {
+    s: String,
+    sink: Option<&'a mut dyn Write>,
+}
+
+impl Json<'_> {
+    /// Size from which the written part is sent.
+    const PIECE: usize = 64 << 10;
+
+    /// Sends what was written so far if it is large enough.
+    fn spill(&mut self) {
+        if self.s.len() >= Self::PIECE {
+            if let Some(w) = self.sink.as_mut() {
+                // A client that went away is noticed at the end.
+                let _ = w.write_all(self.s.as_bytes());
+                self.s.clear();
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for Json<'_> {
+    type Target = String;
+    fn deref(&self) -> &String {
+        &self.s
+    }
+}
+
+impl std::ops::DerefMut for Json<'_> {
+    fn deref_mut(&mut self) -> &mut String {
+        &mut self.s
+    }
+}
+
+/// Appends an integer in decimal; much faster than formatting, which
+/// matters for the lists with an entry per task.
+fn int(o: &mut String, v: i64) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    let mut u = v.unsigned_abs();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 {
+            break;
+        }
+    }
+    if v < 0 {
+        o.push('-');
+    }
+    o.push_str(std::str::from_utf8(&digits[at..]).unwrap());
+}
+
+/// A JSON array of integers.
+fn int_list(o: &mut Json, values: impl Iterator<Item = i64>) {
+    o.push('[');
+    for (i, v) in values.enumerate() {
+        if i > 0 {
+            o.push(',');
+        }
+        o.spill();
+        int(o, v);
+    }
+    o.push(']');
 }
 
 fn list<T: std::fmt::Display>(o: &mut String, values: impl Iterator<Item = T>) {
@@ -467,29 +544,34 @@ fn group_summary_json(s: &analysis::Summary, loc_of: &HashMap<u64, usize>) -> St
 ///
 /// The records of a group's direct tasks are served by `group_json`, the
 /// dependence edges between the visible nodes by `view_json`.
-fn graph_json(m: &Model, crit: &PathResult, locs: &[Loc], loc_of: &HashMap<u64, usize>, grouping: &analysis::Grouping) -> String {
+///
+/// The document has about 30 bytes per task; it is written for each request
+/// and not kept.
+fn graph_json(o: &mut Json, r: &Rank, grouped: &Grouped) {
     use std::collections::BTreeSet;
+    let (m, crit, loc_of, grouping) = (&r.model, &r.crit, &r.loc_of, &grouped.grouping);
     let loc = |addr: u64| loc_of.get(&addr).map_or(-1, |&i| i as i64);
     let n = m.tasks.len();
-    let mut o = header_json(m, crit, locs, loc_of);
+    o.push_str(&header_json(r));
     let _ = write!(o, ",\"n\":{n},\"ids\":");
-    list(&mut o, m.tasks.iter().map(|t| t.id));
+    // Ids above i64::MAX would not survive as JSON numbers in the browser either.
+    int_list(o, m.tasks.iter().map(|t| t.id as i64));
     o.push_str(",\"par\":");
-    list(&mut o, m.tasks.iter().map(|t| idx(t.parent)));
+    int_list(o, m.tasks.iter().map(|t| idx(t.parent)));
     o.push_str(",\"crit\":");
-    list(&mut o, crit.task_time.iter().enumerate().filter(|(_, &c)| c > 0).map(|(i, c)| format!("[{i},{c}]")));
+    list(o, crit.tasks.iter().map(|(i, c)| format!("[{i},{c}]")));
     o.push_str(",\"cc\":");
     let on_path = |a: u32, b: u32| crit.transitions.contains(&(a, b)) || crit.transitions.contains(&(b, a));
-    list(&mut o, m.tasks.iter().enumerate().filter(|(i, t)| t.parent != NONE && on_path(t.parent, *i as u32)).map(|(i, _)| i));
+    list(o, m.tasks.iter().enumerate().filter(|(i, t)| t.parent != NONE && on_path(t.parent, *i as u32)).map(|(i, _)| i));
 
     // Category values and time ranges over all tasks; the rules match
     // catValue and SEQUENTIAL in web/app.js.
     let mut cats: [BTreeSet<i64>; 6] = Default::default();
     let mut ranges = [[u64::MAX, 0u64]; 4];
-    for t in &m.tasks {
-        let seg = t.segs.first();
-        let start = analysis::task_start(t);
-        cats[0].insert(analysis::task_thread(t));
+    for (i, t) in m.tasks.iter().enumerate() {
+        let seg = m.segs(i).first();
+        let start = analysis::task_start(m, i);
+        cats[0].insert(analysis::task_thread(m, i));
         cats[1].insert(seg.map_or(-1, |s| s.cpu as i64));
         cats[2].insert(seg.map_or(-1, |s| s.numa as i64));
         cats[3].insert(loc(t.codeptr));
@@ -503,7 +585,7 @@ fn graph_json(m: &Model, crit: &PathResult, locs: &[Loc], loc_of: &HashMap<u64, 
     o.push_str(",\"cats\":{");
     for (i, name) in ["thread", "cpu", "numa", "loc", "region", "kind"].iter().enumerate() {
         let _ = write!(o, "{}\"{name}\":", if i > 0 { "," } else { "" });
-        list(&mut o, cats[i].iter());
+        list(o, cats[i].iter());
     }
     o.push_str("},\"ranges\":{");
     for (i, name) in ["work", "create", "start", "wait"].iter().enumerate() {
@@ -519,10 +601,11 @@ fn graph_json(m: &Model, crit: &PathResult, locs: &[Loc], loc_of: &HashMap<u64, 
             o.push(',');
         }
         first = false;
-        task_json(&mut o, m, crit, loc_of, i, None, Some(&deps));
+        o.spill();
+        task_json(o, m, crit, loc_of, i, None, Some(&deps));
     }
     o.push_str("],\"groups\":[");
-    let summaries = analysis::summarize_groups(m, crit, grouping);
+    let summaries = &grouped.summaries;
     for (g, grp) in grouping.groups.iter().enumerate() {
         let kind = match grp.kind {
             analysis::GroupKind::Taskloop => "taskloop",
@@ -540,13 +623,14 @@ fn graph_json(m: &Model, crit: &PathResult, locs: &[Loc], loc_of: &HashMap<u64, 
             grp.rep,
             group_summary_json(&summaries[g], loc_of)
         );
-        list(&mut o, grp.tasks.iter());
+        int_list(o, grp.tasks.iter().map(|&t| t as i64));
         o.push_str(",\"sub\":");
-        list(&mut o, grp.children.iter());
+        list(o, grp.children.iter());
         o.push('}');
     }
-    let _ = write!(o, "],\"origins\":{}}}", origins_json(m, crit, loc_of));
-    o
+    o.push_str("],\"origins\":");
+    origins_json(o, r);
+    o.push('}');
 }
 
 /// The records of the tasks a group shows when it is expanded.
@@ -601,17 +685,16 @@ fn view_json(r: &Rank, grouping: &analysis::Grouping, body: &str) -> String {
 /// the `cols` pixel columns the class taking most of it (-1: outside the run).
 fn gap_strip_json(r: &Rank, t0: f64, t1: f64, cols: usize) -> String {
     let gaps = r.gaps.get_or_init(|| analysis::critical_gaps(&r.model, &r.crit));
-    let iv = &gaps.intervals;
-    let (a, b) = (iv.partition_point(|i| (i.1 as f64) <= t0), iv.partition_point(|i| (i.0 as f64) < t1));
+    let range = gaps.overlapping(t0, t1);
     let mut o = String::from("{\"total\":");
     list(&mut o, gaps.totals.iter());
-    if b.saturating_sub(a) <= TIMELINE_MAX_SEGMENTS {
+    if range.len() <= TIMELINE_MAX_SEGMENTS {
         o.push_str(",\"iv\":");
-        list(&mut o, iv[a..b.max(a)].iter().map(|&(x, y, k)| format!("[{x},{y},{}]", k as u8)));
+        list(&mut o, range.map(|i| gaps.interval(i)).map(|(x, y, k)| format!("[{x},{y},{}]", k as u8)));
     } else {
         let per = (t1 - t0) / cols as f64;
         let mut time = vec![[0f64; 4]; cols];
-        for &(x, y, k) in &iv[a..b] {
+        for (x, y, k) in range.map(|i| gaps.interval(i)) {
             let (fa, fb) = (((x as f64).max(t0) - t0) / per, ((y as f64).min(t1) - t0) / per);
             for c in (fa as usize)..(fb.ceil() as usize).min(cols) {
                 time[c][k as usize] += (fb.min(c as f64 + 1.0) - fa.max(c as f64)).max(0.0);
@@ -658,11 +741,9 @@ fn region_json(m: &Model, body: &str) -> String {
     }
     o.push_str("],\"crit_tasks\":[");
     let mut first = true;
-    for (i, &t) in r.path.task_time.iter().enumerate() {
-        if t > 0 {
-            let _ = write!(o, "{}[{},{}]", if first { "" } else { "," }, i, t);
-            first = false;
-        }
+    for &(i, t) in &r.path.tasks {
+        let _ = write!(o, "{}[{},{}]", if first { "" } else { "," }, i, t);
+        first = false;
     }
     o.push_str("],\"crit_edges\":[");
     for (i, (a, b)) in r.path.transitions.iter().enumerate() {
@@ -681,6 +762,21 @@ fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) {
     );
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(body);
+}
+
+/// Answers with a JSON document written by `write` and sent while it is
+/// written. It has no Content-Length: the connection is closed after it.
+fn respond_streamed(stream: &mut TcpStream, write: impl FnOnce(&mut Json)) {
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+    if stream.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    let mut o = Json { s: String::with_capacity(2 * Json::PIECE), sink: Some(stream) };
+    write(&mut o);
+    let rest = std::mem::take(&mut o.s);
+    if let Some(w) = o.sink {
+        let _ = w.write_all(rest.as_bytes());
+    }
 }
 
 fn handle(mut stream: TcpStream, info: &str, ranks: &[Rank]) {
@@ -759,15 +855,15 @@ fn handle(mut stream: TcpStream, info: &str, ranks: &[Rank]) {
                             *rank.view.write().unwrap() = regrouped;
                         }
                     }
-                    respond(&mut stream, "200 OK", JSON, rank.view.read().unwrap().graph_json.as_bytes());
+                    let view = rank.view.read().unwrap();
+                    respond_streamed(&mut stream, |o| graph_json(o, rank, &view));
                 }
                 ("POST", Some(rank), "view") => {
                     let json = view_json(rank, &rank.view.read().unwrap().grouping, &String::from_utf8_lossy(&body));
                     respond(&mut stream, "200 OK", JSON, json.as_bytes());
                 }
                 ("GET", Some(rank), "full") => {
-                    let json = full_json(&rank.model, &rank.crit, &rank.locs, &rank.loc_of);
-                    respond(&mut stream, "200 OK", JSON, json.as_bytes());
+                    respond_streamed(&mut stream, |o| full_json(o, rank));
                 }
                 ("POST", Some(rank), "summary") => {
                     let members = parse_indices(&String::from_utf8_lossy(&body), rank.model.tasks.len());
@@ -813,10 +909,22 @@ fn load(dir: &str, max_group: usize) -> Vec<Rank> {
     };
     files.sort();
     let mut ranks = Vec::new();
+    let started = std::time::Instant::now();
+    let mut total = LoadStats::default();
     for path in files {
-        let trace = std::fs::File::open(&path).and_then(|f| tmj_trace::Trace::read(&mut BufReader::new(f)));
-        let trace = match trace {
-            Ok(t) => t,
+        let mut stats = LoadStats { files: 1, bytes: std::fs::metadata(&path).map_or(0, |m| m.len()), mark: Some(std::time::Instant::now()), ..Default::default() };
+        // The events are not loaded: they are read from the file in time
+        // order and go straight into the model.
+        let model = tmj_trace::TraceFile::open(&path).and_then(|trace| {
+            stats.index = stats.lap();
+            let mut builder = model::ModelBuilder::new();
+            trace.for_each_event(|e| builder.push(e))?;
+            let model = builder.finish(&trace.head);
+            stats.build = stats.lap();
+            Ok((model, trace.head, trace.n_events))
+        });
+        let (model, trace, n_events) = match model {
+            Ok(m) => m,
             Err(e) => {
                 eprintln!("temanejo: skipping {}: {e}", path.display());
                 continue;
@@ -827,32 +935,131 @@ fn load(dir: &str, max_group: usize) -> Vec<Rank> {
                 "temanejo: {} has no end marker: the run of rank {} did not finish cleanly; showing the {} events recorded up to its last flush",
                 path.display(),
                 trace.rank,
-                trace.events.len()
+                n_events
             );
         }
-        if trace.events.is_empty() {
+        if n_events == 0 {
             eprintln!("temanejo: skipping {}: it contains no events", path.display());
             continue;
         }
-        let model = Model::build(&trace);
+        stats.events = n_events;
+        stats.tasks = model.tasks.len() as u64;
         let crit = analysis::critical_path(&model, None);
+        let origins = analysis::origins(&model, &crit);
+        let peak = analysis::peak_concurrency(&model);
+        stats.analysis = stats.lap();
         let locs = symbolize::symbolize(&trace.syms);
+        stats.symbols = stats.lap();
         let loc_of: HashMap<u64, usize> = locs.iter().enumerate().map(|(i, l)| (l.addr, i)).collect();
-        let empty = Grouped { grouping: analysis::Grouping { max_group: 0, groups: Vec::new(), task_group: Vec::new() }, graph_json: String::new() };
-        let rank = Rank { model, crit, locs, loc_of, view: std::sync::RwLock::new(empty), epoch_ns: trace.epoch_ns, complete: trace.complete, gaps: Default::default(), timeline: Default::default(), selection: Default::default() };
+        let empty = Grouped { grouping: analysis::Grouping { max_group: 0, groups: Vec::new(), task_group: Vec::new() }, summaries: Vec::new() };
+        let rank = Rank { model, crit, locs, loc_of, origins, peak, view: std::sync::RwLock::new(empty), epoch_ns: trace.epoch_ns, complete: trace.complete, gaps: Default::default(), timeline: Default::default(), selection: Default::default() };
         let grouped = rank.regroup(max_group);
         *rank.view.write().unwrap() = grouped;
+        stats.analysis += stats.lap();
+        eprintln!("temanejo: {}: {}", path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()), stats.describe());
+        total.add(&stats);
         ranks.push(rank);
+    }
+    if total.files > 1 {
+        eprintln!("temanejo: {} files: {}, {:.2} s in total", total.files, total.describe(), started.elapsed().as_secs_f64());
+    }
+    if let Some(peak) = peak_memory() {
+        eprintln!("temanejo: peak memory {:.0} MB", peak as f64 / 1e6);
     }
     ranks.sort_by_key(|r| r.model.rank);
     ranks
+}
+
+/// How long loading a trace file took, by stage.
+#[derive(Default)]
+struct LoadStats {
+    files: usize,
+    bytes: u64,
+    events: u64,
+    tasks: u64,
+    /// First pass over the file: header, symbols and the position of the blocks.
+    index: f64,
+    /// Second pass: events merged by time and the model built from them.
+    build: f64,
+    /// Critical path, origins, peak concurrency and task groups.
+    analysis: f64,
+    /// Source locations of the code addresses (addr2line).
+    symbols: f64,
+    /// End of the last stage measured by `lap`.
+    mark: Option<std::time::Instant>,
+}
+
+impl LoadStats {
+    /// Seconds since the previous call (or since loading the file began).
+    fn lap(&mut self) -> f64 {
+        let now = std::time::Instant::now();
+        let since = self.mark.map_or(0.0, |m| (now - m).as_secs_f64());
+        self.mark = Some(now);
+        since
+    }
+
+    fn add(&mut self, o: &LoadStats) {
+        self.files += o.files;
+        self.bytes += o.bytes;
+        self.events += o.events;
+        self.tasks += o.tasks;
+        self.index += o.index;
+        self.build += o.build;
+        self.analysis += o.analysis;
+        self.symbols += o.symbols;
+    }
+
+    fn describe(&self) -> String {
+        let mb = self.bytes as f64 / 1e6;
+        let read = self.index + self.build;
+        let rate = |v: f64, t: f64| if t > 0.0 { v / t } else { 0.0 };
+        format!(
+            "{mb:.1} MB, {:.2} M events, {:.2} M tasks; read {read:.2} s ({:.0} MB/s, {:.1} M events/s: index {:.2} s, model {:.2} s), analysis {:.2} s, symbols {:.2} s",
+            self.events as f64 / 1e6,
+            self.tasks as f64 / 1e6,
+            rate(mb, read),
+            rate(self.events as f64 / 1e6, read),
+            self.index,
+            self.build,
+            self.analysis,
+            self.symbols
+        )
+    }
+}
+
+/// Largest resident memory of the process so far in bytes (Linux only).
+fn peak_memory() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb = status.lines().find_map(|l| l.strip_prefix("VmHWM:"))?.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()?;
+    Some(kb * 1024)
 }
 
 fn ms(ns: u64) -> f64 {
     ns as f64 / 1e6
 }
 
+/// Makes glibc's malloc return large freed blocks to the system. Requests
+/// allocate temporary arrays with an entry per task or task part (tens of
+/// MB); by default glibc raises its mmap threshold after the first such
+/// block is freed and keeps the later ones in the heap, so the server would
+/// grow with every request. The environment variable still takes precedence.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn return_freed_memory() {
+    extern "C" {
+        fn mallopt(param: i32, value: i32) -> i32;
+    }
+    const M_MMAP_THRESHOLD: i32 = -3;
+    if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none() {
+        // SAFETY: mallopt only changes malloc parameters.
+        unsafe { mallopt(M_MMAP_THRESHOLD, 256 << 10) };
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn return_freed_memory() {}
+
 fn main() {
+    return_freed_memory();
     let mut dir = None;
     let mut port = 8700u16;
     let mut bind = "127.0.0.1".to_string();

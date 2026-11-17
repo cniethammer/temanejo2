@@ -6,8 +6,10 @@ use std::collections::HashSet;
 pub struct PathResult {
     /// Length of the longest (work-weighted) path in ns: T_inf.
     pub length: u64,
-    /// Critical work time per task index (0 if the task is not on the path).
-    pub task_time: Vec<u64>,
+    /// Critical work time of the tasks on the path, `(task index, ns)`,
+    /// ascending by task. Paths are short compared with the graph, so this
+    /// is not stored per task.
+    pub tasks: Vec<(u32, u64)>,
     /// Ordered pairs of task indices between which the path changes task.
     pub transitions: HashSet<(u32, u32)>,
 }
@@ -23,23 +25,12 @@ pub fn critical_path(m: &Model, selected: Option<&[bool]>) -> PathResult {
         _ => true,
     };
 
-    // CSR adjacency over included nodes.
+    // Number of included predecessors of each included node.
     let mut indeg = vec![0u32; n];
-    let mut start = vec![0u32; n + 1];
-    let edges: Vec<(u32, u32)> =
-        parts.edges.iter().copied().filter(|&(a, b)| included(a as usize) && included(b as usize)).collect();
-    for &(a, b) in &edges {
-        start[a as usize + 1] += 1;
-        indeg[b as usize] += 1;
-    }
-    for i in 0..n {
-        start[i + 1] += start[i];
-    }
-    let mut fill = start.clone();
-    let mut adj = vec![0u32; edges.len()];
-    for &(a, b) in &edges {
-        adj[fill[a as usize] as usize] = b;
-        fill[a as usize] += 1;
+    for u in (0..n).filter(|&u| included(u)) {
+        for &v in parts.succ(u) {
+            indeg[v as usize] += 1;
+        }
     }
 
     // Kahn's algorithm with longest-distance relaxation. Nodes on a cycle
@@ -56,8 +47,11 @@ pub fn critical_path(m: &Model, selected: Option<&[bool]>) -> PathResult {
         if dist[u] > best.0 || best.1 == NONE {
             best = (dist[u], u as u32);
         }
-        for &v in &adj[start[u] as usize..start[u + 1] as usize] {
+        for &v in parts.succ(u) {
             let v = v as usize;
+            if selected.is_some() && !included(v) {
+                continue;
+            }
             if dist[u] > dist[v] || pred[v] == NONE {
                 dist[v] = dist[u];
                 pred[v] = u as u32;
@@ -68,15 +62,16 @@ pub fn critical_path(m: &Model, selected: Option<&[bool]>) -> PathResult {
             }
         }
     }
+    drop((indeg, queue, dist));
 
-    let mut task_time = vec![0u64; m.tasks.len()];
+    let mut tasks: Vec<(u32, u64)> = Vec::new();
     let mut transitions = HashSet::new();
     let mut cur = best.1;
     let mut later_task = NONE; // task of the nearest real part after `cur` on the path
     while cur != NONE {
         let t = parts.task[cur as usize];
         if t != NONE {
-            task_time[t as usize] += parts.weight[cur as usize];
+            tasks.push((t, parts.weight[cur as usize]));
             if later_task != NONE && later_task != t {
                 transitions.insert((t, later_task));
             }
@@ -84,7 +79,24 @@ pub fn critical_path(m: &Model, selected: Option<&[bool]>) -> PathResult {
         }
         cur = pred[cur as usize];
     }
-    PathResult { length: best.0, task_time, transitions }
+    // One entry per task: a task can be on the path with several parts.
+    tasks.sort_unstable_by_key(|x| x.0);
+    tasks.dedup_by(|b, a| {
+        let same = a.0 == b.0;
+        if same {
+            a.1 += b.1;
+        }
+        same
+    });
+    tasks.retain(|x| x.1 > 0);
+    PathResult { length: best.0, tasks, transitions }
+}
+
+impl PathResult {
+    /// Critical work time of task `t` (0 if it is not on the path).
+    pub fn time(&self, t: u32) -> u64 {
+        self.tasks.binary_search_by_key(&t, |x| x.0).map_or(0, |k| self.tasks[k].1)
+    }
 }
 
 pub struct Region {
@@ -116,7 +128,7 @@ pub fn analyze_region(m: &Model, selected: &[bool]) -> Region {
         }
         n_tasks += 1;
         work += t.work;
-        for s in &t.segs {
+        for s in m.segs(i) {
             if s.end > s.start {
                 steps.push((s.start, 1));
                 steps.push((s.end, -1));
@@ -147,6 +159,25 @@ pub fn analyze_region(m: &Model, selected: &[bool]) -> Region {
         profile,
         per_thread: per_thread.into_iter().collect(),
     }
+}
+
+/// Largest number of tasks executing at the same time in the whole run: the
+/// `max_concurrency` of `analyze_region` for all tasks, without its other results.
+pub fn peak_concurrency(m: &Model) -> u32 {
+    let segs = || m.all_segs().map(|(_, s)| s).filter(|s| s.end > s.start);
+    let mut starts: Vec<u64> = segs().map(|s| s.start).collect();
+    let mut ends: Vec<u64> = segs().map(|s| s.end).collect();
+    starts.sort_unstable();
+    ends.sort_unstable();
+    // Segments ending at a time are over before those starting at it begin.
+    let (mut ended, mut max) = (0, 0);
+    for (started, &t) in starts.iter().enumerate() {
+        while ends[ended] <= t {
+            ended += 1;
+        }
+        max = max.max(started + 1 - ended);
+    }
+    max as u32
 }
 
 /// Reduces a concurrency step function to at most `buckets` time-averaged samples.
@@ -212,7 +243,7 @@ pub fn origins(m: &Model, crit: &PathResult) -> Vec<Origin> {
         let o = groups.entry((initial, codeptr)).or_insert_with(|| Origin { initial, codeptr, ..Default::default() });
         o.tasks.push(i as u32);
         o.work += t.work;
-        o.critical += crit.task_time[i];
+        o.critical += crit.time(i as u32);
         match t.kind {
             TaskKind::Implicit => o.has_implicit = true,
             TaskKind::Explicit if t.taskloop => o.has_taskloop = true,
@@ -576,10 +607,10 @@ impl Grouping {
 pub fn visible_dependences(m: &Model, crit: &PathResult, grouping: &Grouping, expanded: &[bool]) -> Vec<(u32, u32, bool)> {
     let node = grouping.visible(expanded);
     let mut merged: std::collections::BTreeMap<(u32, u32), bool> = Default::default();
-    for e in m.edges.iter().filter(|e| e.kind == crate::model::EdgeKind::Depend) {
-        let (a, b) = (node[e.from as usize], node[e.to as usize]);
+    for (from, to) in m.depends() {
+        let (a, b) = (node[from as usize], node[to as usize]);
         if a != b {
-            *merged.entry((a, b)).or_default() |= crit.transitions.contains(&(e.from, e.to)) || crit.transitions.contains(&(e.to, e.from));
+            *merged.entry((a, b)).or_default() |= crit.transitions.contains(&(from, to)) || crit.transitions.contains(&(to, from));
         }
     }
     merged.into_iter().map(|((a, b), c)| (a, b, c)).collect()
@@ -626,13 +657,13 @@ fn most_frequent<T: Copy + Ord + std::hash::Hash>(values: impl Iterator<Item = T
 
 /// Thread a task counts as running on: that of its first segment, or the
 /// creating thread if it never ran. (The GUI uses the same rule.)
-pub fn task_thread(t: &crate::model::Task) -> i64 {
-    t.segs.first().map_or(t.create_thread as i64, |s| s.thread as i64)
+pub fn task_thread(m: &Model, i: usize) -> i64 {
+    m.segs(i).first().map_or(m.tasks[i].create_thread as i64, |s| s.thread as i64)
 }
 
 /// Start of a task: begin of its first segment, or its creation if it never ran.
-pub fn task_start(t: &crate::model::Task) -> u64 {
-    t.segs.first().map_or(t.create_ts, |s| s.start)
+pub fn task_start(m: &Model, i: usize) -> u64 {
+    m.segs(i).first().map_or(m.tasks[i].create_ts, |s| s.start)
 }
 
 pub fn summarize(m: &Model, crit: &PathResult, members: &[u32]) -> Summary {
@@ -642,26 +673,27 @@ pub fn summarize(m: &Model, crit: &PathResult, members: &[u32]) -> Summary {
     }
     let region = analyze_region(m, &selected);
     let tasks = || members.iter().map(|&i| &m.tasks[i as usize]);
+    let first_seg = |i: &u32| m.segs(*i as usize).first();
     let n = members.len().max(1) as u64;
     Summary {
         n: members.len(),
         work: region.work,
-        critical: members.iter().map(|&i| crit.task_time[i as usize]).sum(),
+        critical: members.iter().map(|&i| crit.time(i)).sum(),
         min_work: tasks().map(|t| t.work).min().unwrap_or(0),
         max_work: tasks().map(|t| t.work).max().unwrap_or(0),
         t_begin: region.t_begin,
         t_end: region.t_end,
         threads: region.per_thread.len(),
         parallelism: Some((region.critical, region.max_concurrency)),
-        thread: most_frequent(tasks().map(task_thread)).unwrap_or(-1),
-        cpu: most_frequent(tasks().map(|t| t.segs.first().map_or(-1, |s| s.cpu as i64))).unwrap_or(-1),
-        numa: most_frequent(tasks().map(|t| t.segs.first().map_or(-1, |s| s.numa as i64))).unwrap_or(-1),
+        thread: most_frequent(members.iter().map(|&i| task_thread(m, i as usize))).unwrap_or(-1),
+        cpu: most_frequent(members.iter().map(|i| first_seg(i).map_or(-1, |s| s.cpu as i64))).unwrap_or(-1),
+        numa: most_frequent(members.iter().map(|i| first_seg(i).map_or(-1, |s| s.numa as i64))).unwrap_or(-1),
         codeptr: most_frequent(tasks().map(|t| t.codeptr)).unwrap_or(0),
         parallel: most_frequent(tasks().map(|t| t.parallel)).unwrap_or(NONE),
         kind: most_frequent(tasks().map(|t| t.kind as u8)).unwrap_or(2),
         mean_work: region.work / n,
         mean_create: tasks().map(|t| t.create_ts).sum::<u64>() / n,
-        mean_start: tasks().map(task_start).sum::<u64>() / n,
+        mean_start: members.iter().map(|&i| task_start(m, i as usize)).sum::<u64>() / n,
     }
 }
 
@@ -683,11 +715,12 @@ struct Aggregate {
 }
 
 impl Aggregate {
-    fn add_task(&mut self, t: &crate::model::Task, critical: u64) {
-        let seg = t.segs.first();
-        let values = [task_thread(t), seg.map_or(-1, |s| s.cpu as i64), seg.map_or(-1, |s| s.numa as i64), t.codeptr as i64, t.parallel as i64, t.kind as i64];
-        let mut one = Aggregate { n: 1, work: t.work, critical, min_work: t.work, max_work: t.work, t_begin: u64::MAX, create: t.create_ts as u128, start: task_start(t) as u128, ..Default::default() };
-        for s in &t.segs {
+    fn add_task(&mut self, m: &Model, i: usize, critical: u64) {
+        let (t, segs) = (&m.tasks[i], m.segs(i));
+        let seg = segs.first();
+        let values = [task_thread(m, i), seg.map_or(-1, |s| s.cpu as i64), seg.map_or(-1, |s| s.numa as i64), t.codeptr as i64, t.parallel as i64, t.kind as i64];
+        let mut one = Aggregate { n: 1, work: t.work, critical, min_work: t.work, max_work: t.work, t_begin: u64::MAX, create: t.create_ts as u128, start: task_start(m, i) as u128, ..Default::default() };
+        for s in segs {
             one.t_begin = one.t_begin.min(s.start);
             one.t_end = one.t_end.max(s.end);
             one.threads.insert(s.thread);
@@ -761,7 +794,7 @@ pub fn summarize_groups(m: &Model, crit: &PathResult, grouping: &Grouping) -> Ve
         let grp = &grouping.groups[g];
         let mut a = std::mem::take(&mut agg[g]);
         for &i in &grp.tasks {
-            a.add_task(&m.tasks[i as usize], crit.task_time[i as usize]);
+            a.add_task(m, i as usize, crit.time(i));
         }
         if grp.parent != NONE {
             agg[grp.parent as usize].merge(&a);
@@ -790,11 +823,40 @@ pub enum GapKind {
     Idle = 3,
 }
 
+/// Consecutive intervals covering the whole run, each of another kind than
+/// the one before. A run has millions of them, so only the begin and kind
+/// of each are stored; an interval ends where the next one begins.
 pub struct CriticalGaps {
-    /// Consecutive intervals `(begin, end, kind)` covering the whole run.
-    pub intervals: Vec<(u64, u64, GapKind)>,
+    begin: Vec<u64>,
+    kind: Vec<GapKind>,
+    /// End of the last interval.
+    end: u64,
     /// Total time per kind, indexed by `GapKind as usize`.
     pub totals: [u64; 4],
+}
+
+impl CriticalGaps {
+    pub fn len(&self) -> usize {
+        self.begin.len()
+    }
+
+    /// Interval `i` as `(begin, end, kind)`.
+    pub fn interval(&self, i: usize) -> (u64, u64, GapKind) {
+        (self.begin[i], self.begin.get(i + 1).copied().unwrap_or(self.end), self.kind[i])
+    }
+
+    #[cfg(test)]
+    pub fn intervals(&self) -> impl Iterator<Item = (u64, u64, GapKind)> + '_ {
+        (0..self.len()).map(|i| self.interval(i))
+    }
+
+    /// Index range of the intervals that overlap the time window `(t0, t1)`.
+    pub fn overlapping(&self, t0: f64, t1: f64) -> std::ops::Range<usize> {
+        // Interval `i` ends at or before `t0` if the next one begins there.
+        let a = self.begin.get(1..).map_or(0, |next| next.partition_point(|&b| (b as f64) <= t0));
+        let a = if self.end as f64 <= t0 { self.len() } else { a };
+        a..self.begin.partition_point(|&b| (b as f64) < t1).max(a)
+    }
 }
 
 /// Classifies every moment of the run (0 to `m.wall`) by `GapKind`.
@@ -805,64 +867,69 @@ pub struct CriticalGaps {
 /// predecessors, until its first segment starts.
 pub fn critical_gaps(m: &Model, crit: &PathResult) -> CriticalGaps {
     // Changes of four counters: critical tasks running, tasks running,
-    // threads available, critical tasks waiting.
-    let mut changes: Vec<(u64, usize, i32)> = Vec::new();
+    // threads available, critical tasks waiting. Packed into one word,
+    // `time << 3 | counter << 1 | increment`, as there are several per segment.
+    let mut changes: Vec<u64> = Vec::new();
+    let change = |ts: u64, counter: u64, up: bool| ts << 3 | counter << 1 | up as u64;
     let mut ready = vec![0u64; m.tasks.len()];
-    for e in m.edges.iter().filter(|e| e.kind == crate::model::EdgeKind::Depend) {
-        let r = &mut ready[e.to as usize];
-        *r = (*r).max(m.tasks[e.from as usize].end);
+    for (from, to) in m.depends() {
+        let r = &mut ready[to as usize];
+        *r = (*r).max(m.tasks[from as usize].end);
     }
     let mut span: std::collections::HashMap<u32, (u64, u64)> = Default::default();
     for (i, t) in m.tasks.iter().enumerate() {
-        let critical = crit.task_time[i] > 0;
-        for s in t.segs.iter().filter(|s| s.end > s.start) {
-            changes.push((s.start, 1, 1));
-            changes.push((s.end, 1, -1));
+        let critical = crit.time(i as u32) > 0;
+        for s in m.segs(i).iter().filter(|s| s.end > s.start) {
+            changes.push(change(s.start, 1, true));
+            changes.push(change(s.end, 1, false));
             if critical {
-                changes.push((s.start, 0, 1));
-                changes.push((s.end, 0, -1));
+                changes.push(change(s.start, 0, true));
+                changes.push(change(s.end, 0, false));
             }
             let sp = span.entry(s.thread).or_insert((s.start, s.end));
             sp.0 = sp.0.min(s.start);
             sp.1 = sp.1.max(s.end);
         }
         if critical {
-            if let Some(first) = t.segs.first() {
+            if let Some(first) = m.segs(i).first() {
                 let from = ready[i].max(t.create_ts);
                 if from < first.start {
-                    changes.push((from, 3, 1));
-                    changes.push((first.start, 3, -1));
+                    changes.push(change(from, 3, true));
+                    changes.push(change(first.start, 3, false));
                 }
             }
         }
     }
     for &(a, b) in span.values() {
-        changes.push((a, 2, 1));
-        changes.push((b, 2, -1));
+        changes.push(change(a, 2, true));
+        changes.push(change(b, 2, false));
     }
-    changes.sort_unstable_by_key(|c| c.0);
+    // Only the time orders: all changes up to a time are applied together.
+    changes.sort_unstable();
 
-    let mut intervals: Vec<(u64, u64, GapKind)> = Vec::new();
+    let (mut begin, mut kinds): (Vec<u64>, Vec<GapKind>) = Default::default();
     let mut totals = [0u64; 4];
     let mut count = [0i32; 4];
+    // Intervals are pushed in order without holes; one of the same kind as
+    // the last extends it.
     let mut push = |a: u64, b: u64, kind: GapKind| {
         if b <= a {
             return;
         }
         totals[kind as usize] += b - a;
-        match intervals.last_mut() {
-            Some(last) if last.2 == kind && last.1 == a => last.1 = b,
-            _ => intervals.push((a, b, kind)),
+        if kinds.last() != Some(&kind) {
+            begin.push(a);
+            kinds.push(kind);
         }
     };
     let mut t = 0u64;
     let mut k = 0;
     while t < m.wall {
-        while k < changes.len() && changes[k].0 <= t {
-            count[changes[k].1] += changes[k].2;
+        while k < changes.len() && changes[k] >> 3 <= t {
+            count[(changes[k] >> 1 & 3) as usize] += if changes[k] & 1 == 1 { 1 } else { -1 };
             k += 1;
         }
-        let next = changes.get(k).map_or(m.wall, |c| c.0.min(m.wall));
+        let next = changes.get(k).map_or(m.wall, |c| (c >> 3).min(m.wall));
         let kind = if count[0] > 0 {
             GapKind::OnPath
         } else if count[2] > 0 && count[1] >= count[2] {
@@ -875,5 +942,7 @@ pub fn critical_gaps(m: &Model, crit: &PathResult) -> CriticalGaps {
         push(t, next, kind);
         t = next;
     }
-    CriticalGaps { intervals, totals }
+    begin.shrink_to_fit();
+    kinds.shrink_to_fit();
+    CriticalGaps { begin, kind: kinds, end: m.wall, totals }
 }

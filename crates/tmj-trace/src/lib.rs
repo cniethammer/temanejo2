@@ -263,6 +263,29 @@ fn read_syms<R: Read>(r: &mut R, n: usize, syms: &mut Vec<Sym>) -> io::Result<()
     Ok(())
 }
 
+/// Reads the file header up to the first block; the flag tells a version 01
+/// file, in which the event count follows instead.
+fn read_header<R: Read>(r: &mut R) -> io::Result<(Trace, bool)> {
+    let mut magic = [0u8; 8];
+    r.read_exact(&mut magic)?;
+    let (v1, v2) = (&magic == MAGIC_V1, &magic == MAGIC_V2);
+    if !v1 && !v2 && &magic != MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a temanejo trace file"));
+    }
+    let mut t = Trace { rank: read_u32(r)?, pid: read_u32(r)?, epoch_ns: read_u64(r)?, host: read_str(r)?, ..Default::default() };
+    if v1 {
+        return Ok((t, true));
+    }
+    t.runtime_module = read_str(r)?;
+    if !v2 {
+        for _ in 0..read_u32(r)? {
+            let key = read_str(r)?;
+            t.info.push((key, read_str(r)?));
+        }
+    }
+    Ok((t, false))
+}
+
 impl Trace {
     /// Writes the trace as a version 03 file with one events block.
     pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
@@ -281,13 +304,7 @@ impl Trace {
     /// there, with `complete` false. Taskloop tasks are attributed to their
     /// construct (`attribute_taskloop_tasks`).
     pub fn read<R: Read>(r: &mut R) -> io::Result<Trace> {
-        let mut magic = [0u8; 8];
-        r.read_exact(&mut magic)?;
-        let (v1, v2) = (&magic == MAGIC_V1, &magic == MAGIC_V2);
-        if !v1 && !v2 && &magic != MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a temanejo trace file"));
-        }
-        let mut t = Trace { rank: read_u32(r)?, pid: read_u32(r)?, epoch_ns: read_u64(r)?, host: read_str(r)?, ..Default::default() };
+        let (mut t, v1) = read_header(r)?;
         if v1 {
             let n = read_u64(r)? as usize;
             read_events(r, n, &mut t.events)?;
@@ -295,13 +312,6 @@ impl Trace {
             read_syms(r, n, &mut t.syms)?;
             t.complete = true;
             return Ok(t);
-        }
-        t.runtime_module = read_str(r)?;
-        if !v2 {
-            for _ in 0..read_u32(r)? {
-                let key = read_str(r)?;
-                t.info.push((key, read_str(r)?));
-            }
         }
         loop {
             let mut kind = [0u8; 1];
@@ -329,42 +339,300 @@ impl Trace {
         Ok(t)
     }
 
-    /// OpenMP runtimes may create the tasks of a `taskloop` inside the
-    /// runtime and report a code address in the runtime for them (LLVM
-    /// libomp does, also for internal helper tasks that create tasks on
-    /// other threads later). The WORK event of the construct carries the
-    /// program's address. This gives every TASK_CREATE whose address lies in
-    /// the runtime module the address of the latest taskloop its creating
-    /// task began before, and keeps the reported address in `c`.
+    /// Gives taskloop tasks the code address of their construct; see
+    /// `TaskloopAttribution`.
     ///
     /// Needs `runtime_module` and the symbol records; events that already
     /// have `c` set (version 01 files) are left alone.
     pub fn attribute_taskloop_tasks(&mut self) {
-        use std::collections::{HashMap, HashSet};
         if self.runtime_module.is_empty() {
             return;
         }
-        let mut taskloops: HashMap<u64, Vec<(u64, u64)>> = HashMap::new(); // task -> (ts, codeptr)
+        let mut attr = TaskloopAttribution::default();
         for e in &self.events {
-            if e.kind == kind::WORK && e.endpoint == ENDPOINT_BEGIN && e.a == WORK_TASKLOOP && e.d != 0 {
-                taskloops.entry(e.b).or_default().push((e.ts, e.d));
-            }
+            attr.note(e);
         }
-        if taskloops.is_empty() {
+        attr.finish(&self.runtime_module, &self.syms);
+        if attr.is_empty() {
             return;
         }
-        for v in taskloops.values_mut() {
+        for e in &mut self.events {
+            attr.apply(e);
+        }
+    }
+}
+
+/// OpenMP runtimes may create the tasks of a `taskloop` inside the runtime
+/// and report a code address in the runtime for them (LLVM libomp does, also
+/// for internal helper tasks that create tasks on other threads later). The
+/// WORK event of the construct carries the program's address. This gives
+/// every TASK_CREATE whose address lies in the runtime module the address of
+/// the latest taskloop its creating task began before, and keeps the
+/// reported address in `c`.
+///
+/// Used in two steps, so a trace need not be in memory: `note` every event,
+/// `finish`, then `apply` to every event.
+#[derive(Default)]
+pub struct TaskloopAttribution {
+    /// Per task: (time, code address) of the taskloops it began, by time.
+    taskloops: std::collections::HashMap<u64, Vec<(u64, u64)>>,
+    in_runtime: std::collections::HashSet<u64>,
+}
+
+impl TaskloopAttribution {
+    pub fn note(&mut self, e: &Event) {
+        if e.kind == kind::WORK && e.endpoint == ENDPOINT_BEGIN && e.a == WORK_TASKLOOP && e.d != 0 {
+            self.taskloops.entry(e.b).or_default().push((e.ts, e.d));
+        }
+    }
+
+    /// To be called after the last `note`, with all symbol records.
+    pub fn finish(&mut self, runtime_module: &str, syms: &[Sym]) {
+        if runtime_module.is_empty() {
+            self.taskloops.clear();
+        }
+        if self.taskloops.is_empty() {
+            return;
+        }
+        for v in self.taskloops.values_mut() {
             v.sort_unstable();
         }
-        let in_runtime: HashSet<u64> = self.syms.iter().filter(|s| s.module == self.runtime_module).map(|s| s.addr).collect();
-        for e in self.events.iter_mut().filter(|e| e.kind == kind::TASK_CREATE && e.c == 0 && in_runtime.contains(&e.d)) {
-            let Some(v) = taskloops.get(&e.b) else { continue };
-            let i = v.partition_point(|&(ts, _)| ts <= e.ts);
-            if i > 0 {
-                e.c = e.d;
-                e.d = v[i - 1].1;
+        self.in_runtime = syms.iter().filter(|s| s.module == runtime_module).map(|s| s.addr).collect();
+    }
+
+    /// True if no event will be changed.
+    pub fn is_empty(&self) -> bool {
+        self.taskloops.is_empty()
+    }
+
+    pub fn apply(&self, e: &mut Event) {
+        if e.kind != kind::TASK_CREATE || e.c != 0 || self.taskloops.is_empty() || !self.in_runtime.contains(&e.d) {
+            return;
+        }
+        let Some(v) = self.taskloops.get(&e.b) else { return };
+        let i = v.partition_point(|&(ts, _)| ts <= e.ts);
+        if i > 0 {
+            e.c = e.d;
+            e.d = v[i - 1].1;
+        }
+    }
+}
+
+// ------------------------------------------------------------------ streaming
+
+/// A run of consecutive events of one thread in a trace file.
+struct Run {
+    /// File offset of the first event.
+    offset: u64,
+    /// Number of events.
+    n: u64,
+    /// Position of the first event among all events of the file.
+    first: u64,
+}
+
+/// A trace file whose events are read on demand, in time order, without
+/// holding them in memory (`for_each_event`). Opening it reads the file once
+/// to collect header, symbols and the position of every events block.
+///
+/// Events are delivered in the order `Trace::read` followed by a stable sort
+/// by time gives: by timestamp, events with equal timestamps in file order.
+pub struct TraceFile {
+    path: std::path::PathBuf,
+    /// Header, symbols and completeness of the trace; `events` is empty.
+    pub head: Trace,
+    pub n_events: u64,
+    /// Per thread the runs of its events, in file order.
+    threads: Vec<Vec<Run>>,
+    /// False if the events of some thread are not ordered by time, or a
+    /// block mixes threads: the events are then sorted in memory.
+    mergeable: bool,
+    attribution: TaskloopAttribution,
+}
+
+/// Events per run of a version 01 file, which has no blocks.
+const V1_RUN: usize = 1 << 14;
+
+impl TraceFile {
+    pub fn open(path: impl AsRef<std::path::Path>) -> io::Result<TraceFile> {
+        let path = path.as_ref().to_path_buf();
+        let mut r = CountingReader { inner: io::BufReader::with_capacity(1 << 16, std::fs::File::open(&path)?), pos: 0 };
+        let mut index = Index::default();
+        let (mut head, v1) = read_header(&mut r)?;
+        if v1 {
+            let mut left = read_u64(&mut r)? as usize;
+            while left > 0 {
+                let n = left.min(V1_RUN);
+                index.events_block(&mut r, n)?;
+                left -= n;
+            }
+            let n = read_u32(&mut r)? as usize;
+            read_syms(&mut r, n, &mut head.syms)?;
+            head.complete = true;
+        } else {
+            loop {
+                let mut kind = [0u8; 1];
+                if r.read_exact(&mut kind).is_err() {
+                    break; // end of file without end block
+                }
+                // A block that cannot be read completely is dropped as a whole.
+                let n_syms = head.syms.len();
+                let block = match kind[0] {
+                    BLOCK_EVENTS => read_u32(&mut r).and_then(|n| index.events_block(&mut r, n as usize)),
+                    BLOCK_SYMBOLS => read_u32(&mut r).and_then(|n| read_syms(&mut r, n as usize, &mut head.syms)),
+                    BLOCK_END => read_u64(&mut r).map(|_| head.complete = true),
+                    other => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unknown block type {other}"))),
+                };
+                if block.is_err() {
+                    head.syms.truncate(n_syms);
+                    break;
+                }
+                if head.complete {
+                    break;
+                }
             }
         }
+        let Index { mut threads, n_events, mergeable, mut attribution, .. } = index;
+        attribution.finish(&head.runtime_module, &head.syms);
+        threads.retain(|runs| !runs.is_empty());
+        Ok(TraceFile { path, head, n_events, threads, mergeable, attribution })
+    }
+
+    /// Calls `f` with every event of the trace, ordered by time, with
+    /// taskloop tasks attributed to their construct as `Trace::read` does.
+    /// Memory use is a read buffer per thread of the traced program.
+    pub fn for_each_event(&self, mut f: impl FnMut(&Event)) -> io::Result<()> {
+        if !self.mergeable {
+            // Not written by the tool: sort the events in memory.
+            let mut events = Trace::read(&mut io::BufReader::new(std::fs::File::open(&self.path)?))?.events;
+            events.truncate(self.n_events as usize);
+            events.sort_by_key(|e| e.ts);
+            events.iter().for_each(f);
+            return Ok(());
+        }
+        let mut cursors = Vec::with_capacity(self.threads.len());
+        // The next event of each thread, smallest (time, file position) first.
+        let mut heap = std::collections::BinaryHeap::with_capacity(self.threads.len());
+        for (i, runs) in self.threads.iter().enumerate() {
+            let mut c = Cursor { file: io::BufReader::with_capacity(1 << 16, std::fs::File::open(&self.path)?), runs, run: 0, at: 0 };
+            if let Some((e, pos)) = c.next()? {
+                heap.push(std::cmp::Reverse((e.ts, pos, i)));
+                cursors.push((c, e));
+            } else {
+                cursors.push((c, Event::default()));
+            }
+        }
+        while let Some(std::cmp::Reverse((_, _, i))) = heap.pop() {
+            let (cursor, event) = &mut cursors[i];
+            // Stay on this thread while its events precede those of all others.
+            loop {
+                self.attribution.apply(event);
+                f(event);
+                let Some((e, pos)) = cursor.next()? else { break };
+                *event = e;
+                if let Some(&std::cmp::Reverse((ts, other, _))) = heap.peek() {
+                    if (e.ts, pos) > (ts, other) {
+                        heap.push(std::cmp::Reverse((e.ts, pos, i)));
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What the first pass over a trace file collects about its events.
+struct Index {
+    threads: Vec<Vec<Run>>,
+    /// Index into `threads` and time of the last event per thread id.
+    slot: std::collections::HashMap<u32, (usize, u64)>,
+    n_events: u64,
+    mergeable: bool,
+    attribution: TaskloopAttribution,
+}
+
+impl Default for Index {
+    fn default() -> Self {
+        Index { threads: Vec::new(), slot: Default::default(), n_events: 0, mergeable: true, attribution: Default::default() }
+    }
+}
+
+impl Index {
+    /// Reads an events block of `n` events; nothing is recorded if it is cut off.
+    fn events_block<R: Read>(&mut self, r: &mut CountingReader<R>, n: usize) -> io::Result<()> {
+        let offset = r.pos;
+        let mut buf = [0u8; EVENT_SIZE];
+        let mut taskloops = TaskloopAttribution::default();
+        let mut thread = None;
+        let (mut last, mut ordered) = (0u64, true);
+        for _ in 0..n {
+            r.read_exact(&mut buf)?;
+            let e = Event::decode(&buf);
+            match thread {
+                None => {
+                    thread = Some(e.thread);
+                    ordered &= self.slot.get(&e.thread).is_none_or(|&(_, ts)| ts <= e.ts);
+                }
+                Some(t) => ordered &= t == e.thread && last <= e.ts,
+            }
+            last = e.ts;
+            taskloops.note(&e);
+        }
+        let Some(thread) = thread else { return Ok(()) };
+        for (task, list) in taskloops.taskloops {
+            self.attribution.taskloops.entry(task).or_default().extend(list);
+        }
+        let n_threads = self.threads.len();
+        let slot = self.slot.entry(thread).or_insert((n_threads, 0));
+        slot.1 = last;
+        if slot.0 == n_threads {
+            self.threads.push(Vec::new());
+        }
+        self.threads[slot.0].push(Run { offset, n: n as u64, first: self.n_events });
+        self.n_events += n as u64;
+        self.mergeable &= ordered;
+        Ok(())
+    }
+}
+
+struct CountingReader<R> {
+    inner: R,
+    pos: u64,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+/// Reads the events of one thread from its runs.
+struct Cursor<'a> {
+    file: io::BufReader<std::fs::File>,
+    runs: &'a [Run],
+    run: usize,
+    /// Events of the current run already read.
+    at: u64,
+}
+
+impl Cursor<'_> {
+    /// The next event and its position among all events of the file.
+    fn next(&mut self) -> io::Result<Option<(Event, u64)>> {
+        use std::io::Seek;
+        while self.run < self.runs.len() && self.at == self.runs[self.run].n {
+            self.run += 1;
+            self.at = 0;
+        }
+        let Some(run) = self.runs.get(self.run) else { return Ok(None) };
+        if self.at == 0 {
+            self.file.seek(io::SeekFrom::Start(run.offset))?;
+        }
+        let mut buf = [0u8; EVENT_SIZE];
+        self.file.read_exact(&mut buf)?;
+        self.at += 1;
+        Ok(Some((Event::decode(&buf), run.first + self.at - 1)))
     }
 }
 
@@ -519,6 +787,86 @@ mod tests {
         assert!(t.complete && t.runtime_module.is_empty());
         assert_eq!((t.rank, t.pid, t.epoch_ns, t.host.as_str()), (2, 7, 11, "old"));
         assert_eq!((t.events.len(), t.events[0].thread, t.events[0].ts), (1, 3, 42));
+    }
+
+    /// Events as `TraceFile` delivers them for a file with content `bytes`.
+    fn streamed(name: &str, bytes: &[u8]) -> (TraceFile, Vec<Event>) {
+        let path = std::env::temp_dir().join(format!("tmj-trace-test-{}-{name}.tmj", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let file = TraceFile::open(&path).unwrap();
+        let mut events = Vec::new();
+        file.for_each_event(|e| events.push(*e)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        (file, events)
+    }
+
+    /// What `TraceFile` must deliver: the events of `Trace::read`, stably sorted by time.
+    fn sorted(bytes: &[u8]) -> Vec<Event> {
+        let mut events = Trace::read(&mut &bytes[..]).unwrap().events;
+        events.sort_by_key(|e| e.ts);
+        events
+    }
+
+    fn fields(events: &[Event]) -> Vec<(u8, u32, u64, u64, u64, u64, u64)> {
+        events.iter().map(|e| (e.kind, e.thread, e.ts, e.a, e.b, e.c, e.d)).collect()
+    }
+
+    #[test]
+    fn streamed_events_are_merged_by_time_in_file_order() {
+        // Three threads in interleaved blocks, with equal times across threads.
+        let mut out = Vec::new();
+        encode_header(&mut out, 1, 2, 3, "h", "/lib/libomp.so", &[("k".into(), "v".into())]);
+        let ev = |th, ts, a| event(kind::TASK_SCHEDULE, th, ts, a, 0, 0);
+        encode_events_block(&mut out, &[ev(0, 1, 1), ev(0, 5, 2), ev(0, 9, 3)]);
+        encode_events_block(&mut out, &[ev(1, 2, 4), ev(1, 5, 5)]);
+        encode_symbols_block(&mut out, &[Sym { addr: 0x10, load_bias: 0, module: "/bin/app".into(), symbol: "f".into() }]);
+        encode_events_block(&mut out, &[ev(2, 5, 6), ev(2, 5, 7)]);
+        encode_events_block(&mut out, &[ev(0, 10, 8), ev(0, 12, 9)]);
+        encode_events_block(&mut out, &[ev(1, 10, 10)]);
+        encode_end_block(&mut out, 10);
+        let (file, events) = streamed("merge", &out);
+        assert!(file.head.complete && file.mergeable);
+        assert_eq!((file.n_events, file.head.syms.len(), file.head.info.len()), (10, 1, 1));
+        assert_eq!(fields(&events), fields(&sorted(&out)));
+        assert_eq!(events.iter().map(|e| e.a).collect::<Vec<_>>(), [1, 4, 2, 5, 6, 7, 3, 8, 10, 9]);
+
+        // Cut inside the last block: the block is dropped, as by `Trace::read`.
+        let cut = &out[..out.len() - 9 - 10];
+        let (file, events) = streamed("cut", cut);
+        assert!(!file.head.complete);
+        assert_eq!(fields(&events), fields(&sorted(cut)));
+        assert_eq!(events.len(), 9);
+    }
+
+    #[test]
+    fn streamed_events_of_unordered_files_are_sorted() {
+        // A block mixing threads and a thread going back in time.
+        let mut out = Vec::new();
+        encode_header(&mut out, 1, 2, 3, "h", "", &[]);
+        encode_events_block(&mut out, &[event(kind::THREAD_BEGIN, 0, 4, 1, 0, 0), event(kind::THREAD_BEGIN, 1, 2, 2, 0, 0)]);
+        encode_events_block(&mut out, &[event(kind::THREAD_END, 0, 3, 3, 0, 0)]);
+        let (file, events) = streamed("unordered", &out);
+        assert!(!file.mergeable);
+        assert_eq!(fields(&events), fields(&sorted(&out)));
+    }
+
+    #[test]
+    fn streamed_events_get_taskloop_attribution() {
+        const RT: u64 = 0x7000;
+        let mut out = Vec::new();
+        encode_header(&mut out, 0, 1, 0, "h", "/lib/libomp.so", &[]);
+        let work = Event { kind: kind::WORK, endpoint: ENDPOINT_BEGIN, ts: 10, a: WORK_TASKLOOP, b: 1, d: 0x100, ..Default::default() };
+        encode_events_block(&mut out, &[work, event(kind::TASK_CREATE, 0, 11, 11, 1, RT)]);
+        // The helper thread's block comes first in the file, the symbols last.
+        let mut file = Vec::new();
+        encode_header(&mut file, 0, 1, 0, "h", "/lib/libomp.so", &[]);
+        encode_events_block(&mut file, &[event(kind::TASK_CREATE, 1, 12, 12, 1, RT)]);
+        file.extend_from_slice(&out[out.len() - (5 + 2 * EVENT_SIZE)..]);
+        encode_symbols_block(&mut file, &[Sym { addr: RT, load_bias: 0, module: "/lib/libomp.so".into(), symbol: String::new() }]);
+        let (_, events) = streamed("taskloop", &file);
+        assert_eq!(fields(&events), fields(&sorted(&file)));
+        let created: Vec<(u64, u64, u64)> = events.iter().filter(|e| e.kind == kind::TASK_CREATE).map(|e| (e.a, e.d, e.c)).collect();
+        assert_eq!(created, [(11, 0x100, RT), (12, 0x100, RT)]);
     }
 
     #[test]

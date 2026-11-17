@@ -114,7 +114,7 @@ fn work(m: &Model, id: u64) -> u64 {
 }
 
 fn crit_time(m: &Model, crit: &PathResult, id: u64) -> u64 {
-    crit.task_time[task(m, id)]
+    crit.time(task(m, id) as u32)
 }
 
 /// Checks the invariants that must hold for every trace: per-task critical
@@ -122,9 +122,9 @@ fn crit_time(m: &Model, crit: &PathResult, id: u64) -> u64 {
 /// partition the tasks so their work and critical times sum to T_1 and T_inf.
 fn check_invariants(m: &Model, crit: &PathResult) {
     for (i, t) in m.tasks.iter().enumerate() {
-        assert!(crit.task_time[i] <= t.work, "task {}: critical time {} > work {}", t.id, crit.task_time[i], t.work);
+        assert!(crit.time(i as u32) <= t.work, "task {}: critical time {} > work {}", t.id, crit.time(i as u32), t.work);
     }
-    assert_eq!(crit.task_time.iter().sum::<u64>(), crit.length, "critical times must add up to T_inf");
+    assert_eq!(crit.tasks.iter().map(|x| x.1).sum::<u64>(), crit.length, "critical times must add up to T_inf");
     assert!(crit.length <= m.total_work(), "T_inf must not exceed T_1");
 
     let origins = analysis::origins(m, crit);
@@ -197,7 +197,7 @@ fn taskwait_counts_and_work() {
     assert_eq!(work(&m, 2), 30);
     assert_eq!(work(&m, 3), 50);
     assert_eq!(m.total_work(), 130);
-    let creates = m.edges.iter().filter(|e| e.kind == EdgeKind::Create).count();
+    let creates = m.edges().filter(|e| e.kind == EdgeKind::Create).count();
     assert_eq!(creates, 2);
     check_invariants(&m, &crit);
 }
@@ -278,7 +278,7 @@ fn dependence_critical_path() {
     let (m, crit) = analyse(&dependence_trace());
     assert_eq!(m.tasks.len(), 4);
     assert_eq!(m.total_work(), 14 + 10 + 20 + 5);
-    let deps: Vec<_> = m.edges.iter().filter(|e| e.kind == EdgeKind::Depend).collect();
+    let deps: Vec<_> = m.edges().filter(|e| e.kind == EdgeKind::Depend).collect();
     assert_eq!(deps.len(), 1);
     assert_eq!((deps[0].from as usize, deps[0].to as usize), (task(&m, 2), task(&m, 3)));
 
@@ -360,10 +360,11 @@ fn parallel_region_work_and_stealing() {
     assert_eq!(work(&m, 20), 40);
     assert_eq!(m.total_work(), 70);
     // Task 20 was created on thread 0 and executed on thread 1.
-    let t20 = &m.tasks[task(&m, 20)];
-    assert_eq!(t20.create_thread, 0);
-    assert_eq!(t20.segs.len(), 1);
-    assert_eq!((t20.segs[0].thread, t20.segs[0].start, t20.segs[0].end), (1, 17, 57));
+    let t20 = task(&m, 20);
+    assert_eq!(m.tasks[t20].create_thread, 0);
+    let segs = m.segs(t20);
+    assert_eq!(segs.len(), 1);
+    assert_eq!((segs[0].thread, segs[0].start, segs[0].end), (1, 17, 57));
 }
 
 #[test]
@@ -427,8 +428,8 @@ fn region_of_independent_tasks() {
     let m = Model::build(&dependence_trace());
     let r = analysis::analyze_region(&m, &select(&m, &[2, 4]));
     assert_eq!((r.work, r.critical), (15, 10));
-    assert_eq!(r.path.task_time[task(&m, 2)], 10);
-    assert_eq!(r.path.task_time[task(&m, 4)], 0);
+    assert_eq!(r.path.time(task(&m, 2) as u32), 10);
+    assert_eq!(r.path.time(task(&m, 4) as u32), 0);
 }
 
 #[test]
@@ -771,14 +772,15 @@ fn gaps(trace: &Trace) -> Vec<(u64, u64, analysis::GapKind)> {
     let (m, crit) = analyse(trace);
     let g = analysis::critical_gaps(&m, &crit);
     // The intervals cover the run without holes and add up to the totals.
-    assert_eq!(g.intervals.first().map(|i| i.0), Some(0));
-    assert_eq!(g.intervals.last().map(|i| i.1), Some(m.wall));
-    assert!(g.intervals.windows(2).all(|w| w[0].1 == w[1].0 && w[0].2 != w[1].2), "contiguous and merged");
+    let intervals: Vec<_> = g.intervals().collect();
+    assert_eq!(intervals.first().map(|i| i.0), Some(0));
+    assert_eq!(intervals.last().map(|i| i.1), Some(m.wall));
+    assert!(intervals.windows(2).all(|w| w[0].1 == w[1].0 && w[0].2 != w[1].2), "contiguous and merged");
     for k in 0..4 {
-        let sum: u64 = g.intervals.iter().filter(|i| i.2 as usize == k).map(|i| i.1 - i.0).sum();
+        let sum: u64 = intervals.iter().filter(|i| i.2 as usize == k).map(|i| i.1 - i.0).sum();
         assert_eq!(sum, g.totals[k]);
     }
-    g.intervals
+    intervals
 }
 
 #[test]
