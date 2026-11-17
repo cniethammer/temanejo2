@@ -899,7 +899,7 @@ fn handle(mut stream: TcpStream, info: &str, ranks: &[Rank]) {
 
 // ------------------------------------------------------------------ main
 
-fn load(dir: &str, max_group: usize) -> Vec<Rank> {
+fn load(dir: &str, max_group: usize, modules: &symbolize::ModuleMap) -> Vec<Rank> {
     let mut files: Vec<_> = match std::fs::read_dir(dir) {
         Ok(d) => d.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "tmj")).collect(),
         Err(e) => {
@@ -948,7 +948,7 @@ fn load(dir: &str, max_group: usize) -> Vec<Rank> {
         let origins = analysis::origins(&model, &crit);
         let peak = analysis::peak_concurrency(&model);
         stats.analysis = stats.lap();
-        let locs = symbolize::symbolize(&trace.syms);
+        let locs = symbolize::symbolize(&trace.syms, modules);
         stats.symbols = stats.lap();
         let loc_of: HashMap<u64, usize> = locs.iter().enumerate().map(|(i, l)| (l.addr, i)).collect();
         let empty = Grouped { grouping: analysis::Grouping { max_group: 0, groups: Vec::new(), task_group: Vec::new() }, summaries: Vec::new() };
@@ -966,6 +966,7 @@ fn load(dir: &str, max_group: usize) -> Vec<Rank> {
     if let Some(peak) = peak_memory() {
         eprintln!("temanejo: peak memory {:.0} MB", peak as f64 / 1e6);
     }
+    modules.warn_unused(ranks.iter().flat_map(|r| r.locs.iter().map(|l| l.module.as_str())));
     ranks.sort_by_key(|r| r.model.rank);
     ranks
 }
@@ -1065,7 +1066,8 @@ fn main() {
     let mut bind = "127.0.0.1".to_string();
     let mut summary_only = false;
     let mut max_group = analysis::DEFAULT_MAX_GROUP;
-    const USAGE: &str = "usage: temanejo <trace-dir> [-p|--port PORT] [--bind ADDR] [--max-group N] [--summary] [-h|--help]";
+    let mut modules = symbolize::ModuleMap::default();
+    const USAGE: &str = "usage: temanejo <trace-dir> [-p|--port PORT] [--bind ADDR] [--max-group N] [--exe FILE]... [--summary] [-h|--help]";
     let usage_error = |msg: String| -> ! {
         eprintln!("temanejo: {msg}\n{USAGE}");
         std::process::exit(2);
@@ -1086,6 +1088,16 @@ fn main() {
                     _ => usage_error(format!("--max-group needs a number of at least {}", analysis::MIN_MAX_GROUP)),
                 }
             }
+            "--exe" => {
+                let Some(path) = args.next() else { usage_error("--exe needs a file".into()) };
+                let path = std::path::PathBuf::from(path);
+                if !path.is_file() {
+                    usage_error(format!("--exe {}: no such file", path.display()));
+                }
+                if !modules.add(path.clone()) {
+                    usage_error(format!("--exe {}: another file with this name was given before", path.display()));
+                }
+            }
             "--summary" => summary_only = true,
             "--help" | "-h" => {
                 println!("{USAGE}\n\nSee temanejo(1) for details.");
@@ -1098,7 +1110,7 @@ fn main() {
     }
     let Some(dir) = dir else { usage_error("no trace directory given".into()) };
 
-    let ranks = load(&dir, max_group);
+    let ranks = load(&dir, max_group, &modules);
     if ranks.is_empty() {
         eprintln!("temanejo: no rank-*.tmj files in {dir}");
         std::process::exit(1);

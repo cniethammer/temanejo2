@@ -4,7 +4,7 @@ temanejo
 Synopsis
 --------
 
-**temanejo** *trace-dir* [**-p** *port*] [**--bind** *address*] [**--max-group** *n*] [**--summary**]
+**temanejo** *trace-dir* [**-p** *port*] [**--bind** *address*] [**--max-group** *n*] [**--exe** *file*]... [**--summary**]
 
 **temanejo** **-h** | **--help**
 
@@ -51,6 +51,16 @@ Options
    Largest number of nodes (tasks and nested groups) a task group shows in
    the GUI when it is expanded. Groups with more tasks are split into nested
    groups. Default: 1000, minimum: 16. The GUI can change it per rank.
+
+**--exe** *file*
+   Read the debug information of a module recorded in the traces from
+   *file*. The traces store the path of every executable and shared library
+   as it was on the system that recorded them; a recorded module whose file
+   name equals that of *file* is read from *file* instead. Use it for traces
+   recorded on another system or after the program was moved. Can be given
+   several times, e.g. for the executable and its shared libraries; each
+   file name only once. A *file* that matches no recorded module is
+   reported together with the list of recorded modules.
 
 **--summary**
    Print the summary table and exit without starting the server.
@@ -118,8 +128,9 @@ Files
    Trace of MPI rank *N*.
 
 The executables and shared libraries recorded in the traces are read for
-their debug information. If they have been moved or rebuilt since the run,
-source locations are missing or wrong.
+their debug information, unless **--exe** names a local copy. If they have
+been moved, source locations are missing; if they have been rebuilt since
+the run, they are wrong.
 
 Examples
 --------
@@ -143,6 +154,11 @@ The same with the wrapper script from the source tree::
 
    OMP_NUM_THREADS=4 scripts/tmj-run -o traces mpirun -np 2 ./app
    temanejo traces
+
+View traces recorded on a cluster, with a copy of the application binary
+built with ``-g``::
+
+   temanejo traces --exe ~/cluster-build/app
 
 Serve on another port and view from a workstation through SSH::
 
