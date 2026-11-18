@@ -118,6 +118,15 @@ aside {
   padding: 4px 14px 24px;
 }
 aside h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 18px 0 8px; }
+/* Collapsible panel section: the heading is the summary, with a chevron;
+   collapsed, a one-line brief follows the heading. */
+details.sec > summary { list-style: none; cursor: pointer; display: flex; align-items: baseline; gap: 8px; margin: 18px 0 8px; }
+details.sec > summary::-webkit-details-marker { display: none; }
+details.sec > summary::before { content: ''; flex: none; align-self: center; border-style: solid; border-width: 4.5px 0 4.5px 7px; border-color: transparent transparent transparent var(--muted); transition: transform .1s; }
+details.sec[open] > summary::before { transform: rotate(90deg); }
+details.sec > summary h2 { margin: 0; flex: none; }
+details.sec > summary .brief { color: var(--ink2); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+details.sec[open] > summary .brief { display: none; }
 .muted { color: var(--muted); }
 .tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .tile { background: var(--surface); border: 1px solid var(--grid); border-radius: 8px; padding: 7px 10px; }

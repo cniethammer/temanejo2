@@ -11,6 +11,11 @@ the divider to reset it to the default of 400 pixels. With the divider focused, 
 width in steps of 20 pixels (80 with Shift). The width is remembered by the
 browser. On narrow windows the panel is placed below the graph instead.
 
+Click the *Process* heading to collapse the process summary to one line
+(average parallelism, number of tasks, critical path T\ :sub:`∞`) and give
+the sections below more room; click it again to expand it. The browser
+remembers whether it is collapsed.
+
 Keyboard
 --------
 
@@ -87,6 +92,10 @@ Max group size
 Collapse groups, Expand all
    Collapse all detected task groups into one node each (the state the GUI
    opens in), or expand all groups; see `Collapsing groups`_.
+
+Select critical path, Expand critical path
+   Select the tasks on the critical path for the region analysis, or expand
+   the groups containing them; see `Region analysis`_.
 
 Task id, Fit
    Jump to a task by its id; fit the view to the window (key ``F``).
@@ -385,7 +394,7 @@ Clicking a task shows:
 * every execution segment: thread, CPU (start → end if it changed), NUMA
   node, start and duration.
 
-*Select critical path* below the process summary selects every task with
+*Select critical path* in the toolbar selects every task with
 work on the critical path of the whole graph. The region's critical path
 T\ :sub:`∞` then equals that of the graph; its work T\ :sub:`1` is larger,
 because only part of some tasks' work lies on the path, and its measured

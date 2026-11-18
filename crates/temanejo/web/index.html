@@ -44,6 +44,10 @@
     <button id="collapse-all" title="Collapse all detected groups: taskloops, 8 or more sibling tasks created at the same source line, and large task trees">Collapse groups</button>
     <button id="expand-all" title="Expand all collapsed groups">Expand all</button>
   </div>
+  <div class="seg" aria-label="Critical path">
+    <button id="sel-crit" title="Select all tasks with work on the critical path for the region analysis">Select critical path</button>
+    <button id="exp-crit" title="Expand every group that contains a task on the critical path, through all nesting levels, so the whole path is visible">Expand critical path</button>
+  </div>
   <button id="fit" title="Fit to window (F)">Fit</button>
 </header>
 
@@ -59,12 +63,11 @@
   <div id="splitter" role="separator" aria-orientation="vertical" aria-label="Resize side panel" tabindex="0"
        title="Drag to resize the side panel · double-click to reset"></div>
   <aside>
-    <section>
-      <h2>Process</h2>
+    <details id="process" class="sec" open>
+      <summary><h2>Process</h2><span id="process-brief" class="brief"></span></summary>
       <div id="summary" class="tiles"></div>
-      <div id="summary-actions" class="actions"></div>
       <details id="runinfo" hidden></details>
-    </section>
+    </details>
     <section>
       <h2>Task origins</h2>
       <input id="origin-filter" type="search" placeholder="Filter by file or function…"

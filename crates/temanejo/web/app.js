@@ -320,13 +320,10 @@ function renderSummary() {
     tile(g.tasks.length, 'tasks') + tile(g.threads.length, 'threads') +
     tile(fmt(g.work), 'total work T₁') + tile(fmt(g.critical), 'critical path T∞') +
     tile(fmt(g.wall), 'wall time') + tile((g.work / Math.max(g.wall, 1)).toFixed(2), 'measured avg. concurrency');
+  // Shown next to the heading while the section is collapsed.
+  $('process-brief').textContent = `parallelism ${par.toFixed(2)} · ${g.tasks.length} tasks · T∞ ${fmt(g.critical)}`;
   const n = criticalTasks().size;
-  $('summary-actions').innerHTML =
-    `<button id="sel-crit" title="Select all tasks with work on the critical path for the region analysis">Select critical path</button>` +
-    `<button id="exp-crit" title="Expand every group that contains a task on the critical path, through all nesting levels, so the whole path is visible">Expand critical path</button>` +
-    `<span class="muted">${n} task${n === 1 ? '' : 's'} on the path</span>`;
-  $('sel-crit').onclick = () => setRegion(criticalTasks());
-  $('exp-crit').onclick = expandCriticalPath;
+  $('sel-crit').title = `Select the ${n} task${n === 1 ? '' : 's'} with work on the critical path for the region analysis`;
   renderRunInfo();
 }
 
@@ -1463,6 +1460,8 @@ for (const v of ['graph', 'timeline']) $('view-' + v).onclick = async () => {
   draw();
 };
 $('fit').onclick = fit;
+$('sel-crit').onclick = () => S.g && setRegion(criticalTasks());
+$('exp-crit').onclick = () => S.g && expandCriticalPath();
 $('collapse-all').onclick = () => S.g && setCollapsed(S.groups.filter(x => x.server), true);
 $('expand-all').onclick = async () => {
   if (!S.g) return;
@@ -1537,6 +1536,11 @@ try {
   const saved = Number(localStorage.getItem('temanejo.asideWidth'));
   if (saved) document.documentElement.style.setProperty('--aside-w', saved + 'px');
 } catch { /* storage unavailable */ }
+// The process section stays open or collapsed across visits.
+try { if (localStorage.getItem('temanejo.processOpen') === '0') $('process').open = false; } catch { /* storage unavailable */ }
+$('process').addEventListener('toggle', () => {
+  try { localStorage.setItem('temanejo.processOpen', $('process').open ? '1' : '0'); } catch { /* storage unavailable */ }
+});
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { readCss(); draw(); });
 
 // ------------------------------------------------------------------ legend
