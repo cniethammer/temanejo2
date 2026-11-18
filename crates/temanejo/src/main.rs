@@ -927,6 +927,27 @@ fn handle(mut stream: TcpStream, info: &str, ranks: &[Rank]) {
 
 // ------------------------------------------------------------------ main
 
+/// Ranks are addressed by their number, so each must be unique. Processes
+/// whose launcher set no known rank variable all record rank 0 (the tool
+/// writes them to `rank-0-<host>-<pid>.tmj`); such duplicates get numbers
+/// above the largest rank, in file name order. A file named after its rank
+/// (`rank-0.tmj`) keeps it.
+fn renumber_duplicate_ranks(ranks: &mut [Rank], names: &[String]) {
+    let mut seen = std::collections::HashSet::new();
+    let mut next = ranks.iter().map(|r| r.model.rank).max().map_or(0, |m| m + 1);
+    let mut order: Vec<usize> = (0..ranks.len()).collect();
+    order.sort_by_key(|&i| names[i] != format!("rank-{}.tmj", ranks[i].model.rank));
+    for i in order {
+        let (r, name) = (&mut ranks[i], &names[i]);
+        if !seen.insert(r.model.rank) {
+            eprintln!("temanejo: {name}: rank {} occurs in more than one file (no MPI rank known when it was recorded?); shown as rank {next}", r.model.rank);
+            r.model.rank = next;
+            seen.insert(next);
+            next += 1;
+        }
+    }
+}
+
 fn load(dir: &str, max_group: usize, modules: &symbolize::ModuleMap) -> Vec<Rank> {
     let mut files: Vec<_> = match std::fs::read_dir(dir) {
         Ok(d) => d.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "tmj")).collect(),
@@ -937,6 +958,7 @@ fn load(dir: &str, max_group: usize, modules: &symbolize::ModuleMap) -> Vec<Rank
     };
     files.sort();
     let mut ranks = Vec::new();
+    let mut names = Vec::new(); // file name of each rank
     let started = std::time::Instant::now();
     let mut total = LoadStats::default();
     for path in files {
@@ -986,8 +1008,10 @@ fn load(dir: &str, max_group: usize, modules: &symbolize::ModuleMap) -> Vec<Rank
         stats.analysis += stats.lap();
         eprintln!("temanejo: {}: {}", path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()), stats.describe());
         total.add(&stats);
+        names.push(path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()));
         ranks.push(rank);
     }
+    renumber_duplicate_ranks(&mut ranks, &names);
     if total.files > 1 {
         eprintln!("temanejo: {} files: {}, {:.2} s in total", total.files, total.describe(), started.elapsed().as_secs_f64());
     }

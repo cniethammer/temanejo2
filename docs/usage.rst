@@ -239,9 +239,29 @@ Environment variables of the tool
    Read by ``tmj-run`` only: tool library to use instead of
    ``target/release/libtmj_ompt.so``.
 
-``PMIX_RANK``, ``OMPI_COMM_WORLD_RANK``, ``PMI_RANK``
-   Set by the MPI launcher. The first one present that holds a number is used
-   as the rank in the trace file name. Without any of them the rank is 0.
+``TEMANEJO_RANK``
+   The rank to record, for launchers that set none of the variables below.
+
+Rank variables of MPI launchers
+   The rank is the value of the first of these variables that holds a
+   number:
+
+   ======================== ==================================================
+   ``TEMANEJO_RANK``        set by the user
+   ``PMIX_RANK``            PRRTE / PMIx: Open MPI 5, ``srun --mpi=pmix``
+   ``OMPI_COMM_WORLD_RANK`` Open MPI
+   ``PMI_RANK``             Hydra (MPICH, Intel MPI), ``srun --mpi=pmi2``
+   ``MV2_COMM_WORLD_RANK``  MVAPICH ``mpirun_rsh``
+   ``PALS_RANKID``          HPE Cray PALS: Cray MPICH with ``mpiexec`` or
+                            ``srun --mpi=cray_shasta``
+   ``ALPS_APP_PE``          Cray ALPS (``aprun``)
+   ``SLURM_PROCID``         ``srun``
+   ======================== ==================================================
+
+   ``SLURM_PROCID`` comes last because an ``mpirun`` inside a Slurm job
+   leaves it at the value of the job step for all its processes. The run
+   information in the GUI names the variable used (``mpi.rank_from``) and
+   the Slurm or PBS job id.
 
 Output
 ------
@@ -252,6 +272,14 @@ runtime finalizes, normally at program exit. The format is described in
 :doc:`trace-format`. Existing files of the same name are overwritten, so use
 a fresh directory per run. If the file cannot be created, the tool reports
 it and records nothing.
+
+Without a rank variable the rank is 0. So that processes started by an
+unknown launcher do not overwrite each other's ``rank-0.tmj``, a process
+without a rank writes it only if it gets an exclusive lock (``flock``) on
+it; otherwise, or on file systems without locking, it writes
+``rank-0-<host>-<pid>.tmj`` and says so on standard error. **temanejo**
+shows files with the same rank under the numbers following the largest
+rank and names them in a warning; the file named after its rank keeps it.
 
 The file header also records what is known about the run: the OpenMP
 runtime and its version, executable, command line and working directory,

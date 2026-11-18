@@ -4,8 +4,9 @@
 //! writes `<TEMANEJO_TRACE_DIR>/rank-<N>.tmj`: a thread appends its events
 //! as a block whenever its buffer is full (`TEMANEJO_BUFFER_SIZE`) or older
 //! than `TEMANEJO_FLUSH_INTERVAL`, and everything left when the OpenMP
-//! runtime shuts down. The MPI rank is taken from the launcher environment (PMIx / Open MPI),
-//! so the tool has no link-time dependency on any MPI library.
+//! runtime shuts down. The MPI rank is taken from the launcher environment
+//! (`RANK_VARS`: PMIx, Open MPI, Hydra, Cray PALS / ALPS, Slurm, or
+//! `TEMANEJO_RANK`), so the tool has no link-time dependency on any MPI library.
 //!
 //! Callbacks only append fixed-size records to a per-thread buffer, which is
 //! written out in one piece; all graph reconstruction happens post mortem in
@@ -90,7 +91,11 @@ extern "C" {
     fn dladdr1(addr: *const c_void, info: *mut DlInfo, extra: *mut *mut c_void, flags: c_int) -> c_int;
     fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
     fn backtrace(buffer: *mut *mut c_void, size: c_int) -> c_int;
+    fn flock(fd: c_int, operation: c_int) -> c_int;
 }
+
+const LOCK_EX: c_int = 2;
+const LOCK_NB: c_int = 4;
 
 #[inline]
 fn now(clk: c_int) -> u64 {
@@ -522,16 +527,21 @@ unsafe fn run_info(lookup: Lookup) -> Vec<(String, String)> {
             add("process.cpus_allowed", line.trim().to_string());
         }
     }
-    for (key, vars) in [("mpi.world_size", ["OMPI_COMM_WORLD_SIZE", "PMI_SIZE"])] {
-        if let Some(v) = vars.iter().find_map(|v| std::env::var(v).ok()) {
-            add(key, v);
-        }
+    if let Some(v) = ["OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "MV2_COMM_WORLD_SIZE", "SLURM_NTASKS"].iter().find_map(|v| std::env::var(v).ok()) {
+        add("mpi.world_size", v);
+    }
+    // Where the rank came from (see RANK_VARS), and the job it belongs to.
+    if let Some((var, _)) = rank_from(|v| std::env::var(v).ok()) {
+        add("mpi.rank_from", var.to_string());
+    }
+    for (key, var) in [("job.slurm", "SLURM_JOB_ID"), ("job.pbs", "PBS_JOBID"), ("job.pals_apid", "PALS_APID")] {
+        add(key, std::env::var(var).unwrap_or_default());
     }
 
-    // Environment variables that configure OpenMP runtimes and this tool.
+    // Environment variables that configure OpenMP runtimes, Cray MPICH and this tool.
     let mut env: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.to_string_lossy().into_owned())))
-        .filter(|(k, _)| ["OMP_", "KMP_", "GOMP_", "LIBOMP_", "TEMANEJO_"].iter().any(|p| k.starts_with(p)))
+        .filter(|(k, _)| ["OMP_", "KMP_", "GOMP_", "LIBOMP_", "MPICH_", "TEMANEJO_"].iter().any(|p| k.starts_with(p)))
         .collect();
     env.sort();
     for (k, v) in env {
@@ -543,16 +553,20 @@ unsafe fn run_info(lookup: Lookup) -> Vec<(String, String)> {
 /// Creates the trace file and writes its header.
 unsafe fn open_output(lookup: Lookup) -> Result<(), String> {
     let runtime_addr = lookup as usize as u64;
-    let rank = mpi_rank();
+    let rank = rank_from(|v| std::env::var(v).ok());
     let dir = std::env::var("TEMANEJO_TRACE_DIR").unwrap_or_else(|_| "tmj-trace".into());
-    let path = format!("{dir}/rank-{rank}.tmj");
     let mut host = [0 as c_char; 256];
     gethostname(host.as_mut_ptr(), host.len() - 1);
+    let host = cstr(host.as_ptr());
+    let (mut file, path) = std::fs::create_dir_all(&dir)
+        .and_then(|_| create_trace_file(&dir, rank.map(|r| r.1), &host, std::process::id()))
+        .map_err(|e| format!("cannot create a trace file in {dir}: {e}"))?;
+    if rank.is_none() && !path.ends_with("/rank-0.tmj") {
+        eprintln!("[temanejo] no MPI rank in the environment and another process writes rank-0.tmj; writing {path} (set TEMANEJO_RANK to name the rank)");
+    }
+    let rank = rank.map_or(0, |r| r.1);
     let mut header = Vec::new();
-    tmj_trace::encode_header(&mut header, rank, std::process::id(), EPOCH_NS.load(Relaxed), &cstr(host.as_ptr()), &resolve(runtime_addr).module, &run_info(lookup));
-    let mut file = std::fs::create_dir_all(&dir)
-        .and_then(|_| std::fs::File::create(&path))
-        .map_err(|e| format!("rank {rank}: cannot create {path}: {e}"))?;
+    tmj_trace::encode_header(&mut header, rank, std::process::id(), EPOCH_NS.load(Relaxed), &host, &resolve(runtime_addr).module, &run_info(lookup));
     file.write_all(&header).map_err(|e| format!("rank {rank}: cannot write {path}: {e}"))?;
     if verbose() {
         let buffer = match BUFFER_EVENTS.load(Relaxed) {
@@ -569,14 +583,47 @@ unsafe fn open_output(lookup: Lookup) -> Result<(), String> {
     Ok(())
 }
 
-fn mpi_rank() -> u32 {
-    // Set by PRRTE/PMIx (Open MPI 5), Open MPI itself, and Hydra/Slurm PMI.
-    for var in ["PMIX_RANK", "OMPI_COMM_WORLD_RANK", "PMI_RANK"] {
-        if let Some(r) = std::env::var(var).ok().and_then(|v| v.trim().parse().ok()) {
-            return r;
-        }
+/// Environment variables holding the MPI rank of the process, in the order
+/// they are tried. The launcher-specific ones come before `SLURM_PROCID`,
+/// which an `mpirun` inside a Slurm job leaves at the value of the job step.
+pub const RANK_VARS: [&str; 8] = [
+    "TEMANEJO_RANK",        // set by the user
+    "PMIX_RANK",            // PRRTE / PMIx (Open MPI 5, srun --mpi=pmix)
+    "OMPI_COMM_WORLD_RANK", // Open MPI
+    "PMI_RANK",             // Hydra (MPICH, Intel MPI), srun --mpi=pmi2
+    "MV2_COMM_WORLD_RANK",  // MVAPICH mpirun_rsh
+    "PALS_RANKID",          // HPE Cray PALS (mpiexec, srun --mpi=cray_shasta)
+    "ALPS_APP_PE",          // Cray ALPS (aprun)
+    "SLURM_PROCID",         // srun
+];
+
+/// The rank and the variable it was found in, from `get` (the environment).
+pub fn rank_from(get: impl Fn(&str) -> Option<String>) -> Option<(&'static str, u32)> {
+    RANK_VARS.iter().find_map(|&var| Some((var, get(var)?.trim().parse().ok()?)))
+}
+
+/// Creates the trace file `rank-<rank>.tmj` in `dir`, replacing a file of an
+/// earlier run. Without a known rank, processes started by an unknown
+/// launcher would all write `rank-0.tmj` and destroy each other's traces:
+/// then the file is only taken if an exclusive lock on it can be had, and
+/// otherwise (taken by another process, or no locking on the file system)
+/// `rank-0-<host>-<pid>.tmj` is written.
+pub fn create_trace_file(dir: &str, rank: Option<u32>, host: &str, pid: u32) -> std::io::Result<(std::fs::File, String)> {
+    use std::os::fd::AsRawFd;
+    if let Some(r) = rank {
+        let path = format!("{dir}/rank-{r}.tmj");
+        return Ok((std::fs::File::create(&path)?, path));
     }
-    0
+    let path = format!("{dir}/rank-0.tmj");
+    // Not truncated before the lock is held: it may be another process's trace.
+    let file = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&path)?;
+    if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+        file.set_len(0)?;
+        return Ok((file, path)); // the lock lasts as long as the file is open
+    }
+    let host: String = host.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect();
+    let path = format!("{dir}/rank-0-{host}-{pid}.tmj");
+    Ok((std::fs::File::create(&path)?, path))
 }
 
 unsafe fn cstr(p: *const c_char) -> String {
@@ -640,4 +687,54 @@ pub unsafe extern "C" fn ompt_start_tool(omp_version: c_uint, runtime_version: *
         eprintln!("[temanejo] OMPT tool attached to runtime: {}", cstr(runtime_version));
     }
     Box::into_raw(Box::new(StartToolResult { initialize, finalize, tool_data: OmptData { value: 0 } }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+    }
+
+    #[test]
+    fn rank_from_launchers() {
+        assert_eq!(rank_from(env(&[])), None);
+        // srun with Cray MPICH (cray_shasta), PBS + PALS mpiexec, aprun
+        assert_eq!(rank_from(env(&[("SLURM_PROCID", "5"), ("PALS_RANKID", "5")])), Some(("PALS_RANKID", 5)));
+        assert_eq!(rank_from(env(&[("PALS_RANKID", "3")])), Some(("PALS_RANKID", 3)));
+        assert_eq!(rank_from(env(&[("ALPS_APP_PE", "7")])), Some(("ALPS_APP_PE", 7)));
+        assert_eq!(rank_from(env(&[("SLURM_PROCID", "2")])), Some(("SLURM_PROCID", 2)));
+        // mpirun inside a Slurm job: the launcher's rank wins over the job step's
+        assert_eq!(rank_from(env(&[("SLURM_PROCID", "0"), ("OMPI_COMM_WORLD_RANK", "3"), ("PMIX_RANK", "3")])), Some(("PMIX_RANK", 3)));
+        assert_eq!(rank_from(env(&[("PMI_RANK", " 4 ")])), Some(("PMI_RANK", 4)));
+        // the user's setting wins; unparsable values are skipped
+        assert_eq!(rank_from(env(&[("TEMANEJO_RANK", "9"), ("PMIX_RANK", "1")])), Some(("TEMANEJO_RANK", 9)));
+        assert_eq!(rank_from(env(&[("PMIX_RANK", "x"), ("SLURM_PROCID", "6")])), Some(("SLURM_PROCID", 6)));
+    }
+
+    #[test]
+    fn unknown_ranks_do_not_share_a_file() {
+        let dir = std::env::temp_dir().join(format!("tmj-ompt-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        // A file of an earlier run is replaced.
+        std::fs::write(dir.join("rank-0.tmj"), b"old").unwrap();
+        let (a, pa) = create_trace_file(d, None, "nid001", 100).unwrap();
+        assert!(pa.ends_with("/rank-0.tmj"));
+        assert_eq!(std::fs::metadata(&pa).unwrap().len(), 0);
+        // A second process without a rank must not take (and truncate) it.
+        std::fs::write(&pa, b"trace").unwrap();
+        let (_b, pb) = create_trace_file(d, None, "nid 002", 200).unwrap();
+        assert!(pb.ends_with("/rank-0-nid_002-200.tmj"), "{pb}");
+        assert_eq!(std::fs::read(&pa).unwrap(), b"trace");
+        // Once the first one has finished, rank-0.tmj is free again.
+        drop(a);
+        let (_c, pc) = create_trace_file(d, None, "nid001", 300).unwrap();
+        assert!(pc.ends_with("/rank-0.tmj"));
+        // Known ranks get their file directly.
+        let (_r, pr) = create_trace_file(d, Some(12), "nid001", 400).unwrap();
+        assert!(pr.ends_with("/rank-12.tmj"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

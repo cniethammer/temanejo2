@@ -179,8 +179,10 @@ synthetic traces (see Tests); the OMPT tool itself is only tested manually.
   `TEMANEJO_BUFFER_SIZE` and `TEMANEJO_FLUSH_INTERVAL` in the documentation).
   A program that crashes or calls `_exit` leaves an incomplete trace with
   the events written up to then, which the viewer still loads.
-- The MPI rank is read from `PMIX_RANK`, `OMPI_COMM_WORLD_RANK` or
-  `PMI_RANK`. Without any of them every process writes `rank-0.tmj`.
+- The MPI rank is read from the launcher's environment (PMIx, Open MPI,
+  Hydra, MVAPICH, HPE Cray PALS and ALPS, Slurm; see the documentation) or
+  from `TEMANEJO_RANK`. Processes without one write `rank-0.tmj`, or
+  `rank-0-<host>-<pid>.tmj` if another process holds it.
 - Clocks of different ranks are not aligned; each rank's time starts at its
   first OMPT event. MPI calls are not recorded, so time blocked in MPI counts
   as work of the task that made the call; serial calls such as

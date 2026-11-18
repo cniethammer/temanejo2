@@ -118,7 +118,7 @@ the network.
 
 The variables that control trace recording (``OMP_TOOL_LIBRARIES``,
 ``TEMANEJO_TRACE_DIR``, ``TEMANEJO_BUFFER_SIZE``, ``TEMANEJO_FLUSH_INTERVAL``,
-``TEMANEJO_SYNC``, ``TEMANEJO_VERBOSE``) are read by the application
+``TEMANEJO_SYNC``, ``TEMANEJO_VERBOSE``, ``TEMANEJO_RANK``) are read by the application
 being traced, not by **temanejo**.
 
 Files
