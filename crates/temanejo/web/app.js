@@ -660,7 +660,7 @@ function drawGraph() {
     for (let c = 0; c < 4; c++)
       pass(e => e[2] === 1 && inSel(e) && depClasses(e[5]).includes(c), css.depCls[c], lw, far && !isCrit(e) ? 0.5 : 0.95, laneOf(c));
   }
-  if (S.regionPairs.length) pass(e => e[2] === 0 && e[4], css.ink, 2.5, 1);
+  if (S.showCreate && S.regionPairs.length) pass(e => e[2] === 0 && e[4], css.ink, 2.5, 1);
   if (S.showCrit) pass(e => e[2] === 0 && e[3] && shown(e) && inSel(e), css.critical, critWidth, 1);
 
   // Nodes, batched: one path per fill colour and one per kind of mark, so a
