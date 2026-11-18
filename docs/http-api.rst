@@ -56,7 +56,14 @@ The server has no authentication and binds to ``127.0.0.1`` by default.
    ``crit``
       ``[task, work on the critical path]`` for the tasks on it.
    ``cc``
-      Tasks whose creation edge is on the critical path.
+      Tasks whose creation edge the critical path follows from the parent to
+      the task.
+   ``cj``
+      ``[from, to]`` task pairs: the steps of the critical path that follow
+      no creation or dependence edge forwards, *joins*: a task returning to
+      the parent waiting for it (``taskwait``, ``taskgroup``, barrier, end of
+      a parallel region) and the step between two tasks of a team at a
+      barrier. Also in the full graph document.
    ``cats``
       The values occurring in each colour category over all tasks:
       ``thread``, ``cpu``, ``numa`` (of the first execution segment; thread:
@@ -223,8 +230,9 @@ The server has no authentication and binds to ``127.0.0.1`` by default.
 
    ``edges``
       ``[from, to, kind, critical]``: task indices; kind 0 creation, 1
-      dependence; critical 1 if the critical path passes from one task to
-      the other. Dependence edges have a fifth element, the variables that
+      dependence; critical 1 if the critical path follows the edge from
+      ``from`` to ``to`` (a return of the path to a waiting task is listed
+      in ``cj``, not here). Dependence edges have a fifth element, the variables that
       order the two tasks, in the format of ``dpv`` (see ``/group``).
 
 ``POST /api/rank/<rank>/region``
@@ -245,8 +253,10 @@ The server has no authentication and binds to ``127.0.0.1`` by default.
    ``bucket``     bucket width
    ``per_thread`` ``[thread, work time]``
    ``crit_tasks`` ``[task, work on the selection's critical path]``
-   ``crit_edges`` ``[task, task]`` pairs the selection's critical path
-                  passes between
+   ``crit_edges`` ``[from, to]`` pairs of tasks the selection's critical
+                  path passes between along a creation or dependence
+                  edge
+   ``crit_joins`` ``[from, to]`` its other steps (joins, see ``cj``)
    ============== ======================================================
 
 Unknown paths and ranks return status 404.

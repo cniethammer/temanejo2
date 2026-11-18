@@ -433,9 +433,11 @@ fn full_json(o: &mut Json, r: &Rank) {
     }
     o.push_str("],\"origins\":");
     origins_json(o, r);
+    o.push_str(",\"cj\":");
+    list(o, analysis::joins(m, &crit.transitions).iter().map(|(a, b)| format!("[{a},{b}]")));
     o.push_str(",\"edges\":[");
     for (i, e) in m.edges().enumerate() {
-        let on_path = crit.transitions.contains(&(e.from, e.to)) || crit.transitions.contains(&(e.to, e.from));
+        let on_path = crit.transitions.contains(&(e.from, e.to));
         o.spill();
         let _ = write!(o, "{}[{},{},{},{}", if i > 0 { "," } else { "" }, e.from, e.to, e.kind as u8, on_path as u8);
         // Dependence edges also carry their variables (see dep_vars_json).
@@ -588,8 +590,10 @@ fn graph_json(o: &mut Json, r: &Rank, grouped: &Grouped) {
     o.push_str(",\"crit\":");
     list(o, crit.tasks.iter().map(|(i, c)| format!("[{i},{c}]")));
     o.push_str(",\"cc\":");
-    let on_path = |a: u32, b: u32| crit.transitions.contains(&(a, b)) || crit.transitions.contains(&(b, a));
-    list(o, m.tasks.iter().enumerate().filter(|(i, t)| t.parent != NONE && on_path(t.parent, *i as u32)).map(|(i, _)| i));
+    list(o, m.tasks.iter().enumerate().filter(|(i, t)| t.parent != NONE && crit.transitions.contains(&(t.parent, *i as u32))).map(|(i, _)| i));
+    // Steps of the path back to a waiting task (analysis::joins).
+    o.push_str(",\"cj\":");
+    list(o, analysis::joins(m, &crit.transitions).iter().map(|(a, b)| format!("[{a},{b}]")));
 
     // Category values and time ranges over all tasks; the rules match
     // catValue and SEQUENTIAL in web/app.js.
@@ -773,11 +777,13 @@ fn region_json(m: &Model, body: &str) -> String {
         let _ = write!(o, "{}[{},{}]", if first { "" } else { "," }, i, t);
         first = false;
     }
-    o.push_str("],\"crit_edges\":[");
-    for (i, (a, b)) in r.path.transitions.iter().enumerate() {
-        let _ = write!(o, "{}[{},{}]", if i > 0 { "," } else { "" }, a, b);
-    }
-    o.push_str("]}");
+    // Steps along creation and dependence edges, and the others (joins).
+    let joins = analysis::joins(m, &r.path.transitions);
+    o.push_str("],\"crit_edges\":");
+    list(&mut o, r.path.transitions.iter().filter(|t| joins.binary_search(t).is_err()).map(|(a, b)| format!("[{a},{b}]")));
+    o.push_str(",\"crit_joins\":");
+    list(&mut o, joins.iter().map(|(a, b)| format!("[{a},{b}]")));
+    o.push('}');
     o
 }
 

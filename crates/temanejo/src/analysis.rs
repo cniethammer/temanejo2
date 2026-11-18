@@ -92,6 +92,18 @@ pub fn critical_path(m: &Model, selected: Option<&[bool]>) -> PathResult {
     PathResult { length: best.0, tasks, transitions }
 }
 
+/// The steps of a path from one task to another that follow no edge of the
+/// display graph forwards: a child returning to the parent that waits for it
+/// (taskwait, taskgroup, barrier, end of a parallel region) and the step
+/// between two tasks of a team at a barrier. All other steps go from a
+/// parent to the child it creates or along a dependence edge. Sorted.
+pub fn joins(m: &Model, transitions: &HashSet<(u32, u32)>) -> Vec<(u32, u32)> {
+    let deps: HashSet<(u32, u32)> = m.depends().filter(|e| transitions.contains(e)).collect();
+    let mut out: Vec<(u32, u32)> = transitions.iter().copied().filter(|&(a, b)| m.tasks[b as usize].parent != a && !deps.contains(&(a, b))).collect();
+    out.sort_unstable();
+    out
+}
+
 impl PathResult {
     /// Critical work time of task `t` (0 if it is not on the path).
     pub fn time(&self, t: u32) -> u64 {
@@ -686,7 +698,7 @@ pub fn visible_dependences(m: &Model, crit: &PathResult, grouping: &Grouping, ex
         let (a, b) = (node[from as usize], node[to as usize]);
         if a != b {
             let e = merged.entry((a, b)).or_default();
-            e.0 |= crit.transitions.contains(&(from, to)) || crit.transitions.contains(&(to, from));
+            e.0 |= crit.transitions.contains(&(from, to));
             e.1 |= dependence_class(m, from, to);
         }
     }

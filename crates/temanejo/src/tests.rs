@@ -216,6 +216,8 @@ fn taskwait_critical_path() {
     assert_eq!(crit_time(&m, &crit, 3), 50);
     let (i, b) = (task(&m, 1) as u32, task(&m, 3) as u32);
     assert!(crit.transitions.contains(&(i, b)) && crit.transitions.contains(&(b, i)));
+    // I creates B (a creation edge); B returns to I at the taskwait (a join).
+    assert_eq!(analysis::joins(&m, &crit.transitions), [(b, i)]);
 }
 
 #[test]

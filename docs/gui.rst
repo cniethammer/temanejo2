@@ -109,6 +109,15 @@ including a parallel region's encountering task to the implicit tasks),
 coloured edges with arrowheads are ``depend`` dependences, coloured by type
 (see `Dependence types`_). Red marks the critical path.
 
+The critical path also goes back up the graph: from a task to the parent
+waiting for it at a ``taskwait``, ``taskgroup`` or barrier, from one task
+of a team to another at a barrier, and from the implicit tasks to the
+initial task at the end of a parallel region. These steps (*joins*) have no
+edge of their own in the graph; they are drawn as dashed red arrows, curved
+so that they do not cover the creation edge between the same two tasks.
+The critical path of a selected region shows its joins as dashed black
+arrows. Joins are not used for the layout.
+
 Tasks that create many children (8 or more, e.g. the task running a
 ``taskloop`` or a ``single`` that spawns all tasks of a phase) have their
 creation edges drawn as a *bus*: a short trunk below the parent, a

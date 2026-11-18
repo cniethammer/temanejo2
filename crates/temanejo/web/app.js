@@ -53,7 +53,7 @@ const FLAGS = [[0x08000000, 'undeferred'], [0x10000000, 'untied'], [0x20000000, 
 const S = {
   g: null, view: 'graph', colorBy: 'thread',
   showCrit: true, showCreate: true, showDep: true, fadeOthers: true,
-  sel: -1, region: new Set(), regionInfo: null, regionCrit: new Map(), regionPairs: [],
+  sel: -1, region: new Set(), regionInfo: null, regionCrit: new Map(), regionPairs: [], regionJoins: [],
   cam: { x: 0, y: 0, k: 1 },           // graph camera: screen = world * k + (x, y)
   tl: { t0: 0, t1: 1 },                // visible time window of the timeline
   drag: null, hover: -1, hoverGroup: -1, css: {}, children: [], succ: [], pred: [],
@@ -229,7 +229,8 @@ async function loadRank(rank, maxGroup) {
   S.depView = [];   // dependence edges between the visible nodes, see refreshView
   S.tl = { t0: 0, t1: Math.max(g.wall, 1) };
   assignSlots();
-  S.hoverGroup = -1; S.region = new Set(); S.regionPairs = [];
+  S.critJoins = g.cj || [];   // steps of the critical path back to a waiting task
+  S.hoverGroup = -1; S.region = new Set(); S.regionPairs = []; S.regionJoins = [];
   // The server's group tree, all collapsed. `tasks` are a group's direct
   // tasks, `sub` its child groups.
   S.groups = g.groups.map((sg, id) => ({ id, kind: sg.kind, anchor: sg.anchor, loc: sg.loc, parent: sg.parent, rep: sg.rep, part: sg.part,
@@ -583,15 +584,17 @@ function edgePainter() {
   // Arrowhead of a dependence edge: its tip, unit direction and length, or
   // null if there is none.
   const arrow = (e, p, width) => {
-    if (e[2] !== 1 || far) return null;
+    if (e[2] === 0 || far) return null;
     const [x0, y0, x1, y1] = p, len = Math.hypot(x1 - x0, y1 - y0);
     return len < 2 * head ? null : [x1, y1, (x1 - x0) / len, (y1 - y0) / len, head + width];
   };
   // Strokes the edges that satisfy `pred`. `lane(e)`: sideways offset of the
   // line in px (one line per dependence class); `arrows`: whether dependence
   // edges get their arrowhead.
-  const pass = (pred, style, width, alpha, lane = null, arrows = true, edges = S.vEdges) => {
-    ctx.strokeStyle = style; ctx.lineWidth = width; ctx.globalAlpha = alpha;
+  // Joins (kind 2) are curved to the right of their direction, so one that
+  // returns along a creation edge does not cover it; `dash`: line dash.
+  const pass = (pred, style, width, alpha, lane = null, arrows = true, edges = S.vEdges, dash = []) => {
+    ctx.strokeStyle = style; ctx.lineWidth = width; ctx.globalAlpha = alpha; ctx.setLineDash(dash);
     let count = 0;
     const heads = new Path2D();
     ctx.beginPath();
@@ -604,7 +607,13 @@ function edgePainter() {
         const len = Math.hypot(p[2] - p[0], p[3] - p[1]) || 1, nx = -(p[3] - p[1]) / len * o, ny = (p[2] - p[0]) / len * o;
         p = [p[0] + nx, p[1] + ny, p[2] + nx, p[3] + ny];
       }
-      ctx.moveTo(p[0], p[1]); ctx.lineTo(p[2], p[3]);
+      ctx.moveTo(p[0], p[1]);
+      if (e[2] === 2) {
+        const dx = p[2] - p[0], dy = p[3] - p[1], len = Math.hypot(dx, dy) || 1, bend = Math.min(0.2 * len, 30 * k + 10);
+        const cx = (p[0] + p[2]) / 2 - dy / len * bend, cy = (p[1] + p[3]) / 2 + dx / len * bend;
+        ctx.quadraticCurveTo(cx, cy, p[2], p[3]);
+        p = [cx, cy, p[2], p[3]];   // the arrowhead follows the curve's end
+      } else ctx.lineTo(p[2], p[3]);
       if (++count === 1024) { ctx.stroke(); ctx.beginPath(); count = 0; }
       const h = arrows && arrow(e, p, width);
       if (h) {
@@ -615,7 +624,7 @@ function edgePainter() {
         heads.closePath();
       }
     }
-    ctx.stroke();
+    ctx.stroke(); ctx.setLineDash([]);
     ctx.fillStyle = style; ctx.fill(heads);
     ctx.globalAlpha = 1;
   };
@@ -639,7 +648,7 @@ function drawGraph() {
   const fade = S.fadeOthers && S.region.size > 0;
   const inReg = i => S.repGroup[i] >= 0 ? S.groups[S.repGroup[i]].inRegion : S.region.has(i);
   const inSel = e => !fade || (inReg(e[0]) && inReg(e[1]));
-  const shown = e => e[2] === 0 ? S.showCreate : S.showDep;
+  const shown = e => e[2] === 0 ? S.showCreate : e[2] === 1 && S.showDep;
   // Creation edges of large fans are drawn as a bus (see drawFans); only
   // their critical path edges are drawn as direct lines.
   const direct = e => e[2] !== 0 || !S.fanChild[e[1]];
@@ -662,6 +671,10 @@ function drawGraph() {
   }
   if (S.showCreate && S.regionPairs.length) pass(e => e[2] === 0 && e[4], css.ink, 2.5, 1);
   if (S.showCrit) pass(e => e[2] === 0 && e[3] && shown(e) && inSel(e), css.critical, critWidth, 1);
+  // Joins of the critical paths: dashed arrows back to the waiting task.
+  const joinWidth = Math.max(1.5, 0.75 * critWidth), joinDash = [6, 4];
+  if (S.regionJoins.length) pass(e => e[2] === 2 && e[4], css.ink, joinWidth + 1, 1, null, true, S.vEdges, joinDash);
+  if (S.showCrit) pass(e => e[2] === 2 && e[3] && inSel(e), css.critical, joinWidth, 1, null, true, S.vEdges, joinDash);
 
   // Nodes, batched: one path per fill colour and one per kind of mark, so a
   // frame needs a few dozen canvas calls instead of one or more per task.
@@ -862,15 +875,20 @@ function rebuildVisible(relayout = true) {
   }
   const rep = i => S.hidden[i] < 0 ? i : S.groups[S.hidden[i]].rep;
   // Edges between visible nodes: [from, to, kind, critical, region critical,
-  // dependence classes (DEP_CLASS bits)].
-  // All edges between the same two nodes are merged into one.
+  // dependence classes (DEP_CLASS bits)]. Kind 0 creation, 1 dependence,
+  // 2 a step of a critical path back to a waiting task (a join: a child
+  // returning to its parent at a taskwait or barrier, the end of a parallel
+  // region, a barrier between tasks of a team); joins exist only as part of
+  // a critical path and are not used for the layout.
+  // All edges of a kind between the same two nodes are merged into one.
   const merged = new Map();
+  const key = (a, b, kind) => (a * n + b) * 3 + kind;
   for (const e of g.edges) {
     const a = rep(e[0]), b = rep(e[1]);
     if (a === b) continue;
-    const key = (a * n + b) * 2 + e[2];
-    let v = merged.get(key);
-    if (!v) merged.set(key, v = [a, b, e[2], 0, 0, 0]);
+    const k = key(a, b, e[2]);
+    let v = merged.get(k);
+    if (!v) merged.set(k, v = [a, b, e[2], 0, 0, 0]);
     if (e[3]) v[3] = 1;
   }
   // Dependence edges of the current view from the server; `rep` maps their
@@ -878,16 +896,28 @@ function rebuildVisible(relayout = true) {
   for (const e of S.depView) {
     const a = rep(e[0]), b = rep(e[1]);
     if (a === b) continue;
-    const key = (a * n + b) * 2 + 1;
-    let v = merged.get(key);
-    if (!v) merged.set(key, v = [a, b, 1, 0, 0, 0]);
+    const k = key(a, b, 1);
+    let v = merged.get(k);
+    if (!v) merged.set(k, v = [a, b, 1, 0, 0, 0]);
     if (e[2]) v[3] = 1;
     v[5] |= e[3] || 0;
   }
-  // Edges on the critical path of the selected region.
+  // Edges on the critical path of the selected region: its steps along
+  // creation and dependence edges.
   for (const [p, q] of S.regionPairs) {
     const a = rep(p), b = rep(q);
-    for (const key of [(a * n + b) * 2, (a * n + b) * 2 + 1, (b * n + a) * 2, (b * n + a) * 2 + 1]) { const v = merged.get(key); if (v) v[4] = 1; }
+    for (const k of [key(a, b, 0), key(a, b, 1)]) { const v = merged.get(k); if (v) v[4] = 1; }
+  }
+  // Joins of the critical path (3) and of the region's critical path (4).
+  for (const [list, flag] of [[S.critJoins, 3], [S.regionJoins, 4]]) {
+    for (const [p, q] of list) {
+      const a = rep(p), b = rep(q);
+      if (a === b) continue;
+      const k = key(a, b, 2);
+      let v = merged.get(k);
+      if (!v) merged.set(k, v = [a, b, 2, 0, 0, 0]);
+      v[flag] = 1;
+    }
   }
   S.vEdges = [...merged.values()];
   findFans();
@@ -904,7 +934,8 @@ function layoutVisible() {
   const nodes = [];
   for (let i = 0; i < n; i++) if (S.hidden[i] < 0 || S.repGroup[i] >= 0) nodes.push(i);
   const succ = new Map(), pred = new Map(), indeg = new Int32Array(n), layer = new Int32Array(n), done = new Uint8Array(n);
-  for (const [a, b] of S.vEdges) {
+  for (const [a, b, kind] of S.vEdges) {
+    if (kind === 2) continue;   // joins point back up the graph
     if (!succ.has(a)) succ.set(a, []);
     if (!pred.has(b)) pred.set(b, []);
     succ.get(a).push(b); pred.get(b).push(a); indeg[b]++;
@@ -1564,6 +1595,8 @@ function renderLegend() {
     html += `<span class="muted">strip:</span>` + [0, 1, 2, 3].map(k =>
       `<span title="${GAP_LABEL[k]}"><span class="sw" style="border-radius:2px;background:${S.css.gap[k]}"></span>${GAP_SHORT[k]} ${pctText(gapTotals[k], total)} %</span>`).join('');
   }
+  if ((S.showCrit && S.vEdges.some(e => e[2] === 2 && e[3])) || S.vEdges.some(e => e[2] === 2 && e[4]))
+    html += `<span title="A step of the critical path from a task back to a task waiting for it: a child to its parent at a taskwait or barrier, the end of a parallel region, a barrier between tasks of a team"><span class="sw" style="border-radius:0;width:14px;height:0;border-top:2px dashed ${S.css.critical};vertical-align:3px"></span>critical path returns to waiting task</span>`;
   if (S.showDep && S.vEdges.some(e => e[2] === 1)) {
     const used = new Set(S.vEdges.filter(e => e[2] === 1).flatMap(e => depClasses(e[5])));
     html += `<span class="muted">dependences:</span>` + [...used].sort().map(j =>
@@ -1669,7 +1702,7 @@ $('task').addEventListener('click', e => {
 // ------------------------------------------------------------------ region analysis
 
 async function setRegion(sel) {
-  S.region = sel; S.regionInfo = null; S.regionCrit = new Map(); S.regionPairs = [];
+  S.region = sel; S.regionInfo = null; S.regionCrit = new Map(); S.regionPairs = []; S.regionJoins = [];
   rebuildVisible(false);
   renderLegend();
   const el = $('region');
@@ -1691,6 +1724,7 @@ async function setRegion(sel) {
   S.regionInfo = r;
   S.regionCrit = new Map(r.crit_tasks);
   S.regionPairs = r.crit_edges;
+  S.regionJoins = r.crit_joins || [];
   rebuildVisible(false);
   renderRegion();
   draw();
