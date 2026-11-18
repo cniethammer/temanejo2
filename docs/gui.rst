@@ -76,6 +76,17 @@ Colour by
 Critical path, Creation edges, Dependence edges
    Show or hide these overlays.
 
+Hide implicit tasks without children
+   Leave out implicit tasks that create no tasks, whether or not they do
+   work themselves, and lay the graph out again. Typical are the threads of
+   a team that only wait while another thread runs a ``single`` construct
+   that creates the tasks. In a region without explicit tasks (a ``for``
+   loop, a ``single`` that only computes) this hides all implicit tasks
+   except those with work on the critical path. A return of the critical
+   path through a hidden task (see `Graph view`_) is drawn around it. Hidden
+   tasks still appear in the timeline, the task origins and all metrics.
+   Off by default.
+
 Grey out unselected
    While a region is selected (see `Region analysis`_), draw all tasks
    outside it in grey, without critical path marks, and all edges that do

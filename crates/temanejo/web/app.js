@@ -36,6 +36,10 @@ const base = document.createElement('canvas');
 const baseCtx = base.getContext('2d', { willReadFrequently: !location.hash.includes('gpubase') });
 let ctx = view;
 const DX = 26, DY = 64, R = 9;
+// S.hidden[i]: -1 visible, a group id if inside a collapsed group, or
+// HIDDEN_CHILDLESS for an implicit task hidden by "Hide implicit tasks
+// without children".
+const HIDDEN_CHILDLESS = -2;
 const KIND = ['initial', 'implicit', 'explicit'];
 // Classes of a dependence edge (bits of analysis::DEP_* on the server):
 // read after write (flow), write after read (anti), write after write
@@ -52,7 +56,7 @@ const FLAGS = [[0x08000000, 'undeferred'], [0x10000000, 'untied'], [0x20000000, 
 
 const S = {
   g: null, view: 'graph', colorBy: 'thread',
-  showCrit: true, showCreate: true, showDep: true, fadeOthers: true,
+  showCrit: true, showCreate: true, showDep: true, fadeOthers: true, hideChildless: false,
   sel: -1, region: new Set(), regionInfo: null, regionCrit: new Map(), regionPairs: [], regionJoins: [],
   cam: { x: 0, y: 0, k: 1 },           // graph camera: screen = world * k + (x, y)
   tl: { t0: 0, t1: 1 },                // visible time window of the timeline
@@ -687,7 +691,7 @@ function drawGraph() {
   const regionRing = new Path2D(), regionCritRing = new Path2D(), critRing = new Path2D();
   const critSquare = new Path2D(), regionBar = new Path2D();
   for (let i = 0; i < T.length; i++) {
-    if (S.hidden[i] >= 0) continue;   // inside a collapsed group
+    if (S.hidden[i] !== -1) continue;   // inside a collapsed group, or hidden
     const t = T[i], x = sx(t), y = sy(t);
     if (x < -r - 4 || x > S.w + r + 4 || y < -r - 4 || y > S.h + r + 4) continue;
     const inRegion = S.region.has(i);
@@ -730,7 +734,7 @@ function drawGraph() {
     // Visible tasks with their id below (drawn next) and group boxes.
     const idFs = Math.min(11 * k, 13);
     for (let i = 0; i < T.length; i++) {
-      if (S.hidden[i] >= 0 && S.repGroup[i] < 0) continue;
+      if (S.hidden[i] !== -1 && S.repGroup[i] < 0) continue;
       const x = sx(T[i]), y = sy(T[i]);
       if (x < -40 || x > S.w + 40 || y < -40 || y > S.h + 40) continue;
       const [top, bot] = extent(i), w = S.repGroup[i] >= 0 ? 2 * groupSize(S.groups[S.repGroup[i]], r)[0] + 2 * off : 2 * r;
@@ -758,7 +762,7 @@ function drawGraph() {
   if (k >= 1.1) {
     ctx.fillStyle = css.ink2; ctx.font = `${Math.min(11 * k, 13)}px system-ui, sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
     for (let i = 0; i < T.length; i++) {
-      if (S.hidden[i] >= 0) continue;
+      if (S.hidden[i] !== -1) continue;
       const t = T[i], x = sx(t), y = sy(t);
       if (x > -30 && x < S.w + 30 && y > -30 && y < S.h + 30) ctx.fillText(t.id, x, y + r + 5);
     }
@@ -775,7 +779,7 @@ function graphOverlay() {
     ctx.beginPath(); ctx.roundRect(t.x * DX * k + cam.x - hw - 3, t.y * DY * k + cam.y - hh - 3, 2 * hw + 6, 2 * hh + 6, hh * 0.5); ctx.stroke();
   }
   for (const [i, w] of [[S.hover, 1.5], [S.sel, 3]]) {
-    if (i < 0) continue;
+    if (i < 0 || S.hidden[i] === HIDDEN_CHILDLESS) continue;
     const t = S.g.tasks[i];
     ctx.lineWidth = w; ctx.strokeStyle = S.css.ink;
     ctx.beginPath(); ctx.arc(t.x * DX * k + cam.x, t.y * DY * k + cam.y, Math.max(r + 5, 7), 0, 6.2832); ctx.stroke();
@@ -786,6 +790,7 @@ function graphOverlay() {
 // node standing in for it, drawn again above the graph: wider, opaque and on
 // a halo of the background colour, so they stand out of crossing edges.
 function drawSelectedEdges() {
+  if (S.hidden[S.sel] === HIDDEN_CHILDLESS) return;
   const node = S.hidden[S.sel] >= 0 ? S.groups[S.hidden[S.sel]].rep : S.sel;
   const { pass, gap, laneOf } = edgePainter(), css = S.css;
   const mine = e => e[0] === node || e[1] === node;
@@ -873,6 +878,14 @@ function rebuildVisible(relayout = true) {
     S.repGroup[grp.rep] = grp.id;
     grp.inRegion = S.region.size > 0 && membersOf(grp).some(i => S.region.has(i));
   }
+  // Implicit tasks without children, with "Hide implicit tasks without
+  // children", whether they do work or not. Tasks with work on the critical
+  // path stay visible.
+  if (S.hideChildless) for (let i = 0; i < n; i++) {
+    const t = T[i];
+    if (S.hidden[i] === -1 && t.loaded && t.k === 1 && !S.children[i].length && !(t.cr > 0)) S.hidden[i] = HIDDEN_CHILDLESS;
+  }
+  const childless = i => S.hidden[i] === HIDDEN_CHILDLESS;
   const rep = i => S.hidden[i] < 0 ? i : S.groups[S.hidden[i]].rep;
   // Edges between visible nodes: [from, to, kind, critical, region critical,
   // dependence classes (DEP_CLASS bits)]. Kind 0 creation, 1 dependence,
@@ -885,7 +898,7 @@ function rebuildVisible(relayout = true) {
   const key = (a, b, kind) => (a * n + b) * 3 + kind;
   for (const e of g.edges) {
     const a = rep(e[0]), b = rep(e[1]);
-    if (a === b) continue;
+    if (a === b || childless(a) || childless(b)) continue;
     const k = key(a, b, e[2]);
     let v = merged.get(k);
     if (!v) merged.set(k, v = [a, b, e[2], 0, 0, 0]);
@@ -895,7 +908,7 @@ function rebuildVisible(relayout = true) {
   // end points on if a group made in the browser hides them.
   for (const e of S.depView) {
     const a = rep(e[0]), b = rep(e[1]);
-    if (a === b) continue;
+    if (a === b || childless(a) || childless(b)) continue;
     const k = key(a, b, 1);
     let v = merged.get(k);
     if (!v) merged.set(k, v = [a, b, 1, 0, 0, 0]);
@@ -909,10 +922,15 @@ function rebuildVisible(relayout = true) {
     for (const k of [key(a, b, 0), key(a, b, 1)]) { const v = merged.get(k); if (v) v[4] = 1; }
   }
   // Joins of the critical path (3) and of the region's critical path (4).
+  // A join into a hidden task continues with the join out of it, so the path
+  // goes around the task (e.g. through a barrier to the end of the region).
   for (const [list, flag] of [[S.critJoins, 3], [S.regionJoins, 4]]) {
-    for (const [p, q] of list) {
+    const next = new Map(list);
+    for (let [p, q] of list) {
+      if (childless(p)) continue;
+      for (let hops = 0; childless(q) && next.has(q) && hops < 8; hops++) q = next.get(q);
       const a = rep(p), b = rep(q);
-      if (a === b) continue;
+      if (a === b || childless(b)) continue;
       const k = key(a, b, 2);
       let v = merged.get(k);
       if (!v) merged.set(k, v = [a, b, 2, 0, 0, 0]);
@@ -932,7 +950,7 @@ function rebuildVisible(relayout = true) {
 function layoutVisible() {
   const T = S.g.tasks, n = T.length;
   const nodes = [];
-  for (let i = 0; i < n; i++) if (S.hidden[i] < 0 || S.repGroup[i] >= 0) nodes.push(i);
+  for (let i = 0; i < n; i++) if (S.hidden[i] === -1 || S.repGroup[i] >= 0) nodes.push(i);
   const succ = new Map(), pred = new Map(), indeg = new Int32Array(n), layer = new Int32Array(n), done = new Uint8Array(n);
   for (const [a, b, kind] of S.vEdges) {
     if (kind === 2) continue;   // joins point back up the graph
@@ -982,6 +1000,8 @@ function layoutVisible() {
     if (rows > 1) row += 0.5;
   }
   for (let i = 0; i < n; i++) if (S.hidden[i] >= 0 && S.repGroup[i] < 0) { const r = T[S.groups[S.hidden[i]].rep]; T[i].x = r.x; T[i].y = r.y; }
+  // Hidden childless tasks take their parent's place (for "fit" and "centre").
+  for (let i = 0; i < n; i++) if (S.hidden[i] === HIDDEN_CHILDLESS && T[i].par >= 0) { const r = T[T[i].par]; T[i].x = r.x; T[i].y = r.y; }
 }
 const slots = i => S.repGroup[i] >= 0 ? 3 : 1;
 
@@ -1096,8 +1116,8 @@ function findFans() {
   S.fanKids = new Map();   // parent -> its visible children
   S.fanChild = new Uint8Array(S.g.tasks.length);
   S.children.forEach((ch, p) => {
-    if (ch.length < FAN || S.hidden[p] >= 0) return;
-    const kids = ch.filter(c => S.hidden[c] < 0);
+    if (ch.length < FAN || S.hidden[p] !== -1) return;
+    const kids = ch.filter(c => S.hidden[c] === -1);
     if (kids.length < FAN) return;
     S.fans.push(p); S.fanKids.set(p, kids);
     for (const c of kids) S.fanChild[c] = 1;
@@ -1346,7 +1366,7 @@ function pick(mx, my) {
     }
     let best = -1, bd = lim * lim;
     for (let i = 0; i < T.length; i++) {
-      if (S.hidden[i] >= 0) continue;
+      if (S.hidden[i] !== -1) continue;
       const dx = T[i].x * DX * cam.k + cam.x - mx, dy = T[i].y * DY * cam.k + cam.y - my, d = dx * dx + dy * dy;
       if (d < bd) { bd = d; best = i; }
     }
@@ -1438,6 +1458,7 @@ canvas.addEventListener('pointerup', e => {
     if (S.view === 'graph') {
       const [x0, x1, y0, y1] = [Math.min(d.x0, d.x), Math.max(d.x0, d.x), Math.min(d.y0, d.y), Math.max(d.y0, d.y)];
       T.forEach((t, i) => {
+        if (S.hidden[i] === HIDDEN_CHILDLESS) return;
         const x = t.x * DX * S.cam.k + S.cam.x, y = t.y * DY * S.cam.k + S.cam.y;
         if (x >= x0 && x <= x1 && y >= y0 && y <= y1) sel.add(i);
       });
@@ -1481,6 +1502,7 @@ $('rank').onchange = e => loadRank(e.target.value);
 $('color').onchange = e => { S.colorBy = e.target.value; assignSlots(); renderLegend(); renderOrigins(); renderTask(); draw(); };
 for (const [id, key] of [['show-crit', 'showCrit'], ['show-create', 'showCreate'], ['show-dep', 'showDep'], ['fade-others', 'fadeOthers']])
   $(id).onchange = e => { S[key] = e.target.checked; renderLegend(); draw(); };
+$('hide-childless').onchange = e => { S.hideChildless = e.target.checked; if (S.g) { rebuildVisible(); renderLegend(); draw(); } };
 for (const v of ['graph', 'timeline']) $('view-' + v).onclick = async () => {
   S.view = v;
   $('view-graph').setAttribute('aria-selected', v === 'graph'); $('view-timeline').setAttribute('aria-selected', v === 'timeline');
