@@ -303,7 +303,18 @@ fn task_json(o: &mut String, m: &Model, crit: &PathResult, loc_of: &HashMap<u64,
         list(o, pred.iter());
         o.push_str(",\"ds\":");
         list(o, succ.iter());
-        o.push(',');
+        // The variables behind each of those edges, in the same order.
+        o.push_str(",\"dpv\":[");
+        for (j, &p) in pred.iter().enumerate() {
+            o.push_str(if j > 0 { "," } else { "" });
+            dep_vars_json(o, m, p, i as u32);
+        }
+        o.push_str("],\"dsv\":[");
+        for (j, &s) in succ.iter().enumerate() {
+            o.push_str(if j > 0 { "," } else { "" });
+            dep_vars_json(o, m, i as u32, s);
+        }
+        o.push_str("],");
     }
     o.push_str("\"segs\":[");
     for (j, s) in m.segs(i).iter().enumerate() {
@@ -314,6 +325,16 @@ fn task_json(o: &mut String, m: &Model, crit: &PathResult, loc_of: &HashMap<u64,
         let _ = write!(o, "{}[\"{:#x}\",{}]", if j > 0 { "," } else { "" }, d.addr, d.kind);
     }
     o.push_str("]}");
+}
+
+/// The variables by which task `from` precedes `to` (`analysis::dependence_vars`):
+/// `[[address, class bit, predecessor's type, successor's type], ...]`.
+fn dep_vars_json(o: &mut String, m: &Model, from: u32, to: u32) {
+    o.push('[');
+    for (j, v) in analysis::dependence_vars(m, from, to).iter().enumerate() {
+        let _ = write!(o, "{}[\"{:#x}\",{},{},{}]", if j > 0 { "," } else { "" }, v.addr, v.class, v.pred_kind, v.succ_kind);
+    }
+    o.push(']');
 }
 
 /// Rank header, threads, source locations and parallel regions (without the
@@ -416,7 +437,13 @@ fn full_json(o: &mut Json, r: &Rank) {
     for (i, e) in m.edges().enumerate() {
         let on_path = crit.transitions.contains(&(e.from, e.to)) || crit.transitions.contains(&(e.to, e.from));
         o.spill();
-        let _ = write!(o, "{}[{},{},{},{}]", if i > 0 { "," } else { "" }, e.from, e.to, e.kind as u8, on_path as u8);
+        let _ = write!(o, "{}[{},{},{},{}", if i > 0 { "," } else { "" }, e.from, e.to, e.kind as u8, on_path as u8);
+        // Dependence edges also carry their variables (see dep_vars_json).
+        if e.kind == model::EdgeKind::Depend {
+            o.push(',');
+            dep_vars_json(o, m, e.from, e.to);
+        }
+        o.push(']');
     }
     o.push_str("]}");
 }
@@ -663,7 +690,8 @@ fn group_stats_json(r: &Rank, grouping: &analysis::Grouping, g: usize) -> String
     format!("{{\"own_cr\":{},\"peak\":{}}}", region.critical, region.max_concurrency)
 }
 
-/// Dependence edges `[from, to, critical]` between the nodes visible when
+/// Dependence edges `[from, to, critical, classes]` (`analysis::DEP_*` bits)
+/// between the nodes visible when
 /// the groups listed in the request body are expanded; a collapsed group is
 /// represented by its `rep` task.
 fn view_json(r: &Rank, grouping: &analysis::Grouping, body: &str) -> String {
@@ -672,7 +700,7 @@ fn view_json(r: &Rank, grouping: &analysis::Grouping, body: &str) -> String {
         expanded[g as usize] = true;
     }
     let mut o = String::from("{\"deps\":");
-    list(&mut o, analysis::visible_dependences(&r.model, &r.crit, grouping, &expanded).iter().map(|&(a, b, c)| format!("[{a},{b},{}]", c as u8)));
+    list(&mut o, analysis::visible_dependences(&r.model, &r.crit, grouping, &expanded).iter().map(|&(a, b, c, k)| format!("[{a},{b},{},{k}]", c as u8)));
     o.push('}');
     o
 }

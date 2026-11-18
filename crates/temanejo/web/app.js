@@ -37,6 +37,13 @@ const baseCtx = base.getContext('2d', { willReadFrequently: !location.hash.inclu
 let ctx = view;
 const DX = 26, DY = 64, R = 9;
 const KIND = ['initial', 'implicit', 'explicit'];
+// Classes of a dependence edge (bits of analysis::DEP_* on the server):
+// read after write (flow), write after read (anti), write after write
+// (output), and no shared address.
+const DEP_CLASS = [[1, 'RAW'], [2, 'WAR'], [4, 'WAW'], [8, '?']];
+const depClassText = mask => DEP_CLASS.filter(([b]) => mask & b).map(([, s]) => s).join('+');
+// Line dash of a dependence edge: RAW solid, WAW dotted, WAR dashed.
+const depDash = mask => (mask & 1) || !mask ? [] : mask & 4 ? [1.5, 3] : mask & 2 ? [6, 4] : [];
 const DEP_TYPE = { 1: 'in', 2: 'out', 3: 'inout', 4: 'mutexinoutset', 5: 'source', 6: 'sink', 7: 'inoutset', 34: 'out (all memory)', 35: 'inout (all memory)' };
 const FLAGS = [[0x08000000, 'undeferred'], [0x10000000, 'untied'], [0x20000000, 'final'], [0x40000000, 'mergeable'], [0x80000000, 'merged'], [0x8, 'target'], [0x10, 'taskwait']];
 
@@ -251,7 +258,7 @@ function membersOf(grp) {
 }
 
 // Asks the server for the dependence edges between the nodes visible with
-// the currently expanded server groups: [from, to, critical], a collapsed
+// the currently expanded server groups: [from, to, critical, classes], a collapsed
 // group standing in by its `rep` task.
 async function refreshView() {
   const g = S.g;
@@ -287,12 +294,12 @@ function ensureLoaded(tasks) {
   if (!g.loadingAll) {
     g.loadingAll = fetch(`api/rank/${g.rank}/full`).then(r => r.json()).then(full => {
       if (S.g !== g) return;
-      for (const [i, r] of full.tasks.entries()) if (!g.tasks[i].loaded) Object.assign(g.tasks[i], r, { i, x: g.tasks[i].x, y: g.tasks[i].y, dp: [], ds: [], loaded: 'all' });
+      for (const [i, r] of full.tasks.entries()) if (!g.tasks[i].loaded) Object.assign(g.tasks[i], r, { i, x: g.tasks[i].x, y: g.tasks[i].y, dp: [], ds: [], dpv: [], dsv: [], loaded: 'all' });
       // The complete document lists dependences as edges, not per task.
-      for (const [a, b, kind] of full.edges) {
+      for (const [a, b, kind, , vars] of full.edges) {
         if (kind !== 1) continue;
-        if (g.tasks[b].loaded === 'all') g.tasks[b].dp.push(a);
-        if (g.tasks[a].loaded === 'all') g.tasks[a].ds.push(b);
+        if (g.tasks[b].loaded === 'all') { g.tasks[b].dp.push(a); g.tasks[b].dpv.push(vars); }
+        if (g.tasks[a].loaded === 'all') { g.tasks[a].ds.push(b); g.tasks[a].dsv.push(vars); }
       }
       for (const x of S.groups) x.loaded = true;
     });
@@ -549,21 +556,60 @@ function drawGraph() {
   // Edges, batched per style in paths of at most 1024 lines (one huge path
   // is slow to rasterise). An edge is skipped when both ends lie off the
   // same side.
-  const pass = (pred, style, width, alpha) => {
-    ctx.strokeStyle = style; ctx.lineWidth = width; ctx.globalAlpha = alpha;
+  // Dependence edges get an arrowhead at their successor (not when zoomed
+  // far out, where it would be smaller than a node), filled after the lines
+  // so it is not dashed. Its tip sits on the edge of the node or group box.
+  const far = k < 0.25;
+  const head = Math.min(Math.max(4, 5 * k), 9);
+  // How far a node reaches above and below its centre: a group box with
+  // its stacked cards and critical-path ring (see drawGroups), or a task.
+  const off = Math.max(1.5, r * 0.32);
+  const extent = i => {
+    if (S.repGroup[i] < 0) return [r, r];
+    const hh = groupSize(S.groups[S.repGroup[i]], r)[1];
+    return [hh + 2 * off + 3, hh + 3];
+  };
+  // The drawn line of an edge, [x0, y0, x1, y1], or null when both ends lie
+  // off the same side: from the bottom of the source to the top of the
+  // target, or the other way round for an edge pointing upwards (a cycle
+  // between groups).
+  const ends = e => {
+    const a = T[e[0]], b = T[e[1]], ax = sx(a), ay = sy(a), bx = sx(b), by = sy(b);
+    if ((ax < 0 && bx < 0) || (ax > S.w && bx > S.w) || (ay < 0 && by < 0) || (ay > S.h && by > S.h)) return null;
+    const down = by >= ay, ea = extent(e[0]), eb = extent(e[1]);
+    return [ax, down ? ay + ea[1] : ay - ea[0], bx, down ? by - eb[0] : by + eb[1]];
+  };
+  // Arrowhead of a dependence edge: its tip, unit direction and length, or
+  // null if there is none.
+  const arrow = (e, p, width) => {
+    if (e[2] !== 1 || far) return null;
+    const [x0, y0, x1, y1] = p, len = Math.hypot(x1 - x0, y1 - y0);
+    return len < 2 * head ? null : [x1, y1, (x1 - x0) / len, (y1 - y0) / len, head + width];
+  };
+  const pass = (pred, style, width, alpha, dash = []) => {
+    ctx.strokeStyle = style; ctx.lineWidth = width; ctx.globalAlpha = alpha; ctx.setLineDash(dash);
     let count = 0;
+    const heads = new Path2D();
     ctx.beginPath();
     for (const e of S.vEdges) {
       if (!pred(e)) continue;
-      const a = T[e[0]], b = T[e[1]];
-      const ax = sx(a), ay = sy(a), bx = sx(b), by = sy(b);
-      if ((ax < 0 && bx < 0) || (ax > S.w && bx > S.w) || (ay < 0 && by < 0) || (ay > S.h && by > S.h)) continue;
-      ctx.moveTo(ax, ay + r); ctx.lineTo(bx, by - r);
+      const p = ends(e);
+      if (!p) continue;
+      ctx.moveTo(p[0], p[1]); ctx.lineTo(p[2], p[3]);
       if (++count === 1024) { ctx.stroke(); ctx.beginPath(); count = 0; }
+      const h = arrow(e, p, width);
+      if (h) {
+        const [bx, ty, ux, uy, s] = h;
+        heads.moveTo(bx, ty);
+        heads.lineTo(bx - s * ux + 0.45 * s * uy, ty - s * uy - 0.45 * s * ux);
+        heads.lineTo(bx - s * ux - 0.45 * s * uy, ty - s * uy + 0.45 * s * ux);
+        heads.closePath();
+      }
     }
-    ctx.stroke(); ctx.globalAlpha = 1;
+    ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = style; ctx.fill(heads);
+    ctx.globalAlpha = 1;
   };
-  const far = k < 0.25;
   const isCrit = e => S.showCrit && e[3];
   // With "grey out unselected", everything outside the selected region is
   // drawn first in grey; only edges between two selected tasks keep their style.
@@ -578,7 +624,9 @@ function drawGraph() {
   if (fade) pass(e => shown(e) && !inSel(e) && direct(e), css.axis, 1, greyAlpha);
   if (S.showCreate) drawFans(sx, sy, r, fade, greyAlpha, createAlpha);
   if (S.showCreate) pass(e => e[2] === 0 && !isCrit(e) && inSel(e) && direct(e), css.edgeCreate, 1, createAlpha);
-  if (S.showDep) pass(e => e[2] === 1 && !isCrit(e) && inSel(e), css.edgeDep, 1, far ? 0.35 : 0.7);
+  // Dependence edges, one pass per line style (depDash).
+  if (S.showDep) for (const dash of [[], [6, 4], [1.5, 3]])
+    pass(e => e[2] === 1 && !isCrit(e) && inSel(e) && String(depDash(e[5])) === String(dash), css.edgeDep, far ? 1 : 1.3, far ? 0.35 : 0.7, far ? [] : dash);
   if (S.regionPairs.length) pass(e => e[4], css.ink, 2.5, 1);
   if (S.showCrit) pass(e => e[3] && shown(e) && inSel(e), css.critical, Math.max(2, 3 * Math.min(k, 1)), 1);
 
@@ -621,6 +669,44 @@ function drawGraph() {
     ctx.strokeStyle = css.critical; ctx.lineWidth = 2; ctx.stroke(critRing);
   }
   drawGroups(sx, sy, r, fade);
+  // Dependence classes on their edges, when zoomed in. Edges into the same
+  // node cross near their middles, so a label tries a few places along its
+  // edge and is left out if all of them overlap arrowheads or labels
+  // already drawn.
+  if (S.showDep && k >= 1.1) {
+    const fs = Math.min(10 * k, 12);
+    ctx.font = `${fs}px system-ui, sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.lineWidth = 3; ctx.strokeStyle = css.surface; ctx.fillStyle = css.edgeDep; ctx.lineJoin = 'round';
+    const boxes = [];   // [centre x, centre y, width, height]
+    const free = (x, y, w) => !boxes.some(([bx, by, bw, bh]) => Math.abs(bx - x) * 2 < bw + w + 4 && Math.abs(by - y) * 2 < bh + fs + 2);
+    const labelled = e => e[2] === 1 && e[5] && inSel(e);
+    // Visible tasks with their id below (drawn next) and group boxes.
+    const idFs = Math.min(11 * k, 13);
+    for (let i = 0; i < T.length; i++) {
+      if (S.hidden[i] >= 0 && S.repGroup[i] < 0) continue;
+      const x = sx(T[i]), y = sy(T[i]);
+      if (x < -40 || x > S.w + 40 || y < -40 || y > S.h + 40) continue;
+      const [top, bot] = extent(i), w = S.repGroup[i] >= 0 ? 2 * groupSize(S.groups[S.repGroup[i]], r)[0] + 2 * off : 2 * r;
+      boxes.push([x, y + (bot - top) / 2, w, top + bot]);
+      boxes.push([x, y + bot + 5 + idFs / 2, 4 * idFs, idFs]);
+    }
+    for (const e of S.vEdges) {
+      const p = labelled(e) && ends(e), h = p && arrow(e, p, 1);
+      if (h) boxes.push([h[0] - h[2] * h[4] / 2, h[1] - h[3] * h[4] / 2, h[4], h[4]]);
+    }
+    for (const e of S.vEdges) {
+      const p = labelled(e) && ends(e);
+      if (!p) continue;
+      const [ax, ay, bx, by] = p, text = depClassText(e[5]), w = ctx.measureText(text).width;
+      for (const f of [0.5, 0.36, 0.64, 0.22, 0.78]) {
+        const x = ax + f * (bx - ax), y = ay + f * (by - ay);
+        if (!free(x, y, w)) continue;
+        boxes.push([x, y, w, fs]);
+        ctx.strokeText(text, x, y); ctx.fillText(text, x, y);
+        break;
+      }
+    }
+  }
   if (k >= 1.1) {
     ctx.fillStyle = css.ink2; ctx.font = `${Math.min(11 * k, 13)}px system-ui, sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
     for (let i = 0; i < T.length; i++) {
@@ -711,7 +797,8 @@ function rebuildVisible(relayout = true) {
     grp.inRegion = S.region.size > 0 && membersOf(grp).some(i => S.region.has(i));
   }
   const rep = i => S.hidden[i] < 0 ? i : S.groups[S.hidden[i]].rep;
-  // Edges between visible nodes: [from, to, kind, critical, region critical].
+  // Edges between visible nodes: [from, to, kind, critical, region critical,
+  // dependence classes (DEP_CLASS bits)].
   // All edges between the same two nodes are merged into one.
   const merged = new Map();
   for (const e of g.edges) {
@@ -719,7 +806,7 @@ function rebuildVisible(relayout = true) {
     if (a === b) continue;
     const key = (a * n + b) * 2 + e[2];
     let v = merged.get(key);
-    if (!v) merged.set(key, v = [a, b, e[2], 0, 0]);
+    if (!v) merged.set(key, v = [a, b, e[2], 0, 0, 0]);
     if (e[3]) v[3] = 1;
   }
   // Dependence edges of the current view from the server; `rep` maps their
@@ -729,8 +816,9 @@ function rebuildVisible(relayout = true) {
     if (a === b) continue;
     const key = (a * n + b) * 2 + 1;
     let v = merged.get(key);
-    if (!v) merged.set(key, v = [a, b, 1, 0, 0]);
+    if (!v) merged.set(key, v = [a, b, 1, 0, 0, 0]);
     if (e[2]) v[3] = 1;
+    v[5] |= e[3] || 0;
   }
   // Edges on the critical path of the selected region.
   for (const [p, q] of S.regionPairs) {
@@ -1405,6 +1493,7 @@ function renderLegend() {
     html += `<span class="muted">strip:</span>` + [0, 1, 2, 3].map(k =>
       `<span title="${GAP_LABEL[k]}"><span class="sw" style="border-radius:2px;background:${S.css.gap[k]}"></span>${GAP_SHORT[k]} ${pctText(gapTotals[k], total)} %</span>`).join('');
   }
+  if (S.showDep && S.vEdges.some(e => e[2] === 1)) html += `<span class="muted">dependences: — RAW · ‒ ‒ WAR · ⋯ WAW</span>`;
   if (S.fadeOthers && S.region.size) html += `<span><span class="sw" style="background:${S.css.axis}"></span>not selected</span>`;
   html += `<span class="muted">○ explicit · □ implicit · ◇ initial${S.groups.some(x => x.drawn) ? ' · ▭ collapsed group (×tasks)' : ''}</span>`;
   $('legend').innerHTML = html;
@@ -1444,6 +1533,11 @@ function renderTask() {
   const regionAt = pl ? ` <span class="muted">at</span> <span class="mono">${esc(locShort(pl))}</span>${funcName(pl) && pl.file ? ` <span class="muted">in</span> <span class="fn">${esc(funcName(pl))}</span>` : ''}` : '';
 
   const list = a => a.length ? a.slice(0, 40).map(taskLink).join(', ') + (a.length > 40 ? ` … (${a.length})` : '') : '–';
+  // Dependence partners with the variables that order them: one line each,
+  // "task · RAW 0x… (out → in)".
+  const depList = (a, vars) => !vars ? list(a) : a.length ? a.slice(0, 40).map((x, j) => `<div>${taskLink(x)} <span class="muted">·</span> ` +
+    ((vars[j] || []).map(([addr, c, pk, sk]) => `${depClassText(c)} <span class="mono">${addr}</span> <span class="muted">(${DEP_TYPE[pk] || pk} → ${DEP_TYPE[sk] || sk})</span>`).join(', ') || '<span class="muted">no shared address</span>') +
+    '</div>').join('') + (a.length > 40 ? `<div class="muted">… (${a.length})</div>` : '') : '–';
   let html = `<div><b style="font-size:15px">Task ${t.id}</b></div><div style="margin:4px 0 8px">${badges.join('')}</div><dl>
     <dt>Source</dt><dd>${src}</dd>
     <dt>Function</dt><dd>${func}</dd>
@@ -1455,8 +1549,8 @@ function renderTask() {
     <dt>Threads</dt><dd>${threads.join(', ') || '–'}</dd>
     <dt>CPUs</dt><dd>${cpus.join(', ') || '–'} <span class="muted">NUMA ${[...new Set(t.segs.map(s => s[3]))].join(', ') || '–'}</span></dd>
     <dt>Children</dt><dd>${S.children[S.sel].length}</dd>
-    <dt>Depends on</dt><dd>${list(t.dp || [])}</dd>
-    <dt>Required by</dt><dd>${list(t.ds || [])}</dd>
+    <dt>Depends on</dt><dd>${depList(t.dp || [], t.dpv)}</dd>
+    <dt>Required by</dt><dd>${depList(t.ds || [], t.dsv)}</dd>
   </dl>
   <div class="actions"><button data-a="center">Centre</button><button data-a="subtree">Select subtree</button>${p ? '<button data-a="region">Select parallel region</button>' : ''}${S.children[S.sel].length ? '<button data-a="collapse-subtree" title="Show all tasks created below this task as one node">Collapse subtree</button>' : ''}${S.groupOf[S.sel] >= 0 && !S.groups[S.groupOf[S.sel]].collapsed ? `<button data-a="collapse-group" title="Show this task and the ${S.groups[S.groupOf[S.sel]].n - 1} others of its ${GROUP_KIND[S.groups[S.groupOf[S.sel]].kind]} group as one node">Collapse its group (×${S.groups[S.groupOf[S.sel]].n})</button>` : ''}</div>`;
 

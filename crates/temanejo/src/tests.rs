@@ -80,6 +80,11 @@ impl TraceBuilder {
         self.ev(th, ts, kind::TASK_DEPENDENCE, 0, 0, pred, succ, 0, 0)
     }
 
+    /// An item of the depend clause of `task` (ompt dependence type `ty`).
+    fn dep_var(&mut self, th: u32, ts: u64, task: u64, addr: u64, ty: u64) -> &mut Self {
+        self.ev(th, ts, kind::DEPENDENCE_VAR, 0, 0, task, addr, ty, 0)
+    }
+
     /// Begin of a synchronisation region and of waiting in it.
     fn sync_begin(&mut self, th: u32, ts: u64, sync: u64, task: u64, par: u64) -> &mut Self {
         self.ev(th, ts, kind::SYNC_REGION, ENDPOINT_BEGIN, 0, sync, task, par, 0xdead);
@@ -801,4 +806,46 @@ fn gap_while_a_critical_task_waits_for_a_thread() {
     // from 16 to 17 both threads are idle in the barrier while it is ready:
     // waiting. From 57 to 59 no task runs and none is ready: idle.
     assert_eq!(gaps(&parallel_trace()), [(0, 16, OnPath), (16, 17, Waiting), (17, 57, OnPath), (57, 59, Idle), (59, 70, OnPath)]);
+}
+
+// ompt_dependence_type_t
+const DEP_IN: u64 = 1;
+const DEP_OUT: u64 = 2;
+const DEP_INOUT: u64 = 3;
+const DEP_ALL_OUT: u64 = 34;
+
+/// Edge classes from the depend clauses of the two tasks, following the
+/// loop of examples/omp_depend_chains.c:
+///
+/// ```text
+/// B  in(a) out(b)    B -> C   flow on b, anti on a
+/// C  in(b) inout(a)  C -> B'  flow on a, anti on b
+/// B' in(a) out(b)    B' -> D  output on b
+/// D  out(b)          B' -> E  nothing shared
+/// E  in(z)           D -> F   omp_all_memory: output on b
+/// F  out(omp_all_memory)
+/// ```
+#[test]
+fn dependence_classes() {
+    use analysis::{dependence_class, dependence_vars, DepVar, DEP_ANTI, DEP_FLOW, DEP_OUTPUT, DEP_UNKNOWN};
+    let (a, bv, z) = (0x100, 0x200, 0x300);
+    let mut b = TraceBuilder::default();
+    b.thread_begin(0, 0, true).initial_begin(0, 0, 1, 1);
+    b.create(0, 1, 2, 1, 0xB).dep_var(0, 1, 2, a, DEP_IN).dep_var(0, 1, 2, bv, DEP_OUT);
+    b.create(0, 2, 3, 1, 0xC).dep_var(0, 2, 3, bv, DEP_IN).dep_var(0, 2, 3, a, DEP_INOUT).dependence(0, 2, 2, 3);
+    b.create(0, 3, 4, 1, 0xB).dep_var(0, 3, 4, a, DEP_IN).dep_var(0, 3, 4, bv, DEP_OUT).dependence(0, 3, 3, 4);
+    b.create(0, 4, 5, 1, 0xD).dep_var(0, 4, 5, bv, DEP_OUT).dependence(0, 4, 4, 5);
+    b.create(0, 5, 6, 1, 0xE).dep_var(0, 5, 6, z, DEP_IN).dependence(0, 5, 4, 6);
+    b.create(0, 6, 7, 1, 0xF).dep_var(0, 6, 7, 0, DEP_ALL_OUT).dependence(0, 6, 5, 7);
+    b.initial_end(0, 10, 1, 1);
+    let m = Model::build(&b.build());
+    let t = |id| task(&m, id) as u32;
+    let v = |addr, class, p, s| DepVar { addr, class, pred_kind: p as u32, succ_kind: s as u32 };
+
+    assert_eq!(dependence_vars(&m, t(2), t(3)), [v(a, DEP_ANTI, DEP_IN, DEP_INOUT), v(bv, DEP_FLOW, DEP_OUT, DEP_IN)]);
+    assert_eq!(dependence_vars(&m, t(3), t(4)), [v(bv, DEP_ANTI, DEP_IN, DEP_OUT), v(a, DEP_FLOW, DEP_INOUT, DEP_IN)]);
+    assert_eq!(dependence_class(&m, t(3), t(4)), DEP_FLOW | DEP_ANTI);
+    assert_eq!(dependence_class(&m, t(4), t(5)), DEP_OUTPUT);
+    assert_eq!(dependence_class(&m, t(4), t(6)), DEP_UNKNOWN);
+    assert_eq!(dependence_vars(&m, t(5), t(7)), [v(bv, DEP_OUTPUT, DEP_OUT, DEP_ALL_OUT)]);
 }

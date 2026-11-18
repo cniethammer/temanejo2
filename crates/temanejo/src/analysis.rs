@@ -602,18 +602,95 @@ impl Grouping {
     }
 }
 
+/// Classes of a dependence edge, as a bit mask (`dependence_class`).
+/// Flow: the predecessor writes what the successor reads (read after write);
+/// anti: the successor overwrites what the predecessor read (write after
+/// read); output: both write (write after write). `DEP_UNKNOWN`: the two
+/// depend clauses share no address, e.g. an edge the runtime adds for
+/// `inoutset` or `mutexinoutset` bookkeeping.
+///
+/// Clang compiles `out` like `inout`, so libomp reports `out` items as
+/// inout; with it, an out -> out ordering is classified as flow.
+pub const DEP_FLOW: u8 = 1;
+pub const DEP_ANTI: u8 = 2;
+pub const DEP_OUTPUT: u8 = 4;
+pub const DEP_UNKNOWN: u8 = 8;
+
+/// ompt dependence types (`ompt_dependence_type_t`) that write / read the
+/// variable. mutexinoutset and inoutset count as inout here.
+fn dep_writes(kind: u32) -> bool {
+    matches!(kind, 2 | 3 | 4 | 7 | 34 | 35)
+}
+fn dep_reads(kind: u32) -> bool {
+    matches!(kind, 1 | 3 | 4 | 7 | 35)
+}
+/// `omp_all_memory`: matches every address.
+fn dep_all_memory(kind: u32) -> bool {
+    matches!(kind, 34 | 35)
+}
+
+/// A variable that orders two tasks: its address, the class of the ordering
+/// (one `DEP_*` bit) and the dependence types in the predecessor's and the
+/// successor's depend clause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DepVar {
+    pub addr: u64,
+    pub class: u8,
+    pub pred_kind: u32,
+    pub succ_kind: u32,
+}
+
+/// The variables by which task `from` precedes task `to`: the addresses in
+/// both depend clauses, classified. An inout followed by an in or inout is a
+/// flow dependence (the write is what matters).
+pub fn dependence_vars(m: &Model, from: u32, to: u32) -> Vec<DepVar> {
+    let (pd, sd) = (m.deps(from as usize), m.deps(to as usize));
+    let mut out = Vec::new();
+    for p in pd {
+        for s in sd {
+            if p.addr != s.addr && !dep_all_memory(p.kind) && !dep_all_memory(s.kind) {
+                continue;
+            }
+            let class = if dep_writes(p.kind) && dep_reads(s.kind) {
+                DEP_FLOW
+            } else if dep_writes(p.kind) && dep_writes(s.kind) {
+                DEP_OUTPUT
+            } else if dep_reads(p.kind) && dep_writes(s.kind) {
+                DEP_ANTI
+            } else {
+                continue;
+            };
+            // For omp_all_memory, name the concrete address of the other side.
+            let addr = if dep_all_memory(p.kind) { s.addr } else { p.addr };
+            out.push(DepVar { addr, class, pred_kind: p.kind, succ_kind: s.kind });
+        }
+    }
+    out
+}
+
+/// The classes of the edge `from -> to` as a mask of `DEP_*` bits.
+pub fn dependence_class(m: &Model, from: u32, to: u32) -> u8 {
+    match dependence_vars(m, from, to).iter().fold(0, |c, v| c | v.class) {
+        0 => DEP_UNKNOWN,
+        c => c,
+    }
+}
+
 /// Dependence edges between the visible nodes for a set of expanded groups:
-/// (from, to, on the critical path), merged per pair of nodes.
-pub fn visible_dependences(m: &Model, crit: &PathResult, grouping: &Grouping, expanded: &[bool]) -> Vec<(u32, u32, bool)> {
+/// (from, to, on the critical path, `DEP_*` classes), merged per pair of
+/// nodes (the classes of merged edges are or-ed).
+pub fn visible_dependences(m: &Model, crit: &PathResult, grouping: &Grouping, expanded: &[bool]) -> Vec<(u32, u32, bool, u8)> {
     let node = grouping.visible(expanded);
-    let mut merged: std::collections::BTreeMap<(u32, u32), bool> = Default::default();
+    let mut merged: std::collections::BTreeMap<(u32, u32), (bool, u8)> = Default::default();
     for (from, to) in m.depends() {
         let (a, b) = (node[from as usize], node[to as usize]);
         if a != b {
-            *merged.entry((a, b)).or_default() |= crit.transitions.contains(&(from, to)) || crit.transitions.contains(&(to, from));
+            let e = merged.entry((a, b)).or_default();
+            e.0 |= crit.transitions.contains(&(from, to)) || crit.transitions.contains(&(to, from));
+            e.1 |= dependence_class(m, from, to);
         }
     }
-    merged.into_iter().map(|((a, b), c)| (a, b, c)).collect()
+    merged.into_iter().map(|((a, b), (c, k))| (a, b, c, k)).collect()
 }
 
 /// What the GUI shows for a set of tasks without having their records.
