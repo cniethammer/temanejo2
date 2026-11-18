@@ -39,11 +39,14 @@ const DX = 26, DY = 64, R = 9;
 const KIND = ['initial', 'implicit', 'explicit'];
 // Classes of a dependence edge (bits of analysis::DEP_* on the server):
 // read after write (flow), write after read (anti), write after write
-// (output), and no shared address.
+// (output), and no shared address. Each class is drawn as a line of its own
+// colour (S.css.depCls), side by side if an edge has several.
 const DEP_CLASS = [[1, 'RAW'], [2, 'WAR'], [4, 'WAW'], [8, '?']];
+const DEP_CLASS_TITLE = ['read after write (flow)', 'write after read (anti)', 'write after write (output)', 'the depend clauses share no address'];
 const depClassText = mask => DEP_CLASS.filter(([b]) => mask & b).map(([, s]) => s).join('+');
-// Line dash of a dependence edge: RAW solid, WAW dotted, WAR dashed.
-const depDash = mask => (mask & 1) || !mask ? [] : mask & 4 ? [1.5, 3] : mask & 2 ? [6, 4] : [];
+const depClassHtml = mask => depClasses(mask).map(j => `<b style="color:${S.css.depCls[j]}" title="${DEP_CLASS_TITLE[j]}">${DEP_CLASS[j][1]}</b>`).join('+');
+// Indices into DEP_CLASS of the classes of an edge; unclassified counts as '?'.
+const depClasses = mask => { const c = [0, 1, 2, 3].filter(j => mask & (1 << j)); return c.length ? c : [3]; };
 const DEP_TYPE = { 1: 'in', 2: 'out', 3: 'inout', 4: 'mutexinoutset', 5: 'source', 6: 'sink', 7: 'inoutset', 34: 'out (all memory)', 35: 'inout (all memory)' };
 const FLAGS = [[0x08000000, 'undeferred'], [0x10000000, 'untied'], [0x20000000, 'final'], [0x40000000, 'mergeable'], [0x80000000, 'merged'], [0x8, 'target'], [0x10, 'taskwait']];
 
@@ -80,6 +83,7 @@ function readCss() {
   S.css = {
     surface: v('--surface'), ink: v('--ink'), ink2: v('--ink2'), muted: v('--muted'), grid: v('--grid'), axis: v('--axis'),
     edgeCreate: v('--edge-create'), edgeDep: v('--edge-dep'), critical: v('--critical'),
+    depCls: [v('--dep-raw'), v('--dep-war'), v('--dep-waw'), v('--edge-dep')],
     gap: [v('--critical'), v('--gap-busy'), v('--gap-wait'), v('--gap-idle')],
     cat: [1, 2, 3, 4, 5, 6, 7, 8].map(i => v('--s' + i)), seqLo: v('--seq-lo'), seqHi: v('--seq-hi'),
   };
@@ -557,8 +561,8 @@ function drawGraph() {
   // is slow to rasterise). An edge is skipped when both ends lie off the
   // same side.
   // Dependence edges get an arrowhead at their successor (not when zoomed
-  // far out, where it would be smaller than a node), filled after the lines
-  // so it is not dashed. Its tip sits on the edge of the node or group box.
+  // far out, where it would be smaller than a node), filled after the lines.
+  // Its tip sits on the edge of the node or group box.
   const far = k < 0.25;
   const head = Math.min(Math.max(4, 5 * k), 9);
   // How far a node reaches above and below its centre: a group box with
@@ -586,18 +590,25 @@ function drawGraph() {
     const [x0, y0, x1, y1] = p, len = Math.hypot(x1 - x0, y1 - y0);
     return len < 2 * head ? null : [x1, y1, (x1 - x0) / len, (y1 - y0) / len, head + width];
   };
-  const pass = (pred, style, width, alpha, dash = []) => {
-    ctx.strokeStyle = style; ctx.lineWidth = width; ctx.globalAlpha = alpha; ctx.setLineDash(dash);
+  // `lane(e)`: sideways offset of the line in px (one line per dependence
+  // class); `arrows`: whether dependence edges get their arrowhead.
+  const pass = (pred, style, width, alpha, lane = null, arrows = true) => {
+    ctx.strokeStyle = style; ctx.lineWidth = width; ctx.globalAlpha = alpha;
     let count = 0;
     const heads = new Path2D();
     ctx.beginPath();
     for (const e of S.vEdges) {
       if (!pred(e)) continue;
-      const p = ends(e);
+      let p = ends(e);
       if (!p) continue;
+      const o = lane ? lane(e) : 0;
+      if (o) {
+        const len = Math.hypot(p[2] - p[0], p[3] - p[1]) || 1, nx = -(p[3] - p[1]) / len * o, ny = (p[2] - p[0]) / len * o;
+        p = [p[0] + nx, p[1] + ny, p[2] + nx, p[3] + ny];
+      }
       ctx.moveTo(p[0], p[1]); ctx.lineTo(p[2], p[3]);
       if (++count === 1024) { ctx.stroke(); ctx.beginPath(); count = 0; }
-      const h = arrow(e, p, width);
+      const h = arrows && arrow(e, p, width);
       if (h) {
         const [bx, ty, ux, uy, s] = h;
         heads.moveTo(bx, ty);
@@ -606,7 +617,7 @@ function drawGraph() {
         heads.closePath();
       }
     }
-    ctx.stroke(); ctx.setLineDash([]);
+    ctx.stroke();
     ctx.fillStyle = style; ctx.fill(heads);
     ctx.globalAlpha = 1;
   };
@@ -624,11 +635,24 @@ function drawGraph() {
   if (fade) pass(e => shown(e) && !inSel(e) && direct(e), css.axis, 1, greyAlpha);
   if (S.showCreate) drawFans(sx, sy, r, fade, greyAlpha, createAlpha);
   if (S.showCreate) pass(e => e[2] === 0 && !isCrit(e) && inSel(e) && direct(e), css.edgeCreate, 1, createAlpha);
-  // Dependence edges, one pass per line style (depDash).
-  if (S.showDep) for (const dash of [[], [6, 4], [1.5, 3]])
-    pass(e => e[2] === 1 && !isCrit(e) && inSel(e) && String(depDash(e[5])) === String(dash), css.edgeDep, far ? 1 : 1.3, far ? 0.35 : 0.7, far ? [] : dash);
-  if (S.regionPairs.length) pass(e => e[4], css.ink, 2.5, 1);
-  if (S.showCrit) pass(e => e[3] && shown(e) && inSel(e), css.critical, Math.max(2, 3 * Math.min(k, 1)), 1);
+  const critWidth = Math.max(2, 3 * Math.min(k, 1));
+  if (S.showDep) {
+    // Dependence edges: one line per class, side by side. Critical path and
+    // selected-region edges are a band under the lines, as wide as they are.
+    const lw = far ? 1 : 1.5, gap = far ? 0 : Math.min(Math.max(2.5 * k, 2), 4.5);
+    const nLanes = e => depClasses(e[5]).length;
+    for (let n = 1; n <= 4; n++) {
+      const band = (n - 1) * gap + lw;
+      if (S.regionPairs.length) pass(e => e[2] === 1 && e[4] && nLanes(e) === n, css.ink, band + 3, 1, null, false);
+      if (S.showCrit) pass(e => e[2] === 1 && e[3] && inSel(e) && nLanes(e) === n, css.critical, band + critWidth, 1, null, false);
+    }
+    for (let c = 0; c < 4; c++) {
+      const lane = e => { const cl = depClasses(e[5]); return (cl.indexOf(c) - (cl.length - 1) / 2) * gap; };
+      pass(e => e[2] === 1 && inSel(e) && depClasses(e[5]).includes(c), css.depCls[c], lw, far && !isCrit(e) ? 0.5 : 0.95, lane);
+    }
+  }
+  if (S.regionPairs.length) pass(e => e[2] === 0 && e[4], css.ink, 2.5, 1);
+  if (S.showCrit) pass(e => e[2] === 0 && e[3] && shown(e) && inSel(e), css.critical, critWidth, 1);
 
   // Nodes, batched: one path per fill colour and one per kind of mark, so a
   // frame needs a few dozen canvas calls instead of one or more per task.
@@ -1493,7 +1517,11 @@ function renderLegend() {
     html += `<span class="muted">strip:</span>` + [0, 1, 2, 3].map(k =>
       `<span title="${GAP_LABEL[k]}"><span class="sw" style="border-radius:2px;background:${S.css.gap[k]}"></span>${GAP_SHORT[k]} ${pctText(gapTotals[k], total)} %</span>`).join('');
   }
-  if (S.showDep && S.vEdges.some(e => e[2] === 1)) html += `<span class="muted">dependences: — RAW · ‒ ‒ WAR · ⋯ WAW</span>`;
+  if (S.showDep && S.vEdges.some(e => e[2] === 1)) {
+    const used = new Set(S.vEdges.filter(e => e[2] === 1).flatMap(e => depClasses(e[5])));
+    html += `<span class="muted">dependences:</span>` + [...used].sort().map(j =>
+      `<span title="${DEP_CLASS_TITLE[j]}"><span class="sw" style="border-radius:1px;width:14px;height:3px;vertical-align:2px;background:${S.css.depCls[j]}"></span>${DEP_CLASS[j][1]}</span>`).join('');
+  }
   if (S.fadeOthers && S.region.size) html += `<span><span class="sw" style="background:${S.css.axis}"></span>not selected</span>`;
   html += `<span class="muted">○ explicit · □ implicit · ◇ initial${S.groups.some(x => x.drawn) ? ' · ▭ collapsed group (×tasks)' : ''}</span>`;
   $('legend').innerHTML = html;
@@ -1536,7 +1564,7 @@ function renderTask() {
   // Dependence partners with the variables that order them: one line each,
   // "task · RAW 0x… (out → in)".
   const depList = (a, vars) => !vars ? list(a) : a.length ? a.slice(0, 40).map((x, j) => `<div>${taskLink(x)} <span class="muted">·</span> ` +
-    ((vars[j] || []).map(([addr, c, pk, sk]) => `${depClassText(c)} <span class="mono">${addr}</span> <span class="muted">(${DEP_TYPE[pk] || pk} → ${DEP_TYPE[sk] || sk})</span>`).join(', ') || '<span class="muted">no shared address</span>') +
+    ((vars[j] || []).map(([addr, c, pk, sk]) => `${depClassHtml(c)} <span class="mono">${addr}</span> <span class="muted">(${DEP_TYPE[pk] || pk} → ${DEP_TYPE[sk] || sk})</span>`).join(', ') || '<span class="muted">no shared address</span>') +
     '</div>').join('') + (a.length > 40 ? `<div class="muted">… (${a.length})</div>` : '') : '–';
   let html = `<div><b style="font-size:15px">Task ${t.id}</b></div><div style="margin:4px 0 8px">${badges.join('')}</div><dl>
     <dt>Source</dt><dd>${src}</dd>

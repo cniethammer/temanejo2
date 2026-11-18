@@ -9,6 +9,8 @@
   --axis: #c3c2b7;
   --edge-create: #c3c2b7;
   --edge-dep: #52514e;
+  /* Dependence classes: read after write, write after read, write after write. */
+  --dep-raw: #2a78d6; --dep-war: #eb6834; --dep-waw: #6250d6;
   --critical: #d03b3b;
   /* Critical path strip of the timeline: gap classes. */
   --gap-busy: #898781;
@@ -32,6 +34,7 @@
     --axis: #383835;
     --edge-create: #4a4a46;
     --edge-dep: #c3c2b7;
+    --dep-raw: #3987e5; --dep-war: #d95926; --dep-waw: #9085e9;
     --critical: #e66767;
     --gap-busy: #898781;
     --gap-wait: #fab219;
