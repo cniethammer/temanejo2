@@ -57,7 +57,7 @@ const S = {
   cam: { x: 0, y: 0, k: 1 },           // graph camera: screen = world * k + (x, y)
   tl: { t0: 0, t1: 1 },                // visible time window of the timeline
   drag: null, hover: -1, hoverGroup: -1, css: {}, children: [], succ: [], pred: [],
-  groups: [], hidden: new Int32Array(0), repGroup: new Int32Array(0), groupOf: new Int32Array(0), vEdges: [],
+  depLabels: [], groups: [], hidden: new Int32Array(0), repGroup: new Int32Array(0), groupOf: new Int32Array(0), vEdges: [],
   originSort: { key: 'w', dir: -1 },   // task origins table: column and direction
   originFilter: '',                    // task origins table: lower-case filter text
 };
@@ -551,12 +551,12 @@ function draw(mode = false) {
   });
 }
 
-function drawGraph() {
-  const { g, cam, css } = S, { k } = cam, T = g.tasks;
-  ctx.clearRect(0, 0, S.w, S.h);
+// Drawing of graph edges for the current camera, shared by the graph
+// (drawGraph) and the overlay (graphOverlay).
+function edgePainter() {
+  const { cam } = S, { k } = cam, T = S.g.tasks;
   const sx = t => t.x * DX * k + cam.x, sy = t => t.y * DY * k + cam.y;
   const r = Math.max(R * k, 1.2);
-
   // Edges, batched per style in paths of at most 1024 lines (one huge path
   // is slow to rasterise). An edge is skipped when both ends lie off the
   // same side.
@@ -590,14 +590,15 @@ function drawGraph() {
     const [x0, y0, x1, y1] = p, len = Math.hypot(x1 - x0, y1 - y0);
     return len < 2 * head ? null : [x1, y1, (x1 - x0) / len, (y1 - y0) / len, head + width];
   };
-  // `lane(e)`: sideways offset of the line in px (one line per dependence
-  // class); `arrows`: whether dependence edges get their arrowhead.
-  const pass = (pred, style, width, alpha, lane = null, arrows = true) => {
+  // Strokes the edges that satisfy `pred`. `lane(e)`: sideways offset of the
+  // line in px (one line per dependence class); `arrows`: whether dependence
+  // edges get their arrowhead.
+  const pass = (pred, style, width, alpha, lane = null, arrows = true, edges = S.vEdges) => {
     ctx.strokeStyle = style; ctx.lineWidth = width; ctx.globalAlpha = alpha;
     let count = 0;
     const heads = new Path2D();
     ctx.beginPath();
-    for (const e of S.vEdges) {
+    for (const e of edges) {
       if (!pred(e)) continue;
       let p = ends(e);
       if (!p) continue;
@@ -621,6 +622,20 @@ function drawGraph() {
     ctx.fillStyle = style; ctx.fill(heads);
     ctx.globalAlpha = 1;
   };
+  // Dependence edges are drawn as one line per class, side by side `gap`
+  // apart; `laneOf(c)` gives the offset of class c's line on an edge.
+  const lw = far ? 1 : 1.5, gap = far ? 0 : Math.min(Math.max(2.5 * k, 2), 4.5);
+  const laneOf = (c, g = gap) => e => { const cl = depClasses(e[5]); return (cl.indexOf(c) - (cl.length - 1) / 2) * g; };
+  return { far, off, extent, ends, arrow, pass, lw, gap, laneOf };
+}
+
+function drawGraph() {
+  const { g, cam, css } = S, { k } = cam, T = g.tasks;
+  ctx.clearRect(0, 0, S.w, S.h);
+  const sx = t => t.x * DX * k + cam.x, sy = t => t.y * DY * k + cam.y;
+  const r = Math.max(R * k, 1.2);
+
+  const { far, off, extent, ends, arrow, pass, lw, gap, laneOf } = edgePainter();
   const isCrit = e => S.showCrit && e[3];
   // With "grey out unselected", everything outside the selected region is
   // drawn first in grey; only edges between two selected tasks keep their style.
@@ -639,17 +654,14 @@ function drawGraph() {
   if (S.showDep) {
     // Dependence edges: one line per class, side by side. Critical path and
     // selected-region edges are a band under the lines, as wide as they are.
-    const lw = far ? 1 : 1.5, gap = far ? 0 : Math.min(Math.max(2.5 * k, 2), 4.5);
     const nLanes = e => depClasses(e[5]).length;
     for (let n = 1; n <= 4; n++) {
       const band = (n - 1) * gap + lw;
       if (S.regionPairs.length) pass(e => e[2] === 1 && e[4] && nLanes(e) === n, css.ink, band + 3, 1, null, false);
       if (S.showCrit) pass(e => e[2] === 1 && e[3] && inSel(e) && nLanes(e) === n, css.critical, band + critWidth, 1, null, false);
     }
-    for (let c = 0; c < 4; c++) {
-      const lane = e => { const cl = depClasses(e[5]); return (cl.indexOf(c) - (cl.length - 1) / 2) * gap; };
-      pass(e => e[2] === 1 && inSel(e) && depClasses(e[5]).includes(c), css.depCls[c], lw, far && !isCrit(e) ? 0.5 : 0.95, lane);
-    }
+    for (let c = 0; c < 4; c++)
+      pass(e => e[2] === 1 && inSel(e) && depClasses(e[5]).includes(c), css.depCls[c], lw, far && !isCrit(e) ? 0.5 : 0.95, laneOf(c));
   }
   if (S.regionPairs.length) pass(e => e[2] === 0 && e[4], css.ink, 2.5, 1);
   if (S.showCrit) pass(e => e[2] === 0 && e[3] && shown(e) && inSel(e), css.critical, critWidth, 1);
@@ -697,6 +709,7 @@ function drawGraph() {
   // node cross near their middles, so a label tries a few places along its
   // edge and is left out if all of them overlap arrowheads or labels
   // already drawn.
+  S.depLabels = [];   // [edge, x, y, text, font size], redrawn by drawSelectedEdges
   if (S.showDep && k >= 1.1) {
     const fs = Math.min(10 * k, 12);
     ctx.font = `${fs}px system-ui, sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
@@ -727,6 +740,7 @@ function drawGraph() {
         if (!free(x, y, w)) continue;
         boxes.push([x, y, w, fs]);
         ctx.strokeText(text, x, y); ctx.fillText(text, x, y);
+        S.depLabels.push([e, x, y, text, fs]);
         break;
       }
     }
@@ -741,9 +755,10 @@ function drawGraph() {
   }
 }
 
-// Rings around the hovered and the selected task.
+// The edges of the selected task, rings around the hovered and the selected task.
 function graphOverlay() {
   const { cam } = S, k = cam.k, r = Math.max(R * k, 1.2);
+  if (S.sel >= 0) drawSelectedEdges();
   if (S.hoverGroup >= 0 && S.groups[S.hoverGroup]?.drawn) {
     const grp = S.groups[S.hoverGroup], t = S.g.tasks[grp.rep], [hw, hh] = groupSize(grp, r);
     ctx.lineWidth = 2.5; ctx.strokeStyle = S.css.ink;
@@ -754,6 +769,34 @@ function graphOverlay() {
     const t = S.g.tasks[i];
     ctx.lineWidth = w; ctx.strokeStyle = S.css.ink;
     ctx.beginPath(); ctx.arc(t.x * DX * k + cam.x, t.y * DY * k + cam.y, Math.max(r + 5, 7), 0, 6.2832); ctx.stroke();
+  }
+}
+
+// The creation and dependence edges of the selected task, or of the group
+// node standing in for it, drawn again above the graph: wider, opaque and on
+// a halo of the background colour, so they stand out of crossing edges.
+function drawSelectedEdges() {
+  const node = S.hidden[S.sel] >= 0 ? S.groups[S.hidden[S.sel]].rep : S.sel;
+  const { pass, gap, laneOf } = edgePainter(), css = S.css;
+  const mine = e => e[0] === node || e[1] === node;
+  const create = e => S.showCreate && e[2] === 0 && mine(e), dep = e => S.showDep && e[2] === 1 && mine(e);
+  const edges = S.vEdges.filter(e => create(e) || dep(e));
+  if (!edges.length) return;
+  const w = 2.5, g = Math.max(gap, w + 1.5);
+  pass(create, css.surface, w + 4, 1, null, false, edges);
+  for (let n = 1; n <= 4; n++) pass(e => dep(e) && depClasses(e[5]).length === n, css.surface, (n - 1) * g + w + 4, 1, null, false, edges);
+  pass(create, css.ink2, w, 1, null, true, edges);
+  for (let c = 0; c < 4; c++) pass(e => dep(e) && depClasses(e[5]).includes(c), css.depCls[c], w, 1, laneOf(c, g), true, edges);
+  // Their labels, which the lines now cover, unless the camera moved since
+  // the graph (and the label positions) were drawn.
+  const b = S.baseCam;
+  if (!b || b.k !== S.cam.k || b.x !== S.cam.x || b.y !== S.cam.y) return;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.lineJoin = 'round'; ctx.lineWidth = 3;
+  ctx.strokeStyle = css.surface; ctx.fillStyle = css.ink;
+  for (const [e, x, y, text, fs] of S.depLabels) {
+    if (!dep(e)) continue;
+    ctx.font = `600 ${fs}px system-ui, sans-serif`;
+    ctx.strokeText(text, x, y); ctx.fillText(text, x, y);
   }
 }
 
