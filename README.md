@@ -202,3 +202,7 @@ synthetic traces (see Tests); the OMPT tool itself is only tested manually.
   `taskwait` in deep recursion, with and without the tool; the example
   therefore uses tied tasks only, and task migration between threads is
   implemented but untested.
+
+## License
+
+BSD 3-Clause License, see [LICENSE](LICENSE).
