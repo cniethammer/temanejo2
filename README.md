@@ -77,17 +77,20 @@ FILE, e.g. for traces recorded on another system).
 
 - **MPI rank** selector switches between the graphs of the processes.
 - **Graph view**: tasks as nodes (circle = explicit, square = implicit,
-  diamond = initial task), light edges = task creation, dark edges =
-  `depend` dependences, red = critical path. Drag to pan, wheel to zoom,
-  `F` or *Fit* to see everything.
+  diamond = initial task), grey edges = task creation, coloured arrows =
+  `depend` dependences by type (RAW blue, WAR orange, WAW purple; one line
+  per type if two tasks are ordered by several), red = critical path. Drag
+  to pan, wheel to zoom, `F` or *Fit* to see everything.
 - **Timeline view**: one row per thread with the execution segments of all
   tasks; the red strip below a segment marks critical-path tasks.
 - **Colour by** thread, CPU, NUMA node, source location, parallel region,
   task kind or work time.
 - **Click a task** for its details: source file and line, work time, time
   spent on the critical path, creating task and thread, parallel region and
-  team, `depend` items, and one row per execution segment with thread, CPU
-  and NUMA node. Badges flag tasks that ran on a different thread than the
+  team, `depend` items, the variables (type and address) ordering it after
+  its predecessors and before its successors, and one row per execution
+  segment with thread, CPU and NUMA node; its edges are highlighted in the
+  graph. Badges flag tasks that ran on a different thread than the
   one that created them (stolen), migrated between threads (untied tasks) or
   were moved between CPUs by the OS.
 - **Shift+drag** selects a region of the graph (or a time range in the

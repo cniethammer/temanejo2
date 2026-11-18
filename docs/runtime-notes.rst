@@ -146,6 +146,24 @@ call and return instead of a jump at such places.
 regions affected, and the task details point to this section. Structure,
 timing and critical path are not affected.
 
+``depend(out: ...)`` reported as ``inout``
+------------------------------------------
+
+**What you see.** The task details list the ``depend`` items of an ``out``
+clause with type ``inout``, and a dependence between two tasks that both
+write a variable with ``out`` is shown as RAW instead of WAW.
+
+**Cause.** clang compiles ``out`` and ``inout`` to the same dependence kind
+of the libomp interface, so the runtime cannot tell them apart and reports
+both as ``ompt_dependence_type_inout``. Observed with a task
+``depend(out: a)`` followed by a task ``depend(in: a)``: the first item was
+reported as ``inout``.
+
+**Consequences.** The edges and the critical path are not affected, only
+the classification of dependence types (see :doc:`gui`, "Dependence types"):
+WAW does not occur for code compiled with clang, and a RAW edge between two
+tasks that write with ``out`` may really be WAW.
+
 Event details
 -------------
 

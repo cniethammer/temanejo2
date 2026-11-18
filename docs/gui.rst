@@ -95,9 +95,10 @@ Graph view
 ----------
 
 Each task is a node: circle for explicit tasks, square for implicit tasks,
-diamond for the initial task. Light edges are task creation (parent to child,
-including a parallel region's encountering task to the implicit tasks), dark
-edges are ``depend`` dependences. Red marks the critical path.
+diamond for the initial task. Grey edges are task creation (parent to child,
+including a parallel region's encountering task to the implicit tasks),
+coloured edges with arrowheads are ``depend`` dependences, coloured by type
+(see `Dependence types`_). Red marks the critical path.
 
 Tasks that create many children (8 or more, e.g. the task running a
 ``taskloop`` or a ``single`` that spawns all tasks of a phase) have their
@@ -117,6 +118,58 @@ border empty for a moment; it is redrawn sharp when the movement pauses for
 150 ms or the mouse button is released. Hovering and clicking a task only
 redraw the marks on top of the picture. Task ids are drawn once the zoom is large
 enough.
+
+Clicking a task also highlights its edges: its creation edge (drawn as a
+direct line also where the graph draws a bus) and its dependence edges to
+predecessors and successors are drawn again on top, wider and opaque, so
+they can be followed through crossing edges. If the task is inside a
+collapsed group, the group node's edges are highlighted. Edge kinds switched
+off in the toolbar stay hidden.
+
+Dependence types
+----------------
+
+OMPT reports a dependence edge only as a pair of tasks. Temanejo derives
+*why* the successor waits from the ``depend`` clauses of both tasks, which
+OMPT reports with the address and type of each item: every address that
+appears in both clauses is classified as
+
+====== ======= ===================================================================
+Type   Colour  Meaning
+====== ======= ===================================================================
+RAW    blue    read after write (flow): the predecessor writes (``out``,
+               ``inout``), the successor reads (``in``, ``inout``)
+WAR    orange  write after read (anti): the predecessor reads, the successor
+               writes
+WAW    purple  write after write (output): both write, the successor does not
+               read
+?      grey    the two clauses share no address, e.g. an edge the runtime adds
+               for ``inoutset`` or ``mutexinoutset``
+====== ======= ===================================================================
+
+``inout`` followed by ``in`` or ``inout`` counts as RAW: the write is what the
+successor waits for. ``mutexinoutset`` and ``inoutset`` count as ``inout``;
+``omp_all_memory`` matches every address.
+
+Two tasks can be ordered by several variables and so by several types at
+once. Each type present is drawn as a line of its own colour, side by side,
+each with an arrowhead at the successor, the task that waits: tasks with a
+RAW and a WAR dependence are connected by a blue and an orange line. An
+edge between collapsed groups carries the types of all edges it stands for.
+On the critical path (or the critical path of a selected region) the lines
+lie on a red (black) band. When zoomed out far, the lines coincide and the
+arrowheads are left out; when zoomed in far enough to show task ids, each
+edge is labelled with its types (e.g. ``RAW+WAR``) where the label covers
+no node, arrowhead or other label. The legend lists the types present in
+the view.
+
+WAR and WAW dependences carry no data from one task to the other; they
+exist because both tasks use the same memory. Giving the tasks separate
+copies (renaming, privatisation) removes them, which can be a way to more
+parallelism.
+
+With clang, ``out`` items are reported as ``inout``, so a dependence between
+two ``out`` items appears as RAW, not WAW; see :doc:`runtime-notes`.
 
 Collapsing groups
 -----------------
@@ -322,7 +375,12 @@ Clicking a task shows:
 * parallel region with the source location and function where it starts,
   team size and, for implicit tasks, thread number;
 * threads, CPUs and NUMA nodes used;
-* number of children, predecessors and successors by dependence (clickable);
+* number of children;
+* predecessors (*Depends on*) and successors (*Required by*) by dependence,
+  clickable, each with the variables that order the two tasks: the
+  dependence type (see `Dependence types`_), the address, and the types of
+  the two ``depend`` items, e.g. ``RAW 0x7ffe4a6754a0 (inout → in)``. OMPT
+  reports addresses only; variable names are not shown;
 * the items of the ``depend`` clause;
 * every execution segment: thread, CPU (start → end if it changed), NUMA
   node, start and duration.

@@ -67,8 +67,9 @@ The server has no authentication and binds to ``127.0.0.1`` by default.
       ``wait`` (start − create).
    ``tasks``
       Records of the tasks outside groups, as in the full graph, without
-      ``x``/``y`` and with ``i``, the task's index, and the dependence lists
-      ``dp`` and ``ds`` (see ``/group`` below).
+      ``x``/``y`` and with ``i``, the task's index, the dependence lists
+      ``dp`` and ``ds`` and their variables ``dpv`` and ``dsv`` (see
+      ``/group`` below).
    ``max_group``
       The size limit the groups were made for.
    ``groups``
@@ -93,7 +94,13 @@ The server has no authentication and binds to ``127.0.0.1`` by default.
 ``GET /api/rank/<rank>/group/<group>``
    ``tasks``: the records of the tasks the group shows when expanded (its
    direct tasks, with ``i`` and the dependence lists ``dp``, tasks it
-   depends on, and ``ds``, tasks depending on it).
+   depends on, and ``ds``, tasks depending on it). ``dpv`` and ``dsv`` give
+   for each entry of ``dp`` and ``ds`` the variables that order the two
+   tasks, as a list of ``[address (hex string), class, predecessor's type,
+   successor's type]``. ``class`` is one bit: 1 read after write (RAW), 2
+   write after read (WAR), 4 write after write (WAW); the types are OMPT
+   dependence types (``ompt_dependence_type_t``). The list is empty if the
+   two ``depend`` clauses share no address.
 
 ``GET /api/rank/<rank>/group/<group>/stats``
    ``own_cr``, the critical path through all tasks of the group alone, and
@@ -140,7 +147,9 @@ The server has no authentication and binds to ``127.0.0.1`` by default.
    The dependence edges between the nodes that are visible when certain
    groups are expanded. Request body: the ids of the expanded groups,
    separated by commas (empty: all collapsed). Response: ``deps``, a list of
-   ``[from, to, critical]``. A task whose enclosing groups are all expanded
+   ``[from, to, critical, classes]``; ``classes`` is a bit set of the
+   dependence types (1 RAW, 2 WAR, 4 WAW, 8 no shared address) of all edges
+   merged into this one. A task whose enclosing groups are all expanded
    is its own node; any other task is represented by the ``rep`` of the
    outermost collapsed group around it. Edges between the same two nodes
    are merged, edges inside one node dropped.
@@ -215,7 +224,8 @@ The server has no authentication and binds to ``127.0.0.1`` by default.
    ``edges``
       ``[from, to, kind, critical]``: task indices; kind 0 creation, 1
       dependence; critical 1 if the critical path passes from one task to
-      the other.
+      the other. Dependence edges have a fifth element, the variables that
+      order the two tasks, in the format of ``dpv`` (see ``/group``).
 
 ``POST /api/rank/<rank>/region``
    (The server remembers the task set of the last request per rank, to
