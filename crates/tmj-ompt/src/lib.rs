@@ -418,10 +418,14 @@ unsafe extern "C" fn initialize(lookup: Lookup, _initial_device_num: c_int, _too
     macro_rules! register {
         ($id:expr, $f:expr) => {{
             let cb: Callback = std::mem::transmute($f as *const c_void);
-            let r = set($id, Some(cb));
-            // ompt_set_error = 0, ompt_set_never = 1
-            if r <= 1 && verbose() {
-                eprintln!("[temanejo] OMPT callback {} is not available in this runtime", $id);
+            // ompt_set_result_t (OpenMP 6.0, Section 33.28 "OMPT set_result Type"):
+            // error = 0, never = 1, impossible = 2, sometimes = 3,
+            // sometimes_paired = 4, always = 5
+            match set($id, Some(cb)) {
+                0 => eprintln!("[temanejo] registering OMPT callback {} failed", $id),
+                1 | 2 =>eprintln!("[temanejo] OMPT callback {} is not available in this runtime", $id),
+                3 | 4 => eprintln!("[temanejo] OMPT callback {} is only invoked for some events; the trace may be incomplete", $id),
+                _ => {}
             }
         }};
     }
