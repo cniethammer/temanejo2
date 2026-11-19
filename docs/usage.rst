@@ -344,10 +344,16 @@ Viewing
    temanejo traces                    # http://127.0.0.1:8700/
    temanejo traces --port 9000
    temanejo traces --summary          # table only, no server
+   temanejo traces --exe ./app        # debug info from a local copy of the binary
 
 The server only needs the trace directory and, for source locations, read
-access to the application binaries at the paths recorded in the trace. On a
-cluster run it on the login node and forward the port::
+access to the application binaries. By default it reads them at the paths
+recorded in the trace. For traces recorded on another system, or after the
+binary was moved, name a local copy with ``--exe``; it replaces the recorded
+module with the same file name. Give it once per file, e.g. also for a
+shared library of the application. It must be the same build that ran,
+compiled with ``-g``. On a cluster run the server on the login node and
+forward the port::
 
    ssh -L 8700:localhost:8700 login-node
 

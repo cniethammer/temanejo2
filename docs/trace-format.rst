@@ -113,12 +113,19 @@ Keys written by ``libtmj_ompt.so``:
        ``0-3,8`` (``Cpus_allowed_list`` of ``/proc/self/status``). Shows the
        binding applied by the MPI launcher or batch system.
    * - ``mpi.world_size``
-     - Number of MPI processes, from ``OMPI_COMM_WORLD_SIZE`` or
-       ``PMI_SIZE``.
+     - Number of MPI processes, from ``OMPI_COMM_WORLD_SIZE``,
+       ``PMI_SIZE``, ``MV2_COMM_WORLD_SIZE`` or ``SLURM_NTASKS``, the first
+       that is set.
+   * - ``mpi.rank_from``
+     - Name of the environment variable the rank was taken from (see
+       :doc:`usage`). Missing if none of these variables was set.
+   * - ``job.slurm``, ``job.pbs``, ``job.pals_apid``
+     - Batch job or application id: ``SLURM_JOB_ID``, ``PBS_JOBID`` and
+       ``PALS_APID``, each if set.
    * - ``env.<NAME>``
      - Value of the environment variable ``<NAME>``, for every variable
-       whose name starts with ``OMP_``, ``KMP_``, ``GOMP_``, ``LIBOMP_`` or
-       ``TEMANEJO_``, sorted by name. A variable set to the empty string is
+       whose name starts with ``OMP_``, ``KMP_``, ``GOMP_``, ``LIBOMP_``,
+       ``MPICH_`` or ``TEMANEJO_``, sorted by name. A variable set to the empty string is
        written with an empty value; an unset variable has no entry.
 
 The environment shows what was requested, not what the runtime did with it:

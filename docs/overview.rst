@@ -62,8 +62,9 @@ Requirements
   must be compiled with clang, e.g. ``OMPI_CC=clang mpicc -fopenmp``.
 * An MPI implementation that starts processes through PMIx or PMI (developed
   against Open MPI 5.0). The tool does not link against MPI.
-* For source locations: the application built with ``-g``, and
-  ``llvm-addr2line`` or GNU ``addr2line`` where the server runs.
+* For source locations: the application built with ``-g``, readable where
+  the server runs (at its recorded path, or as a copy named with ``--exe``),
+  and ``llvm-addr2line`` or GNU ``addr2line`` there.
 * For the documentation: Sphinx (``pip install -r docs/requirements.txt``).
 
 Building
