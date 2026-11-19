@@ -91,6 +91,17 @@ Keys written by ``libtmj_ompt.so``:
      - Number of processors available to the runtime
        (``ompt_get_num_procs``), if the runtime knows it when the tool
        starts. LLVM ``libomp`` 23 does not, so the entry is missing there.
+   * - ``ompt.callback.<name>``
+     - What ``ompt_set_callback`` returned when the tool registered the OMPT
+       callback ``ompt_callback_<name>``, one entry per callback the tool
+       uses (``thread_begin``, ``task_create``, ``dependences``, ``work``,
+       …). The value is the ``ompt_set_result_t`` name without the
+       ``ompt_set_`` prefix (OpenMP 6.0, Section 33.28 "OMPT set_result
+       Type"): ``always`` (invoked for every event), ``sometimes`` or
+       ``sometimes_paired`` (only for some events, so the events of this
+       kind may be incomplete), ``never`` or ``impossible`` (no events of
+       this kind), ``error`` (registration failed), or the number for any
+       other value.
    * - ``process.exe``
      - Absolute path of the executable.
    * - ``process.args``

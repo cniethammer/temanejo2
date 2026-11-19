@@ -128,6 +128,23 @@ struct Output {
 }
 
 static OUTPUT: Mutex<Option<Output>> = Mutex::new(None);
+/// Result of `ompt_set_callback` for every callback the tool registers, in
+/// registration order.
+static REGISTERED: Mutex<Vec<(&str, c_int)>> = Mutex::new(Vec::new());
+
+/// Name of an `ompt_set_result_t` value (OpenMP 6.0, Section 33.28 "OMPT
+/// set_result Type").
+fn set_result_name(r: c_int) -> String {
+    match r {
+        0 => "error".into(),
+        1 => "never".into(),
+        2 => "impossible".into(),
+        3 => "sometimes".into(),
+        4 => "sometimes_paired".into(),
+        5 => "always".into(),
+        _ => r.to_string(),
+    }
+}
 /// What the runtime passed to `ompt_start_tool`: its `_OPENMP` version and version string.
 static STARTED_BY: Mutex<(c_uint, String)> = Mutex::new((0, String::new()));
 /// Events a thread buffers before it writes them (`usize::MAX`: until the end).
@@ -416,17 +433,21 @@ unsafe extern "C" fn initialize(lookup: Lookup, _initial_device_num: c_int, _too
     };
     let set: SetCallback = std::mem::transmute(f);
     macro_rules! register {
-        ($id:expr, $f:expr) => {{
+        ($id:expr, $f:ident) => {{
             let cb: Callback = std::mem::transmute($f as *const c_void);
+            // The handler is named after the callback: on_task_create -> task_create.
+            let name = stringify!($f).trim_start_matches("on_");
             // ompt_set_result_t (OpenMP 6.0, Section 33.28 "OMPT set_result Type"):
             // error = 0, never = 1, impossible = 2, sometimes = 3,
             // sometimes_paired = 4, always = 5
-            match set($id, Some(cb)) {
-                0 => eprintln!("[temanejo] registering OMPT callback {} failed", $id),
-                1 | 2 =>eprintln!("[temanejo] OMPT callback {} is not available in this runtime", $id),
-                3 | 4 => eprintln!("[temanejo] OMPT callback {} is only invoked for some events; the trace may be incomplete", $id),
+            let r = set($id, Some(cb));
+            match r {
+                0 => eprintln!("[temanejo] registering OMPT callback {} failed", name),
+                1 | 2 => eprintln!("[temanejo] OMPT callback {} is not available in this runtime", name),
+                3 | 4 => eprintln!("[temanejo] OMPT callback {} is only invoked for some events; the trace may be incomplete", name),
                 _ => {}
             }
+            REGISTERED.lock().unwrap().push((name, r));
         }};
     }
     register!(CB_THREAD_BEGIN, on_thread_begin);
@@ -508,6 +529,10 @@ unsafe fn run_info(lookup: Lookup) -> Vec<(String, String)> {
         add("omp.version", omp_version.to_string()); // the runtime's _OPENMP value, yyyymm
     }
     // OMPT entry point; safe to call during tool initialisation.
+    // What the runtime promised when the tool registered its callbacks.
+    for (name, r) in REGISTERED.lock().unwrap().iter() {
+        add(&format!("ompt.callback.{name}"), set_result_name(*r));
+    }
     if let Some(f) = lookup(c"ompt_get_num_procs".as_ptr()) {
         let num_procs: unsafe extern "C" fn() -> c_int = std::mem::transmute(f);
         let n = num_procs();
