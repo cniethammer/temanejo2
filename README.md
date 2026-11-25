@@ -73,6 +73,19 @@ Server options: `temanejo <trace-dir> [--port 8700] [--bind 127.0.0.1] [--max-gr
 information of a recorded executable or library with the same file name from
 FILE, e.g. for traces recorded on another system).
 
+## Installation
+
+```sh
+make install PREFIX=/opt/temanejo      # default PREFIX: /usr/local
+make install-nodocs PREFIX=…           # without Sphinx
+```
+
+This installs `bin/temanejo`, `bin/tmj-run` (pointing to the installed
+library), `lib/libtmj_ompt.so`, `share/man/man1/temanejo.1` and the HTML
+documentation in `share/doc/temanejo/`. `BINDIR`, `LIBDIR`, `MANDIR`,
+`DOCDIR` and `DESTDIR` can be overridden; `make uninstall` removes the files
+again. On a cluster, install to a file system all compute nodes can read.
+
 ## The GUI
 
 - **MPI rank** selector switches between the graphs of the processes.
