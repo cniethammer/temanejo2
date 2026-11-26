@@ -670,8 +670,13 @@ function drawGraph() {
       if (S.regionPairs.length) pass(e => e[2] === 1 && e[4] && nLanes(e) === n, css.ink, band + 3, 1, null, false);
       if (S.showCrit) pass(e => e[2] === 1 && e[3] && inSel(e) && nLanes(e) === n, css.critical, band + critWidth, 1, null, false);
     }
-    for (let c = 0; c < 4; c++)
-      pass(e => e[2] === 1 && inSel(e) && depClasses(e[5]).includes(c), css.depCls[c], lw, far && !isCrit(e) ? 0.5 : 0.95, laneOf(c));
+    // pass() takes one alpha for all its edges: zoomed out, the edges off the
+    // critical path are drawn fainter in a pass of their own, before the others.
+    for (let c = 0; c < 4; c++) {
+      const ofClass = e => e[2] === 1 && inSel(e) && depClasses(e[5]).includes(c);
+      if (far) pass(e => ofClass(e) && !isCrit(e), css.depCls[c], lw, 0.5, laneOf(c));
+      pass(e => ofClass(e) && !(far && !isCrit(e)), css.depCls[c], lw, 0.95, laneOf(c));
+    }
   }
   if (S.showCreate && S.regionPairs.length) pass(e => e[2] === 0 && e[4], css.ink, 2.5, 1);
   if (S.showCrit) pass(e => e[2] === 0 && e[3] && shown(e) && inSel(e), css.critical, critWidth, 1);
